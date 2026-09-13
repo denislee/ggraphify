@@ -1,0 +1,121 @@
+#!/bin/sh
+# ggraphify launcher — rebuild from source, then run.
+#
+# fuzzel launches a .desktop entry, and a .desktop entry can only name a path.
+# Pointing it straight at a binary means it runs whatever was copied there by
+# the last `make install`, which goes stale the moment you rebuild. This script
+# is what the entry names instead: it rebuilds from the working tree and then
+# execs the result, so "latest" means the source as it is right now rather than
+# the source as it was when you last remembered to install.
+#
+# A no-op build costs ~80ms and a one-package change ~100ms, because Go's build
+# cache keeps the expensive cgo/GTK4 objects. That is below the threshold where
+# a launcher feels slow, which is the only reason doing this on every launch is
+# reasonable.
+#
+# The placeholders are substituted by `make install`.
+
+SRC='@SRC@'
+GO='@GO@'
+BIN='@LIBEXEC@'
+
+# A path baked in at install time can rot: the checkout moves, or go is
+# upgraded and the toolchain path changes. Fall back to PATH rather than
+# failing over something recoverable.
+[ -x "$GO" ] || GO=$(command -v go 2>/dev/null)
+
+note() {
+	# The launcher has no terminal to complain into, so a desktop notification
+	# is the only way a failure is visible at all. Keep stderr too, for when it
+	# was started from a shell.
+	printf 'ggraphify: %s\n%s\n' "$1" "$2" >&2
+	command -v notify-send >/dev/null 2>&1 &&
+		notify-send -a ggraphify -u critical "ggraphify: $1" "$2"
+}
+
+build() {
+	cd "$SRC" || return 1
+	# Build beside the target and rename over it. Writing directly to $BIN
+	# fails with ETXTBSY while another board is running from that inode, and a
+	# rename leaves the running process on its old inode untouched.
+	tmp="$BIN.new.$$"
+	if err=$("$GO" build -o "$tmp" . 2>&1); then
+		mv -f "$tmp" "$BIN"
+		return 0
+	fi
+	rm -f "$tmp"
+	# A notification bubble is not a build log. Prefer the lines that name a
+	# file and a line number, because a cgo build spends its first several
+	# lines on warnings from inside the GTK bindings that are noise here.
+	msg=$(printf '%s\n' "$err" | grep -E '\.go:[0-9]+' | head -n 6)
+	[ -n "$msg" ] || msg=$(printf '%s\n' "$err" | head -n 6)
+	note "build failed — running the last good binary" "$msg"
+	return 1
+}
+
+# stale reports whether anything in the tree is newer than the binary we have.
+#
+# `go build` on an unchanged tree is still ~1.4s here, because it relinks and
+# rewrites 22MB whether or not the inputs moved. Pressing enter in a launcher
+# and waiting that long for nothing is the difference between this being
+# invisible and being annoying, so skip the build when no input is newer.
+#
+# mtime is the right test for that despite go's cache being content-addressed:
+# an edit always bumps mtime, so this can only ever trigger a build that was not
+# needed, never skip one that was. go decides whether the work is real.
+stale() {
+	[ -x "$BIN" ] || return 0
+	[ "$SRC/go.mod" -nt "$BIN" ] && return 0
+	[ "$SRC/go.sum" -nt "$BIN" ] && return 0
+	[ -n "$(find "$SRC" -name '*.go' -newer "$BIN" -print -quit 2>/dev/null)" ]
+}
+
+# Re-entry from the flock below. This has to be handled before anything else,
+# or the locked call would run the launch path again and fork bomb.
+if [ "$1" = "--build-only" ]; then
+	build
+	exit $?
+fi
+
+if [ "${GGRAPHIFY_NO_REBUILD:-0}" = "1" ]; then
+	: # escape hatch: run what is installed, do not touch the source tree
+elif [ ! -d "$SRC" ]; then
+	note "source tree is gone" "$SRC no longer exists — running the last installed build."
+elif [ -z "$GO" ]; then
+	note "go not found" "Cannot rebuild; running the last installed build."
+elif ! stale; then
+	: # nothing has been touched since this binary was built
+elif command -v flock >/dev/null 2>&1; then
+	# Two launches at once would otherwise race on the same output path. The
+	# loser waits and then does a no-op build, which is cheap.
+	flock "$BIN.lock" "$0" --build-only
+else
+	build
+fi
+
+if [ ! -x "$BIN" ]; then
+	note "nothing to run" "No binary at $BIN and the build did not produce one."
+	exit 1
+fi
+
+# GSK renderer — default to vulkan, but respect a caller-supplied value so that
+# a developer can still override with e.g. GSK_RENDERER=cairo ggraphify.
+# Pinning vulkan here is regression insurance: on Intel Lunar Lake / Mesa 26.1.8 /
+# GTK 4.22.4 vulkan is already GTK’s default, but a Mesa or GTK update could flip
+# that silently.  The A/B test from the performance plan is complete; results:
+#
+#   ngl and gl resolve to the SAME renderer (GskGLRenderer) in GTK 4.22 — they
+#   are not two separate options.  GL/NGL is heavier than vulkan, not lighter:
+#   +87 MB RSS (217 vs 130 MB idle), +36 MB GPU/GTT, and full-window repaint p95
+#   of 17.9–32.8 ms versus vulkan’s 9.0 ms.  Vulkan fits every frame inside one
+#   16.7 ms vblank; GL’s p95 does not.  GL’s sole win — 0.3 ms vs 0.9 ms paint on
+#   small incremental damage — is irrelevant in practice: under real key-driven
+#   scrolling every renderer stays well inside 16.7 ms with zero missed vblanks.
+#
+#   cairo is the no-GPU fallback: ~2× the paint cost (14.7 ms median, full-window
+#   repaint), zero GPU memory, always works.  A user who needs it can still set
+#   GSK_RENDERER=cairo before launching.
+: "${GSK_RENDERER:=vulkan}"
+export GSK_RENDERER
+
+exec "$BIN" "$@"

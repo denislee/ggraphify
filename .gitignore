@@ -30,3 +30,16 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Build output. `make build` produces all three beside the source; the launcher
+# installed by `make install` rebuilds into ~/.local/lib/ggraphify instead.
+/ggraphify
+/ggraphify-scan
+/ggraphify-job
+
+# PGO profile, collected from a running board with `make pgo`. Commit it
+# deliberately when you have a representative one — it is not build output.
+!default.pgo
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

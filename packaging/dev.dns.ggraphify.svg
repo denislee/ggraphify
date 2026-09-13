@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ggraphify: a small force-directed graph. Three communities, one hub. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3584e4"/>
+      <stop offset="1" stop-color="#1c71d8"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bg)"/>
+  <g stroke="#ffffff" stroke-opacity="0.55" stroke-width="3" stroke-linecap="round">
+    <path d="M64 62 L38 36"/>
+    <path d="M64 62 L94 40"/>
+    <path d="M64 62 L34 88"/>
+    <path d="M64 62 L92 92"/>
+    <path d="M38 36 L34 88"/>
+    <path d="M94 40 L92 92"/>
+  </g>
+  <g fill="#ffffff">
+    <circle cx="64" cy="62" r="12"/>
+    <circle cx="38" cy="36" r="8"/>
+    <circle cx="94" cy="40" r="8"/>
+    <circle cx="34" cy="88" r="8"/>
+    <circle cx="92" cy="92" r="8"/>
+  </g>
+</svg>

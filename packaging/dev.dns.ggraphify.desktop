@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=ggraphify
+GenericName=Graphify board
+Comment=Graph freshness and graphify jobs across every local repository
+# @BIN@ is substituted by `make install` with the absolute path of the
+# installed launcher — fuzzel launches entries with the session's PATH, which
+# does not always include ~/.local/bin.
+Exec=@BIN@
+Icon=dev.dns.ggraphify
+Terminal=false
+StartupNotify=true
+# Matches the Wayland app_id the window carries (ui.AppID), so sway and fuzzel
+# associate the running window with this entry.
+StartupWMClass=dev.dns.ggraphify
+Categories=Development;
+Keywords=graphify;graph;board;knowledge;repositories;code;
