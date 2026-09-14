@@ -32,6 +32,9 @@ var keyBindings = []keyBinding{
 	{"r", "Rescan every root", "Moving"},
 
 	{"h", "Fix — run whatever this repository needs to become healthy", "Building"},
+	{"H", "Fix, free steps only — no API key, no LLM call", "Building"},
+	{"Ctrl+H", "Fix, free steps only, on every repository on the board", "Building"},
+	{"Ctrl+G", "Sync the graft index for every repository in the selected folder", "Building"},
 	{"u", "Update — AST re-extraction, free", "Building"},
 	{"c", "Re-cluster, keeping placeholder names, free", "Building"},
 	{"E", "Extract — full LLM extraction, METERED", "Building"},
@@ -39,6 +42,7 @@ var keyBindings = []keyBinding{
 	{"e", "Export graph.html", "Building"},
 	{"w", "Export wiki", "Building"},
 	{"W", "Start/stop `graphify watch` on this repository", "Building"},
+	{"p", "Pause / resume this row's running job", "Building"},
 	{"x", "Cancel this row's running job", "Building"},
 
 	{"o", "Overview page", "Pages"},
@@ -96,6 +100,12 @@ func (a *App) installKeys() {
 			case gdk.KEY_r:
 				a.rescan()
 				return true
+			case gdk.KEY_h, gdk.KEY_H:
+				a.actFixFreeAll()
+				return true
+			case gdk.KEY_g, gdk.KEY_G:
+				a.actSyncGraft()
+				return true
 			}
 			return false
 		}
@@ -132,6 +142,8 @@ func (a *App) dispatchKey(keyval uint) bool {
 		a.rescan()
 	case gdk.KEY_h:
 		a.actFix()
+	case gdk.KEY_H:
+		a.actFixFree()
 	case gdk.KEY_u:
 		a.actUpdate()
 	case gdk.KEY_c:
@@ -146,6 +158,8 @@ func (a *App) dispatchKey(keyval uint) bool {
 		a.actExportWiki()
 	case gdk.KEY_W:
 		a.actWatch()
+	case gdk.KEY_p:
+		a.pauseCurrent()
 	case gdk.KEY_x:
 		a.cancelCurrent()
 	case gdk.KEY_o:

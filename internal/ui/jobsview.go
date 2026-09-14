@@ -20,9 +20,14 @@ type jobsView struct {
 	list    *gtk.ListBox
 	log     *gtk.TextView
 	head    *gtk.Label
+	pause   *gtk.Button
 	rows    []jobs.Snapshot
 	sel     uint64
 	lastGen uint64
+	// bars is the progress bar of each listed job, by job id. The list is
+	// rebuilt on a transition, so the tick needs a handle on the widgets it
+	// repaints between rebuilds.
+	bars map[uint64]*gtk.ProgressBar
 }
 
 func (a *App) showJobs() {
@@ -64,6 +69,13 @@ func (a *App) showJobs() {
 			a.runner.Cancel(v.sel)
 		}
 	})
+	v.pause = gtk.NewButtonWithLabel("Pause")
+	v.pause.AddCSSClass("flat")
+	v.pause.ConnectClicked(func() {
+		if v.sel != 0 {
+			a.togglePause(v.sel)
+		}
+	})
 	retry := gtk.NewButtonWithLabel("Retry")
 	retry.AddCSSClass("flat")
 	retry.ConnectClicked(func() { v.retry() })
@@ -85,6 +97,7 @@ func (a *App) showJobs() {
 	bar.Append(v.head)
 	bar.Append(copyCmd)
 	bar.Append(retry)
+	bar.Append(v.pause)
 	bar.Append(cancel)
 
 	v.log = gtk.NewTextView()
@@ -144,6 +157,7 @@ func (v *jobsView) selected() *jobs.Snapshot {
 func (v *jobsView) reload() {
 	snaps := v.a.runner.Snapshot()
 	v.rows = snaps
+	v.bars = map[uint64]*gtk.ProgressBar{}
 	for {
 		child := v.list.FirstChild()
 		if child == nil {
@@ -191,6 +205,13 @@ func (v *jobsView) jobRow(s jobs.Snapshot) *gtk.ListBoxRow {
 		m.SetTooltipText("This job dispatched LLM requests against your API key.")
 		box.Append(m)
 	}
+	prog := newJobProgressBar()
+	box.Append(progressSlot(prog))
+	setJobProgress(prog, &s)
+	if v.bars != nil {
+		v.bars[s.ID] = prog
+	}
+
 	status := gtk.NewLabel(text)
 	status.AddCSSClass("dim-label")
 	box.Append(status)
@@ -202,6 +223,7 @@ func (v *jobsView) jobRow(s jobs.Snapshot) *gtk.ListBoxRow {
 
 func (v *jobsView) showSelected() {
 	s := v.selected()
+	setPauseButton(v.pause, s)
 	if s == nil {
 		v.head.SetText("")
 		v.log.Buffer().SetText("")
@@ -224,6 +246,13 @@ func (v *jobsView) tick() {
 	}
 	if !s.Status.Done() {
 		v.head.SetText(jobHeadline(s) + "\n" + s.Command())
+		setPauseButton(v.pause, s)
+	}
+	// Every listed job's bar, not just the selected one: the list is the
+	// place you watch a queue from, and a bar that only moved when its row
+	// was selected would be worse than none.
+	for i := range v.rows {
+		setJobProgress(v.bars[v.rows[i].ID], &v.rows[i])
 	}
 }
 

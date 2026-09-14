@@ -175,6 +175,9 @@ func (a *App) activityRow(s jobs.Snapshot) *gtk.Box {
 	row.Append(status)
 
 	id := s.ID
+	if s.Status == jobs.Running {
+		row.Append(a.pauseIconButton(s))
+	}
 	x := gtk.NewButtonFromIconName("window-close-symbolic")
 	x.AddCSSClass("flat")
 	x.SetTooltipText("Cancel this job")

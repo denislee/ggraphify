@@ -31,8 +31,105 @@ type rowPlan struct {
 	plan heal.Plan
 }
 
+// fixRequest is one press of one of the fix buttons: which plans, how many
+// rows were skipped for having nothing to do, whether the LLM was allowed, and
+// whether this came from the button that takes the whole board — which is the
+// one press that can queue a chain per repository.
+type fixRequest struct {
+	plans        []rowPlan
+	healthy      int
+	allowMetered bool
+	everyRepo    bool
+}
+
 // actFix is the button. It plans first, then asks.
-func (a *App) actFix() {
+func (a *App) actFix() { a.fixWith(true) }
+
+// actFixFree is the same button with the LLM taken away: it plans, asks and
+// runs only the steps that cost nothing. It is a button of its own rather than
+// a second click inside the Fix dialog because "take these repositories as far
+// as free work goes" is a thing people want on a whole batch without reading a
+// metered plan first — and on a healthy-but-for-money row, the Fix dialog it
+// would have to go through is the one that spends.
+func (a *App) actFixFree() { a.fixWith(false) }
+
+// actFixFreeAll is the free fix over every repository on the board, rather
+// than over the selection: the sweep you run after a day of committing, which
+// costs nothing and so needs no per-repository decision. Rows kept out of
+// batch actions (X) are left alone, because that flag means exactly this.
+//
+// Unlike the other two it plans off the main thread. Planning one repository
+// reads graph.json, sizes the output directory and walks the tree for drift;
+// doing that for a hundred checkouts inside the click handler would freeze the
+// window for as long as it took.
+func (a *App) actFixFreeAll() {
+	rows := a.fixableRows()
+	if len(rows) == 0 {
+		a.toast("no repositories to fix")
+		return
+	}
+
+	// Everything the worker needs is resolved here, on the main thread, so the
+	// goroutine touches nothing but the filesystem.
+	type plannable struct {
+		row  board.Row
+		opts graphstate.Options
+	}
+	work := make([]plannable, 0, len(rows))
+	for _, r := range rows {
+		work = append(work, plannable{row: r, opts: graphstate.Options{
+			Repo:     r.Path,
+			Out:      a.params(r).Out,
+			Baseline: a.opts.Store.DriftBaseline(r.Path),
+		}})
+	}
+	a.toastf("planning free steps for %s…", plural(len(rows), "repo", "repos"))
+
+	go func() {
+		var plans []rowPlan
+		healthy := 0
+		for _, w := range work {
+			g, err := graphstate.Read(w.opts)
+			if err != nil {
+				g = w.row.Graph
+			}
+			p := heal.For(g, false)
+			if p.Empty() {
+				healthy++
+				continue
+			}
+			plans = append(plans, rowPlan{row: w.row, plan: p})
+		}
+		idle(func() {
+			if len(plans) == 0 {
+				a.toastf("no free step left on any of %s",
+					plural(healthy, "repo", "repos"))
+				return
+			}
+			a.confirmFix(fixRequest{plans: plans, healthy: healthy, everyRepo: true})
+		})
+	}()
+}
+
+// fixableRows is every repository on the board that batch actions may touch —
+// the whole model, not the filtered view: a board-wide sweep that quietly
+// skipped whatever the search box happened to hide would be a trap.
+func (a *App) fixableRows() []board.Row {
+	all := a.allRows()
+	out := make([]board.Row, 0, len(all))
+	for _, r := range all {
+		if !r.Excluded {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// fixWith plans the selected rows and opens the confirmation. allowMetered
+// chooses which plan is computed: the free plan is not the metered one with
+// its paid steps removed, it is a different sequence (see the "free" response
+// in confirmFix).
+func (a *App) fixWith(allowMetered bool) {
 	rows := a.batch()
 	if len(rows) == 0 {
 		a.toast("nothing selected")
@@ -46,7 +143,7 @@ func (a *App) actFix() {
 	var healthy []string
 	for _, r := range rows {
 		g := a.freshGraph(r)
-		p := heal.For(g, true)
+		p := heal.For(g, allowMetered)
 		if p.Empty() {
 			healthy = append(healthy, r.Name)
 			continue
@@ -55,15 +152,23 @@ func (a *App) actFix() {
 	}
 
 	if len(plans) == 0 {
-		switch len(healthy) {
-		case 1:
+		// In free mode "nothing to do" does not mean healthy: the repository
+		// may still need an extraction or a labelling run, which is precisely
+		// what this button declined to do.
+		switch {
+		case !allowMetered && len(healthy) == 1:
+			a.toastf("%s: no free step left — what remains needs the LLM", healthy[0])
+		case !allowMetered:
+			a.toastf("no free step left on %s — what remains needs the LLM",
+				plural(len(healthy), "repo", "repos"))
+		case len(healthy) == 1:
 			a.toastf("%s is already healthy — nothing to fix", healthy[0])
 		default:
 			a.toastf("all %s are already healthy", plural(len(healthy), "repo", "repos"))
 		}
 		return
 	}
-	a.confirmFix(plans, len(healthy))
+	a.confirmFix(fixRequest{plans: plans, healthy: len(healthy), allowMetered: allowMetered})
 }
 
 // freshGraph re-reads one row's graph state from disk. The board's own copy is
@@ -87,7 +192,12 @@ func (a *App) freshGraph(r board.Row) graphstate.Graph {
 // confirmFix is the gate. It shows every step of every plan, marks the metered
 // ones, and offers the free-only plan as a first-class alternative rather than
 // as a thing to go and configure.
-func (a *App) confirmFix(plans []rowPlan, healthy int) {
+//
+// req.allowMetered is false when the caller is one of the free-steps buttons:
+// the plans it was handed already contain nothing metered, and the dialog says
+// so rather than offering a downgrade that would change nothing.
+func (a *App) confirmFix(req fixRequest) {
+	plans, healthy, allowMetered := req.plans, req.healthy, req.allowMetered
 	set := a.opts.Store.Settings()
 
 	var body strings.Builder
@@ -113,10 +223,23 @@ func (a *App) confirmFix(plans []rowPlan, healthy int) {
 	if metered {
 		body.WriteString("\n" + a.meteredNotice(a.params(plans[0].row)))
 	}
+	if !allowMetered {
+		body.WriteString("\nFree steps only — no API key is used and no LLM request is sent. " +
+			"Anything that needs one is left undone.")
+	}
 	body.WriteString("\n" + plural(steps, "command", "commands") + " in total. " +
 		"Each waits for the one before it, and the first failure stops the rest.")
 
-	dlg := adw.NewAlertDialog("Fix", body.String())
+	title := "Fix"
+	confirm := "Fix"
+	if !allowMetered {
+		title = "Free steps"
+		confirm = "Run free steps"
+	}
+	if req.everyRepo {
+		title = "Free steps — every repository"
+	}
+	dlg := adw.NewAlertDialog(title, body.String())
 	dlg.SetPreferWideLayout(true)
 	dlg.SetExtraChild(a.fixPlanWidget(plans))
 
@@ -127,7 +250,7 @@ func (a *App) confirmFix(plans []rowPlan, healthy int) {
 	if metered {
 		dlg.AddResponse("free", "Free steps only")
 	}
-	dlg.AddResponse("fix", "Fix")
+	dlg.AddResponse("fix", confirm)
 	dlg.SetResponseAppearance("fix", adw.ResponseSuggested)
 	if metered {
 		dlg.SetResponseAppearance("fix", adw.ResponseDestructive)
@@ -136,9 +259,11 @@ func (a *App) confirmFix(plans []rowPlan, healthy int) {
 	dlg.SetCloseResponse("cancel")
 
 	// Same typed-count gate as every other batch: a fix over 40 checkouts is
-	// the one shape of this button that can cost real money.
+	// the one shape of this button that can cost real money — and the
+	// board-wide sweep is gated on the same count even though it cannot,
+	// because "every repository" is the one press nobody sized by hand.
 	var entry *gtk.Entry
-	typed := metered && len(plans) > 1 && len(plans) >= set.ConfirmBatchAt
+	typed := (metered || req.everyRepo) && len(plans) > 1 && len(plans) >= set.ConfirmBatchAt
 	if typed {
 		entry = gtk.NewEntry()
 		entry.SetPlaceholderText("type " + gfy.Itoa(len(plans)) + " to confirm")
@@ -156,7 +281,7 @@ func (a *App) confirmFix(plans []rowPlan, healthy int) {
 	dlg.ConnectResponse(func(resp string) {
 		switch resp {
 		case "fix":
-			a.runFix(plans, true)
+			a.runFix(plans, allowMetered)
 		case "free":
 			// Re-planned rather than filtered: without the LLM the right first
 			// step for an unextracted repository is `update`, which is not in

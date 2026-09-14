@@ -384,3 +384,213 @@ func TestSubmitCmdWithoutPrecheck(t *testing.T) {
 		t.Fatalf("SubmitCmd: %v", err)
 	}
 }
+
+// TestPauseResumeStopsTheProcessGroup is the real test of the feature: not that
+// a flag flips, but that the subprocess stops producing output while paused and
+// picks up again when resumed. A script that appends a line every 100ms makes
+// that observable without depending on timing being exact.
+func TestPauseResumeStopsTheProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "ticks")
+	fakeGraphify(t, `i=0
+while [ $i -lt 200 ]; do echo tick >> `+out+`; i=$((i+1)); sleep 0.05; done`)
+
+	r := New(Options{})
+	defer r.Close()
+
+	repo := repoDir(t)
+	job, err := r.SubmitCmd("update", repo, "Update · repo", gfy.Params{Repo: repo}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for it to be genuinely running with a process group to signal;
+	// Pause before exec.Start is a no-op by design.
+	if !waitFor(2*time.Second, func() bool { return r.pausable(job.ID) }) {
+		t.Fatal("job never reached a pausable state")
+	}
+	if !r.Pause(job.ID) {
+		t.Fatal("Pause reported no change on a running job")
+	}
+	if !r.Paused(job.ID) {
+		t.Fatal("Paused = false right after a successful Pause")
+	}
+	if r.Pause(job.ID) {
+		t.Fatal("a second Pause reported a change")
+	}
+
+	// SIGSTOP is asynchronous: let the group settle, then measure.
+	time.Sleep(250 * time.Millisecond)
+	before := countLines(t, out)
+	time.Sleep(400 * time.Millisecond)
+	if after := countLines(t, out); after != before {
+		t.Fatalf("a paused job kept writing: %d lines -> %d", before, after)
+	}
+
+	if !r.Resume(job.ID) {
+		t.Fatal("Resume reported no change on a paused job")
+	}
+	if r.Paused(job.ID) {
+		t.Fatal("still paused after Resume")
+	}
+	if !waitFor(2*time.Second, func() bool { return countLines(t, out) > before }) {
+		t.Fatal("a resumed job never wrote again")
+	}
+
+	r.Cancel(job.ID)
+	if s := wait(t, r, job.ID); s.Status != Canceled {
+		t.Fatalf("Status = %v, want canceled", s.Status)
+	}
+}
+
+// TestCancelWhilePausedTerminatesPromptly guards the reason reap sends SIGCONT
+// after SIGTERM: a stopped process cannot act on a pending signal, so without
+// it cancelling a paused job would sit out the whole kill grace and then be
+// SIGKILLed mid-write — the exact outcome the grace period exists to avoid.
+func TestCancelWhilePausedTerminatesPromptly(t *testing.T) {
+	fakeGraphify(t, `i=0
+while [ $i -lt 400 ]; do echo tick; i=$((i+1)); sleep 0.05; done`)
+
+	r := New(Options{KillGrace: 30 * time.Second})
+	defer r.Close()
+
+	repo := repoDir(t)
+	job, err := r.SubmitCmd("update", repo, "Update · repo", gfy.Params{Repo: repo}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(2*time.Second, func() bool { return r.pausable(job.ID) }) {
+		t.Fatal("job never reached a pausable state")
+	}
+	if !r.Pause(job.ID) {
+		t.Fatal("Pause reported no change")
+	}
+
+	start := time.Now()
+	r.Cancel(job.ID)
+	s := wait(t, r, job.ID)
+	if s.Status != Canceled {
+		t.Fatalf("Status = %v, want canceled", s.Status)
+	}
+	// Far under the 30s grace: it died on the SIGTERM, not on the SIGKILL.
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("cancelling a paused job took %s — it waited out the kill grace", d)
+	}
+}
+
+// TestElapsedExcludesPausedTime pins the accounting: the run history records
+// Elapsed as the job's duration, and time spent stopped is not time spent
+// working.
+func TestElapsedExcludesPausedTime(t *testing.T) {
+	fakeGraphify(t, `sleep 30`)
+
+	r := New(Options{})
+	defer r.Close()
+
+	repo := repoDir(t)
+	job, err := r.SubmitCmd("update", repo, "Update · repo", gfy.Params{Repo: repo}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(2*time.Second, func() bool { return r.pausable(job.ID) }) {
+		t.Fatal("job never reached a pausable state")
+	}
+	if !r.Pause(job.ID) {
+		t.Fatal("Pause reported no change")
+	}
+	s := snapOf(t, r, job.ID)
+	at := s.Elapsed()
+	time.Sleep(600 * time.Millisecond)
+	// Same snapshot value, recomputed later: the UI holds one across ticks,
+	// so the clock has to stand still in the value itself.
+	if grew := s.Elapsed() - at; grew > 50*time.Millisecond {
+		t.Fatalf("elapsed kept running while paused: grew by %s", grew)
+	}
+	if !r.Resume(job.ID) {
+		t.Fatal("Resume reported no change")
+	}
+	if held := snapOf(t, r, job.ID).Held; held < 500*time.Millisecond {
+		t.Fatalf("Held = %s, want at least the time it was paused", held)
+	}
+
+	r.Cancel(job.ID)
+	wait(t, r, job.ID)
+}
+
+// TestPauseRefusesWhatItCannotStop: a queued job has no process group, and a
+// finished one has nothing left to signal. Both report no change rather than
+// pretending.
+func TestPauseRefusesWhatItCannotStop(t *testing.T) {
+	fakeGraphify(t, `sleep 30`)
+
+	// One free lane, two jobs: the second is queued behind the first.
+	r := New(Options{FreeLanes: 1})
+	defer r.Close()
+
+	a, err := r.SubmitCmd("update", repoDir(t), "a", gfy.Params{Repo: repoDir(t)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := r.SubmitCmd("update", repoDir(t), "b", gfy.Params{Repo: repoDir(t)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(2*time.Second, func() bool { return r.pausable(a.ID) }) {
+		t.Fatal("the first job never started")
+	}
+	if r.Pause(b.ID) {
+		t.Fatal("Pause reported a change on a queued job")
+	}
+	if r.Paused(b.ID) {
+		t.Fatal("a queued job reports as paused")
+	}
+	if r.Pause(99999) {
+		t.Fatal("Pause reported a change on an unknown id")
+	}
+
+	r.CancelAll()
+	wait(t, r, a.ID)
+}
+
+// pausable reports whether the job is running with a process group to signal —
+// the precondition Pause enforces, exposed for the tests that must wait for it.
+func (r *Runner) pausable(id uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	j := r.running[id]
+	return j != nil && j.Status == Running && j.pgid != 0
+}
+
+func snapOf(t *testing.T, r *Runner, id uint64) Snapshot {
+	t.Helper()
+	for _, s := range r.Snapshot() {
+		if s.ID == id {
+			return s
+		}
+	}
+	t.Fatalf("no snapshot for job %d", id)
+	return Snapshot{}
+}
+
+func waitFor(d time.Duration, ok func() bool) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if ok() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return ok()
+}
+
+func countLines(t *testing.T, path string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatal(err)
+	}
+	return strings.Count(string(b), "\n")
+}

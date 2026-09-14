@@ -380,6 +380,7 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 	page.Add(llm)
 
 	page.Add(a.settingsClaude())
+	page.Add(a.settingsGraft())
 
 	page.Add(a.settingsOverlay())
 	return page

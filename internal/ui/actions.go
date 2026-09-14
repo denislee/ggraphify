@@ -11,6 +11,7 @@ import (
 	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/gfy"
 	"github.com/dns/ggraphify/internal/graphstate"
+	"github.com/dns/ggraphify/internal/jobs"
 	"github.com/dns/ggraphify/internal/store"
 )
 
@@ -353,6 +354,11 @@ func (a *App) actLabel() {
 
 func (a *App) actCheckUpdate() { a.run("check-update", a.batch(), nil) }
 
+// actGraftBuild syncs the selected repositories' graft index — the other
+// indexer's free, tree-sitter-only build. The board-wide form of the same
+// command is the folder sweep in graft.go.
+func (a *App) actGraftBuild() { a.run("graft-build", a.batch(), nil) }
+
 func (a *App) actExportHTML() { a.run("export-html", a.batch(), nil) }
 func (a *App) actExportWiki() { a.run("export-wiki", a.batch(), nil) }
 
@@ -393,7 +399,8 @@ func (a *App) actGlobalAdd() {
 
 // actHookInstall installs graphify's git hooks in the selected repositories.
 //
-// This is one of the two places ggraphify causes a write *inside* a repository,
+// This is one of the few places ggraphify causes a write *inside* a repository
+// (the graft sync is another),
 // and it is always explicit and always confirmed — never on a batch path taken
 // by accident. The write is graphify's, not the board's.
 func (a *App) actHookInstall() {
@@ -441,6 +448,82 @@ func (a *App) cancelCurrent() {
 		return
 	}
 	a.runner.Cancel(s.ID)
+}
+
+// togglePause stops or continues a running job's process group.
+//
+// It is one call rather than a Pause and a Resume button because the two are
+// never both meaningful: a job is either stopped or it is not, and a control
+// that shows the state it will move to is the one that can live in a row.
+func (a *App) togglePause(id uint64) {
+	if a.runner.Paused(id) {
+		a.runner.Resume(id)
+		return
+	}
+	a.runner.Pause(id)
+}
+
+// pauseCurrent pauses or resumes whatever is running for the selected row.
+func (a *App) pauseCurrent() {
+	r := a.current()
+	if r == nil {
+		return
+	}
+	s := a.jobFor(r.Path)
+	if s == nil || s.Status != jobs.Running {
+		a.toast("nothing running on this row")
+		return
+	}
+	a.togglePause(s.ID)
+}
+
+// pauseIconButton is the pause/resume affordance for a job row, beside the
+// cancel button it shares a column with. Only a running job gets one: a queued
+// job has no process to stop, and pausing it would mean holding a lane, which
+// is a different thing entirely.
+func (a *App) pauseIconButton(s jobs.Snapshot) *gtk.Button {
+	icon, tip := "media-playback-pause-symbolic", pauseTip
+	if s.Paused {
+		icon, tip = "media-playback-start-symbolic", resumeTip
+	}
+	b := gtk.NewButtonFromIconName(icon)
+	b.AddCSSClass("flat")
+	b.SetTooltipText(tip)
+	id := s.ID
+	b.ConnectClicked(func() { a.togglePause(id) })
+	return b
+}
+
+// setPauseButton points a labelled Pause/Resume button at a job, and hides it
+// when there is no running job for it to act on — a dead "Pause" next to a
+// finished job's log would be a control that lies about what is possible.
+func setPauseButton(b *gtk.Button, s *jobs.Snapshot) {
+	if s == nil || s.Status != jobs.Running {
+		b.SetVisible(false)
+		return
+	}
+	b.SetVisible(true)
+	if s.Paused {
+		b.SetLabel("Resume")
+		b.SetTooltipText(resumeTip)
+		return
+	}
+	b.SetLabel("Pause")
+	b.SetTooltipText(pauseTip)
+}
+
+const (
+	pauseTip = "Stop this job where it stands (SIGSTOP to its whole process group). " +
+		"It keeps its log, its lane and its output directory, and resumes from the same place."
+	resumeTip = "Continue this job (SIGCONT to its process group)."
+)
+
+// buttonSpacer is a fixed-width stand-in for a button a row does not get, so
+// the buttons that other rows do get stay in one column.
+func buttonSpacer(n int) *gtk.Box {
+	sp := gtk.NewBox(gtk.OrientationHorizontal, 0)
+	sp.SetSizeRequest(24*n, -1)
+	return sp
 }
 
 // toggleExclude flips the "keep out of batch actions" override.

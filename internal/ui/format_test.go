@@ -10,6 +10,7 @@ import (
 
 	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/discover"
+	"github.com/dns/ggraphify/internal/graftstate"
 	"github.com/dns/ggraphify/internal/graphstate"
 	"github.com/dns/ggraphify/internal/jobs"
 )
@@ -206,5 +207,55 @@ func TestStateWeightOrdersByAttention(t *testing.T) {
 	a.jobByRepo["/busy"] = &jobs.Snapshot{Status: jobs.Running}
 	if stateWeight(a, busy) >= stateWeight(a, row(graphstate.StateBroken)) {
 		t.Error("a running job must sort to the very top")
+	}
+}
+
+// A check detail is built from paths and error text and is rendered into an
+// AdwActionRow subtitle, which parses Pango markup. A bare angle bracket there
+// does not merely look wrong — GTK drops the whole string.
+func TestEscapeMarkup(t *testing.T) {
+	got := escapeMarkup(`Rebuild <repo>/graft & "friends"`)
+	for _, bad := range []string{"<repo>", ` & `, `"friends"`} {
+		if strings.Contains(got, bad) {
+			t.Errorf("escapeMarkup left %q unescaped: %s", bad, got)
+		}
+	}
+	if !strings.Contains(got, "&lt;repo&gt;") {
+		t.Errorf("escapeMarkup = %q", got)
+	}
+}
+
+func TestGraftFact(t *testing.T) {
+	if got := graftFact(graftstate.Index{State: graftstate.StateNone}); got != "" {
+		t.Errorf("a checkout graft never ran on says %q, want nothing", got)
+	}
+	got := graftFact(graftstate.Index{
+		State: graftstate.StateStale, Nodes: 951, Files: 79, DriftChanged: 12, DriftRemoved: 3,
+	})
+	for _, want := range []string{"stale", "951 nodes", "79 files", "~12", "−3"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("graftFact = %q, missing %q", got, want)
+		}
+	}
+}
+
+// The exposure note is about what graphify will do to graft's cards, so it is
+// silent when there are no cards — and silent when git is already ignoring them.
+func TestGraftExposureNote(t *testing.T) {
+	cases := []struct {
+		name string
+		i    graftstate.Index
+		want bool
+	}{
+		{"exposed index", graftstate.Index{State: graftstate.StateFresh, Exposed: true}, true},
+		{"gitignored index", graftstate.Index{State: graftstate.StateFresh}, false},
+		{"no index at all", graftstate.Index{State: graftstate.StateNone, Exposed: true}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := graftExposureNote(tc.i) != ""; got != tc.want {
+				t.Errorf("note present = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

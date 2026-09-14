@@ -32,6 +32,7 @@ import (
 	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/discover"
 	"github.com/dns/ggraphify/internal/gfy"
+	"github.com/dns/ggraphify/internal/graftstate"
 	"github.com/dns/ggraphify/internal/graphstate"
 	"github.com/dns/ggraphify/internal/jobs"
 	"github.com/dns/ggraphify/internal/open"
@@ -171,6 +172,16 @@ type App struct {
 	claudeCheckBtn *gtk.Button
 	claudeFixBtn   *gtk.Button
 	claudeSetup    gfy.ClaudeSetup
+
+	// The graft integration group, the same shape one group further down the
+	// page: is the Claude Code CLI on this machine configured to use graft?
+	graftGroup     *adw.PreferencesGroup
+	graftSummary   *adw.ActionRow
+	graftSetupRows []*adw.ActionRow
+	graftCheckBtn  *gtk.Button
+	graftFixBtn    *gtk.Button
+	graftSetup     gfy.GraftSetup
+	graftVersion   gfy.GraftVersion
 	// claudeAccountCombo is the account picker in the settings group; held so
 	// the rest of the page can read which login it is describing.
 	claudeAccountCombo *adw.ComboRow
@@ -189,6 +200,7 @@ type App struct {
 	runner  *jobs.Runner
 	cache   discover.Cache
 	graphs  graphstate.Cache
+	grafts  graftstate.Cache
 	version gfy.Version
 
 	// selectMode is the batch-action mode. `Space` adds a row to selected;
@@ -442,6 +454,7 @@ func (a *App) refresh(full bool) {
 	if full {
 		a.cache.Invalidate()
 		a.graphs.Clear()
+		a.grafts.Clear()
 	}
 
 	set := a.opts.Store.Settings()
@@ -469,6 +482,7 @@ func (a *App) refresh(full bool) {
 			ShowHidden: showHidden,
 			Cache:      &a.cache,
 			Graphs:     &a.graphs,
+			Grafts:     &a.grafts,
 			Override: func(path string) (string, bool, bool) {
 				o := st.Override(path)
 				return o.Out, o.ExcludeBatch, o.Pinned
@@ -640,6 +654,19 @@ func (a *App) refreshStatus() {
 		b.WriteString(" · ")
 		b.WriteString(plural(c.Behind, "behind HEAD", "behind HEAD"))
 	}
+	// The graft half of the same summary, kept to one clause: how many
+	// checkouts carry a graft index at all, and how many of those the tree has
+	// moved under — which is exactly what the sync button acts on.
+	if c.Grafted > 0 {
+		b.WriteString(" · ")
+		b.WriteString(gfy.Itoa(c.Grafted))
+		b.WriteString(" grafted")
+		if c.GraftStale > 0 {
+			b.WriteString(" (")
+			b.WriteString(gfy.Itoa(c.GraftStale))
+			b.WriteString(" stale)")
+		}
+	}
 	if running > 0 || queued > 0 {
 		b.WriteString(" · ")
 		b.WriteString(plural(running, "job running", "jobs running"))
@@ -764,6 +791,30 @@ func (a *App) onJobEvent(ev jobs.Event) {
 		return
 	}
 
+	if ev.Pause {
+		// Not a lifecycle transition: the job is Running on both sides of it,
+		// so it goes nowhere near the run history and is not a second "job
+		// started" line. The views still have to repaint — the row's status
+		// word, the spinner and the button that now says the opposite thing.
+		if s.Paused {
+			applog.Infof("job %d paused: %s", s.ID, s.Label)
+			a.toastf("%s paused", s.Label)
+		} else {
+			applog.Infof("job %d resumed: %s", s.ID, s.Label)
+			a.toastf("%s resumed", s.Label)
+		}
+		a.view.QueueDraw()
+		a.refreshStatus()
+		a.detail.reloadJobs()
+		if a.dock != nil {
+			a.dock.reloadJobs()
+		}
+		if a.jobsPage != nil {
+			a.jobsPage.reload()
+		}
+		return
+	}
+
 	if s.Status.Done() && a.opts.Store != nil {
 		a.opts.Store.AddHistory(store.HistoryEntry{
 			Kind: s.Kind, Repo: s.Repo, Argv: s.Argv, Cost: s.Cost.String(),
@@ -782,15 +833,33 @@ func (a *App) onJobEvent(ev jobs.Event) {
 		if s.Kind == "install" {
 			a.onSkillInstalled()
 		}
-		if gfy.Rescans(s.Kind) {
-			a.ackDrift(s.Repo, s.Started)
-		}
-		if gfy.Known[s.Kind].Mutates {
+		rescans := gfy.Rescans(s.Kind)
+		if gfy.Graft(s.Kind) {
+			// A graft run rewrote <repo>/graft and nothing in graphify-out/,
+			// so only that half of the row is re-derived.
+			a.grafts.Invalidate(s.Repo)
+			a.refresh(false)
+			if s.Kind == "graft-init" {
+				// Every check in the settings group just became stale, in the
+				// one direction that matters: it was the fix.
+				a.checkGraftSetup(false)
+			}
+		} else if gfy.Known[s.Kind].Mutates {
 			// The job changed graphify-out/, so drop that row's cached
 			// derivation and re-derive now rather than waiting up to a full
 			// tick for the board to catch up with what just happened.
 			a.graphs.Invalidate(s.Repo)
-			a.refresh(false)
+			if !rescans {
+				a.refresh(false)
+			}
+		}
+		if rescans {
+			// Deliberately no refresh here: the scan would race the baseline
+			// walk below and derive this row from the *old* baseline, which
+			// is the whole reason a repository whose only drift was settled
+			// by this very run kept showing as stale. ackDrift refreshes once
+			// the baseline is recorded.
+			a.ackDrift(s.Repo, s.Started)
 		}
 	case jobs.Failed:
 		// Deliberately not a toast that disappears. A failure pins itself on
@@ -997,6 +1066,7 @@ const boardCSS = `
 .dockheadrow{ background: alpha(currentColor, 0.04); }
 .docknote   { font-size: 0.85em; opacity: 0.55; }
 .docklist   { background: transparent; }
+.jobprogress{ min-height: 6px; }
 .check-ok   { color: @success_color; }
 .check-warn { color: @warning_color; }
 .check-bad  { color: @error_color; }

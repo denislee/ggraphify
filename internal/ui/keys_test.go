@@ -58,7 +58,7 @@ func accelNames(keys string) []string {
 		return []string{"k"}
 	case "g / G":
 		return []string{"g", "G"}
-	case "Enter", "Ctrl+Q", "Ctrl+F / Ctrl+B":
+	case "Enter", "Ctrl+Q", "Ctrl+H", "Ctrl+G", "Ctrl+F / Ctrl+B":
 		return nil // handled by the view's activate signal / the ctrl branch
 	case "/":
 		return []string{"slash"}
@@ -121,7 +121,8 @@ func TestColumnIDsAreUnique(t *testing.T) {
 // Every action the UI offers must name a kind that internal/gfy can build, or
 // the board offers a button that cannot run.
 func TestEveryActionKindIsKnown(t *testing.T) {
-	src := readSource(t, "detail.go") + readSource(t, "actions.go") + readSource(t, "viz.go")
+	src := readSource(t, "detail.go") + readSource(t, "actions.go") +
+		readSource(t, "viz.go") + readSource(t, "graft.go")
 	for _, kind := range kindsNamedIn(src) {
 		if _, ok := gfy.Known[kind]; !ok {
 			t.Errorf("the UI names the kind %q, which internal/gfy does not know", kind)

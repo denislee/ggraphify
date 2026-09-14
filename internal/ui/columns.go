@@ -9,6 +9,7 @@ import (
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
 	"github.com/dns/ggraphify/internal/board"
+	"github.com/dns/ggraphify/internal/graftstate"
 	"github.com/dns/ggraphify/internal/graphstate"
 )
 
@@ -104,6 +105,17 @@ var columns = []colSpec{
 		},
 	},
 	{
+		// The other index: graft's wiring graph under <repo>/graft. It is a
+		// column of its own rather than a mark on the state dot, because a
+		// repository can perfectly well have one index and not the other and
+		// the board's job is to say which.
+		ID: "graft", Title: "Graft", Width: 130,
+		cmp: func(a *App, x, y *board.Row) int { return graftWeight(x) - graftWeight(y) },
+		render: func(a *App, l *gtk.Label, r *board.Row) (string, string) {
+			return graftCell(r.Graft)
+		},
+	},
+	{
 		ID: "drift", Title: "Drift", Width: 150,
 		// Sorting by the total, not by the string: "+12 ~30" and "~3" compare
 		// the wrong way round alphabetically, and drift is the column people
@@ -176,6 +188,25 @@ func jobWeight(a *App, r *board.Row) int {
 		return -1
 	}
 	return 1
+}
+
+// graftWeight orders the Graft column the way the state column is ordered: by
+// how much attention the row wants, not by the ordinal the constants happen to
+// have. Broken first, then what has fallen behind the tree, then wiring-only,
+// then fine, and last the repositories graft has never been run on — of which
+// there are usually more than of everything else put together.
+func graftWeight(r *board.Row) int {
+	switch r.Graft.State {
+	case graftstate.StateBroken:
+		return 0
+	case graftstate.StateStale:
+		return 1
+	case graftstate.StateRaw:
+		return 2
+	case graftstate.StateFresh:
+		return 3
+	}
+	return 4 // StateNone
 }
 
 // stateWeight orders the state column by how much attention a row wants,

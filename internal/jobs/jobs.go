@@ -93,6 +93,18 @@ type Job struct {
 
 	cancel context.CancelFunc
 	pgid   int
+	// paused is true between a Pause and the matching Resume: the process
+	// group is stopped with SIGSTOP and holding whatever it had open. The
+	// status stays Running, because it is — a stopped process has not ended,
+	// still owns its output directory, and must not look finished to anything
+	// that keys off Status.Done.
+	paused bool
+	// pausedAt and pausedFor are the elapsed clock's accounting. A stopped
+	// process is not working, so the time it spends stopped is subtracted
+	// from Elapsed — which is not cosmetic: Elapsed is what the run history
+	// records as this job's duration.
+	pausedAt  time.Time
+	pausedFor time.Duration
 	// done is closed exactly once, when the job reaches a terminal status.
 	// It is what lets a chain wait for one step without polling Snapshot or
 	// subscribing to the event channel, which has a single consumer (the UI)
@@ -116,15 +128,41 @@ func (j *Job) finish() {
 	}
 }
 
-// Elapsed is how long the job has been running, or ran for.
+// Elapsed is how long the job has been running, or ran for, not counting any
+// time it spent paused.
 func (j *Job) Elapsed() time.Duration {
-	if j.Started.IsZero() {
+	return elapsed(j.Started, j.Ended, j.pausedAt, j.pausedFor, j.paused)
+}
+
+// held is how long the job has spent stopped, an ongoing pause included.
+// Called with the runner's lock held.
+func (j *Job) held(now time.Time) time.Duration {
+	d := j.pausedFor
+	if j.paused && !j.pausedAt.IsZero() {
+		d += now.Sub(j.pausedAt)
+	}
+	return d
+}
+
+// elapsed is the one clock both Job and Snapshot read. While a job is paused
+// the clock stands still at the moment it was stopped, rather than running on
+// and being corrected afterwards.
+func elapsed(started, ended, pausedAt time.Time, pausedFor time.Duration, paused bool) time.Duration {
+	if started.IsZero() {
 		return 0
 	}
-	if j.Ended.IsZero() {
-		return time.Since(j.Started)
+	end := ended
+	if end.IsZero() {
+		end = time.Now()
 	}
-	return j.Ended.Sub(j.Started)
+	if paused && !pausedAt.IsZero() && pausedAt.Before(end) {
+		end = pausedAt
+	}
+	d := end.Sub(started) - pausedFor
+	if d < 0 {
+		return 0
+	}
+	return d
 }
 
 // Command is the copy-pasteable form of what this job runs.
@@ -134,30 +172,30 @@ func (j *Job) Command() string { return gfy.Quote(j.Argv) }
 // runner's lock. The log is shared by pointer: ringbuf.Buf is itself safe for
 // concurrent use, and copying a quarter-megabyte buffer per frame would not be.
 type Snapshot struct {
-	ID      uint64
-	Kind    string
-	Repo    string
-	Label   string
-	Cost    gfy.Cost
-	Argv    []string
-	Status  Status
-	Exit    int
-	Err     string
-	Queued  time.Time
-	Started time.Time
-	Ended   time.Time
-	Log     *ringbuf.Buf
+	ID     uint64
+	Kind   string
+	Repo   string
+	Label  string
+	Cost   gfy.Cost
+	Argv   []string
+	Status Status
+	// Paused, PausedAt and Held are the pause state as of this snapshot. The
+	// UI holds a snapshot across ticks and recomputes Elapsed from it, so the
+	// clock has to be reconstructible from the value alone.
+	Paused   bool
+	PausedAt time.Time
+	Held     time.Duration
+	Exit     int
+	Err      string
+	Queued   time.Time
+	Started  time.Time
+	Ended    time.Time
+	Log      *ringbuf.Buf
 }
 
 // Elapsed mirrors Job.Elapsed for a snapshot.
 func (s Snapshot) Elapsed() time.Duration {
-	if s.Started.IsZero() {
-		return 0
-	}
-	if s.Ended.IsZero() {
-		return time.Since(s.Started)
-	}
-	return s.Ended.Sub(s.Started)
+	return elapsed(s.Started, s.Ended, s.PausedAt, s.Held, s.Paused)
 }
 
 // Command is the copy-pasteable argv.
@@ -172,6 +210,11 @@ type Event struct {
 	// job produces many of these and the log pane redraws on a tick, not on
 	// each line.
 	Output bool
+	// Pause is true for a pause or resume, which is not a lifecycle change:
+	// the job is Running before and after, and the UI only has to repaint.
+	// The flag is what keeps it out of the run history and out of the
+	// "started" log line.
+	Pause bool
 }
 
 // Options configures a runner.
@@ -387,6 +430,73 @@ func (r *Runner) Cancel(id uint64) bool {
 	return true
 }
 
+// Pause stops a running job's process group. Resume starts it again.
+//
+// It is SIGSTOP/SIGCONT on the whole group rather than on the parent, for the
+// same reason Cancel signals the group: graphify is a Python parent whose AST
+// workers hold the CPU, and stopping only the parent would pause the bookkeeping
+// while the fan-out kept burning cores.
+//
+// Only a running job can be paused — a queued one is not consuming anything, and
+// pausing it would mean "hold a lane", which is Cancel's job, not this one.
+// Both report whether they changed anything.
+func (r *Runner) Pause(id uint64) bool { return r.setPaused(id, true) }
+
+// Resume continues a paused job's process group.
+func (r *Runner) Resume(id uint64) bool { return r.setPaused(id, false) }
+
+// Paused reports whether a job is currently stopped.
+func (r *Runner) Paused(id uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	j := r.running[id]
+	return j != nil && j.paused
+}
+
+func (r *Runner) setPaused(id uint64, want bool) bool {
+	r.mu.Lock()
+	j := r.running[id]
+	// pgid is zero for the instant between dispatch and exec.Start; there is
+	// no group to signal yet, so the caller is told nothing happened rather
+	// than being given a pause that silently did not take.
+	if j == nil || j.Status != Running || j.pgid == 0 || j.paused == want {
+		r.mu.Unlock()
+		return false
+	}
+	pgid := j.pgid
+	r.mu.Unlock()
+
+	sig := syscall.SIGCONT
+	if want {
+		sig = syscall.SIGSTOP
+	}
+	if err := syscall.Kill(-pgid, sig); err != nil {
+		return false
+	}
+
+	now := time.Now()
+	r.mu.Lock()
+	if want {
+		j.pausedAt = now
+	} else {
+		if !j.pausedAt.IsZero() {
+			j.pausedFor += now.Sub(j.pausedAt)
+		}
+		j.pausedAt = time.Time{}
+	}
+	j.paused = want
+	snap := snapshot(j)
+	r.mu.Unlock()
+
+	if want {
+		j.Log.WriteString("\nggraphify: paused — SIGSTOP to the process group\n")
+	} else {
+		j.Log.WriteString("ggraphify: resumed — SIGCONT to the process group\n")
+	}
+	r.emit(Event{Job: snap, Pause: true})
+	return true
+}
+
 // CancelAll cancels everything queued and running. The window's close handler
 // calls it: a watcher started from the UI must not outlive the UI.
 func (r *Runner) CancelAll() {
@@ -588,6 +698,16 @@ func (r *Runner) run(j *Job) {
 
 	r.mu.Lock()
 	j.Ended = time.Now()
+	// A cancelled job can be paused at the moment it dies: reap sends SIGCONT
+	// so the SIGTERM lands. Close the open pause here so the final duration
+	// counts the time it was stopped as stopped.
+	if j.paused {
+		if !j.pausedAt.IsZero() {
+			j.pausedFor += j.Ended.Sub(j.pausedAt)
+		}
+		j.pausedAt = time.Time{}
+		j.paused = false
+	}
 	switch {
 	case ctx.Err() != nil:
 		j.Status = Canceled
@@ -633,6 +753,12 @@ func (r *Runner) reap(ctx context.Context, exited <-chan struct{}, j *Job, cmd *
 	pgid := -cmd.Process.Pid
 	j.Log.WriteString("\nggraphify: cancelled — sending SIGTERM to the process group\n")
 	_ = syscall.Kill(pgid, syscall.SIGTERM)
+	// A paused group is stopped, and a stopped process does not act on the
+	// pending SIGTERM until it runs again. SIGCONT unconditionally: it is a
+	// no-op on a group that was never paused, and without it cancelling a
+	// paused job would wait out the whole grace period and then SIGKILL —
+	// exactly the mid-write kill the grace exists to avoid.
+	_ = syscall.Kill(pgid, syscall.SIGCONT)
 
 	grace := time.NewTimer(r.opts.KillGrace)
 	defer grace.Stop()
@@ -668,6 +794,7 @@ func snapshot(j *Job) Snapshot {
 		ID: j.ID, Kind: j.Kind, Repo: j.Repo, Label: j.Label, Cost: j.Cost,
 		Argv: j.Argv, Status: j.Status, Exit: j.Exit,
 		Queued: j.Queued, Started: j.Started, Ended: j.Ended, Log: j.Log,
+		Paused: j.paused, PausedAt: j.pausedAt, Held: j.pausedFor,
 	}
 	if j.Err != nil {
 		s.Err = j.Err.Error()

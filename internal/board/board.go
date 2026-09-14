@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dns/ggraphify/internal/discover"
+	"github.com/dns/ggraphify/internal/graftstate"
 	"github.com/dns/ggraphify/internal/graphstate"
 )
 
@@ -20,6 +21,11 @@ import (
 type Row struct {
 	discover.Repo
 	Graph graphstate.Graph `json:"graph"`
+	// Graft is the state of the *other* index a checkout can carry: graft's
+	// wiring graph under graft/. It is derived the same way and shown beside
+	// the graphify one, because "which of my repositories does an agent
+	// actually have a map of" is one question, not two.
+	Graft graftstate.Index `json:"graft"`
 
 	// Behind is true when the graph was built at a commit that is not HEAD.
 	// It is a different question from drift — a branch switch moves it without
@@ -69,6 +75,11 @@ type Options struct {
 	// identity of the files it came from. This is what makes a refresh tick
 	// over a hundred repositories nearly free in the steady state.
 	Graphs *graphstate.Cache
+	// Grafts is the same memo for the graft index. Separate from Graphs
+	// because the two are invalidated by different runs: a `graphify update`
+	// says nothing about graft/, and a `graft build` says nothing about
+	// graphify-out/.
+	Grafts *graftstate.Cache
 }
 
 // Scan walks the roots and derives every row.
@@ -179,6 +190,20 @@ func derive(repo discover.Repo, opts Options) Row {
 		g.Err = err.Error()
 	}
 	r.Graph = g
+
+	gropts := graftstate.Options{Repo: repo.Path, SkipDrift: opts.SkipDrift}
+	var gr graftstate.Index
+	if opts.Grafts != nil {
+		gr, err = opts.Grafts.Read(gropts)
+	} else {
+		gr, err = graftstate.Read(gropts)
+	}
+	if err != nil {
+		gr.State = graftstate.StateBroken
+		gr.Err = err.Error()
+	}
+	r.Graft = gr
+
 	r.Behind = g.BuiltCommit != "" && repo.HeadSHA != "" && g.BuiltCommit != repo.HeadSHA
 	return r
 }
@@ -193,6 +218,11 @@ type Counts struct {
 	Broken  int `json:"broken"`
 	None    int `json:"none"`
 	Behind  int `json:"behind"`
+	// Grafted is how many checkouts carry a readable graft index, and
+	// GraftStale how many of those the tree has moved under. They are counted
+	// here rather than in the UI so `ggraphify-scan` reports them too.
+	Grafted    int `json:"grafted"`
+	GraftStale int `json:"graft_stale"`
 }
 
 // Summarize counts the rows by state.
@@ -202,6 +232,13 @@ func Summarize(rows []Row) Counts {
 	for _, r := range rows {
 		if r.Behind {
 			c.Behind++
+		}
+		switch r.Graft.State {
+		case graftstate.StateFresh, graftstate.StateRaw:
+			c.Grafted++
+		case graftstate.StateStale:
+			c.Grafted++
+			c.GraftStale++
 		}
 		switch r.Graph.State {
 		case graphstate.StateFresh:

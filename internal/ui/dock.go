@@ -85,6 +85,10 @@ type dockJobRow struct {
 	class  string
 	status *gtk.Label
 	row    *gtk.ListBoxRow
+	// prog is the running job's progress bar. It is filled when the job's
+	// output carries a fraction and pulsed when it does not, on the same
+	// tick that repaints the elapsed time.
+	prog *gtk.ProgressBar
 }
 
 // buildDock constructs the panel. It is added to the window's vertical paned
@@ -537,11 +541,17 @@ func (d *dockPane) jobRow(e dockEntry) *gtk.ListBoxRow {
 	// A running job gets a spinner, because motion is the one mark that cannot
 	// be confused with a state that has stopped moving; everything else gets
 	// the board's own shape, which is readable without colour vision.
-	if s.Status == jobs.Running {
+	if s.Status == jobs.Running && !s.Paused {
 		spin := gtk.NewSpinner()
 		spin.SetSpinning(true)
 		spin.SetSizeRequest(14, 14)
 		box.Append(spin)
+	} else if s.Paused {
+		// A spinner that keeps spinning over a stopped process group would be
+		// the one mark on this row that is not true.
+		dot := gtk.NewLabel("‖")
+		dot.AddCSSClass("st-none")
+		box.Append(dot)
 	} else {
 		dot := gtk.NewLabel(stateGlyphForJob(s.Status))
 		if class != "" {
@@ -561,6 +571,10 @@ func (d *dockPane) jobRow(e dockEntry) *gtk.ListBoxRow {
 		box.Append(m)
 	}
 
+	prog := newJobProgressBar()
+	box.Append(progressSlot(prog))
+	setJobProgress(prog, &s)
+
 	status := gtk.NewLabel(text)
 	if class != "" {
 		status.AddCSSClass(class)
@@ -569,6 +583,11 @@ func (d *dockPane) jobRow(e dockEntry) *gtk.ListBoxRow {
 
 	if !s.Status.Done() {
 		id := s.ID
+		if s.Status == jobs.Running {
+			box.Append(d.a.pauseIconButton(s))
+		} else {
+			box.Append(buttonSpacer(1))
+		}
 		x := gtk.NewButtonFromIconName("window-close-symbolic")
 		x.AddCSSClass("flat")
 		x.SetTooltipText("Cancel this job")
@@ -577,9 +596,7 @@ func (d *dockPane) jobRow(e dockEntry) *gtk.ListBoxRow {
 	} else {
 		// A fixed-width placeholder so the finished rows' text does not
 		// shift sideways relative to the running ones above them.
-		sp := gtk.NewBox(gtk.OrientationHorizontal, 0)
-		sp.SetSizeRequest(24, -1)
-		box.Append(sp)
+		box.Append(buttonSpacer(2))
 	}
 
 	row := gtk.NewListBoxRow()
@@ -591,7 +608,7 @@ func (d *dockPane) jobRow(e dockEntry) *gtk.ListBoxRow {
 		row.ConnectActivate(func() { d.a.selectRepo(repo) })
 	}
 
-	d.rows = append(d.rows, &dockJobRow{id: s.ID, class: class, status: status, row: row})
+	d.rows = append(d.rows, &dockJobRow{id: s.ID, class: class, status: status, row: row, prog: prog})
 	return row
 }
 
@@ -612,7 +629,13 @@ func dockStatus(e dockEntry) (text, class string) {
 		}
 		return t, "st-none"
 	case jobs.Running:
-		return "running · " + shortDur(s.Elapsed()), "st-running"
+		if s.Paused {
+			// Still "st-none", not "st-running": a paused job is not making
+			// progress, and colouring it as if it were is the whole reason
+			// somebody would misread this strip.
+			return joinDot("paused", progressNote(&s), "ran "+shortDur(s.Elapsed())), "st-none"
+		}
+		return joinDot("running", progressNote(&s), shortDur(s.Elapsed())), "st-running"
 	case jobs.Succeeded:
 		return joinDot("finished ok", "took "+shortDur(s.Elapsed()), endedAgo(s)), "st-fresh"
 	case jobs.Canceled:
@@ -697,6 +720,7 @@ func (d *dockPane) tickJobs() {
 		text, class := dockStatus(e)
 		r.status.SetText(text)
 		setClass(r.status, &r.class, class)
+		setJobProgress(r.prog, &e.snap)
 		if r.row != nil {
 			r.row.SetTooltipText(dockRowTooltip(e))
 		}
@@ -721,6 +745,12 @@ func dockKey(entries []dockEntry) string {
 		b.WriteString(gfy.Itoa(int(e.snap.ID)))
 		b.WriteByte(':')
 		b.WriteString(e.snap.Status.String())
+		// Pausing does not change the status, but it changes the row — the
+		// spinner becomes a mark and the button flips — so it has to move the
+		// key, or the rebuild would be skipped as a no-op.
+		if e.snap.Paused {
+			b.WriteString(":paused")
+		}
 		b.WriteByte('|')
 	}
 	return b.String()

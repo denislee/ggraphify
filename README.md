@@ -52,6 +52,7 @@ rather than remembered.
 | Folder | the scan root this checkout was found under, and what the folder filter narrows to |
 | Branch | branch and short SHA; `≠` when the graph was built at a different commit |
 | Graph | `2047n / 4835e` |
+| Graft | the *other* index: `● 951n`, plus `~12 −3` when the tree has moved under it |
 | Comm. | community count, or "83 unnamed" when the LLM labelling pass has not run |
 | Drift | `+12 ~30 −3` added / changed / removed versus `manifest.json`, or `needs-extract` |
 | Built | how long ago `graph.json` was written |
@@ -76,6 +77,48 @@ just been extracted reported `+4758 −2` — two agent worktrees under `.claude
 gitignored `graft/` cache, a leftover in-tree `graphify-out/`, and two git hooks the walk
 could never see — and the row could not reach `fresh` no matter what was run against it.
 
+## The graft column, and syncing a folder
+
+A checkout can carry two indexes, and they answer to different tools: graphify's, under
+`graphify-out/`, and [graft](https://www.npmjs.com/package/@nanonets/graft)'s wiring graph,
+under `<repo>/graft`. The **Graft** column says which of the two this repository actually
+has, in the same alphabet the state dot uses — `○` never built, `◍` wiring only (graft's
+free default; the `--deep` concept layer has not been run), `◐` the tree has moved under
+it, `●` in step, `△` a half-built directory an interrupted build left behind.
+
+**Ctrl+G — or the folder button in the header — syncs the whole target directory**: one
+`graft build` per repository in the folder the filter is on, skipping the ones already in
+step. It is free (tree-sitter, no API key, no LLM request), it runs in the free lane like
+any other job, and it is gated by the same typed-count confirm as every other batch —
+because `graft build` writes a `graft/` directory *inside* each checkout and adds it to
+that repository's `.gitignore`.
+
+Graft freshness, like graphify drift, is **derived from files and never by running graft**:
+`graft check` re-extracts every source file through tree-sitter, which is seconds per
+repository and impossible on a 30-second tick over a hundred of them. The board reads the
+node and edge counts out of `wiring.json`'s `meta` (a few hundred bytes of a file that is
+megabytes long, since `meta` is written first), and measures drift against graft's own
+`fingerprint.*.json` — one `stat` per recorded file, and a content hash only for the ones
+whose `(size, mtime)` disagrees. That last rule is graft's own probe rule, and it is what
+keeps a `touch`, or a branch switch that restores identical bytes, from showing up as work
+to do.
+
+That `.gitignore` entry is what keeps the two indexes out of each other's way, so the
+detail pane says when it is missing. graphify's extraction is gitignore-aware, which is the
+only reason it has never indexed graft's cards; a `graft/` left visible to git (graft's
+`--no-gitignore`, `GRAFT_NO_GITIGNORE=1`, or a hand-edited file) is one markdown card per
+source file sitting in the tree, and the next extract will read every one of them as
+source — a second prose copy of the codebase in `graph.json`, counted as drift until it is,
+and billed at the metered rate. It is a note on a fact and not an issue on the row: the
+remedy is one line in a `.gitignore`, no graphify command can apply it, and a *Fix* button
+that could never clear it would be worse than the note.
+
+One thing the column deliberately does **not** report: *added* files. Naming one would mean
+mirroring graft's extension table, its gitignore handling and its `--only-dir` whitelist —
+a moving target in another project, and getting it wrong pins a row to "stale" that no
+rebuild can clear. Changed and removed are measured against what graft itself recorded, so
+they are answerable.
+
 ## Free versus metered
 
 The split is not a label on a button; it is a property of the command, declared in
@@ -89,6 +132,7 @@ The split is not a label on a button; it is a property of the command, declared 
 | `tree`, `check-update`, `watch`, `benchmark` | |
 | `query`, `explain`, `path`, `affected`, `god-nodes`, `diagnose` | |
 | `global add\|remove\|list`, `merge-graphs`, `hook install` | |
+| `graft build` (tree-sitter only — graft's `--deep` pass is never run) | |
 
 `cluster-only` is free *because* ggraphify passes `--no-label`. Without that flag it
 dispatches LLM calls to name the communities and costs exactly what `label` costs — so the
@@ -370,6 +414,51 @@ a missing graphify, or no Claude Code on the machine at all. `$CLAUDE_CONFIG_DIR
 honoured, so a board checking one directory while an agent reads another cannot happen.
 
 The same report goes into the diagnostics the log page copies.
+
+**Settings → Jobs → graft integration** is the same question for the other indexer, one
+group below: is the Claude Code CLI on this machine configured to *use* graft? That wiring
+is four files deep and every way it breaks is silent — the agent greps source it could have
+queried, and nothing anywhere says why. The group reads what `graft init` writes at user
+level, the copy that applies to every project the CLI opens:
+
+| Row | What it reads |
+| --- | --- |
+| graft | the binary, resolved the way jobs resolve it, and its version |
+| Hooks shim | `helpers/graft-hooks.cjs` — **the one the hook entries actually name**, which is not always the one in this account's directory |
+| Shim target | the `dist/claude` the shim bakes in: gone (an nvm bump, an uninstall) means an `npm root -g` per hook; older than the installed graft means the hooks run the old code |
+| Hook entries | which of `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop` run the shim, and which are missing |
+| MCP server | `mcpServers.graft` — a warning when absent, not a failure: the hooks still fire, the agent just has to spend a Bash call |
+| graphify hook-guard | the other integration's `PreToolUse` entries in the same file, and whether they are strict — see below |
+| Fix scope | present only when `graft init` cannot write the account being inspected |
+
+*Fix* runs `graft init <repo> --no-build --no-agents --yes`. The flags are the whole design:
+no index is built (the board has a button for that), no other agent's files are touched, and
+graft's interactive picker is skipped because a job log cannot answer one. **`graft init` has
+no machine-only mode** — the writes into `~/.claude` come alongside writes into one
+repository's `.claude/` and `.mcp.json` — so the button uses the row selected on the board,
+and the confirm names that repository and every file in both scopes before anything runs.
+It is insensitive when nothing is wrong, and stays insensitive when what is wrong is not
+`graft init`'s to repair: no graft installed, or a `settings.json` that is not valid JSON
+(graft refuses to touch one, so a Fix button that promised to would be lying).
+
+It is also insensitive when the **account selected in settings is not the default one**.
+`graft init` resolves its user-level targets from the home directory alone and ignores
+`CLAUDE_CONFIG_DIR` — graphify's installer honours it, so the board's per-job account
+selection reaches one integration and silently misses the other. With `~/.claude-work` in
+force, the group inspects that directory, `graft init` would write `~/.claude`, and a Fix
+button that ran it would leave the very rows that enabled it red. So the group withdraws
+fixability, says which directory the command would actually write, and names the two ways
+out: select the default account, or copy graft's hook entries across by hand.
+
+The **graphify hook-guard** row is about the two integrations meeting in one session rather
+than in one file. They merge cleanly — graphify owns `PreToolUse`, graft owns the other four
+events — and in the default advisory mode both simply put their own hint in front of the
+agent. Strict mode is different: the guard blocks a session's first raw read until
+`graphify query` has run, it decides that from `graphify-out/cache/last_query_stamp`, and a
+session that followed graft's own SessionStart hint and ran `graft ask` never touches that
+stamp. Following one integration's advice is what trips the other's block, so the row warns
+and names the way out (`GRAPHIFY_HOOK_STRICT=0`, or re-installing the guard without
+`--strict`). `graft init` cannot repair it, so it is never offered as fixable.
 
 ## Backends: no API key required
 

@@ -61,12 +61,13 @@ type detailPane struct {
 	query *queryPage
 
 	// Jobs (this repo).
-	jobsBox *gtk.Box
-	jobLog  *gtk.TextView
-	jobHead *gtk.Label
-	jobGen  uint64
-	jobID   uint64
-	histBox *gtk.Box
+	jobsBox  *gtk.Box
+	jobLog   *gtk.TextView
+	jobHead  *gtk.Label
+	jobPause *gtk.Button
+	jobGen   uint64
+	jobID    uint64
+	histBox  *gtk.Box
 
 	row *board.Row
 }
@@ -194,6 +195,7 @@ func (d *detailPane) tick() {
 	}
 	if !s.Status.Done() {
 		d.jobHead.SetText(jobHeadline(s))
+		setPauseButton(d.jobPause, s)
 	}
 }
 
@@ -367,10 +369,20 @@ func (d *detailPane) buildActionGroups() *adw.PreferencesGroup {
 	d.fixRow = adw.NewActionRow()
 	d.fixRow.SetTitle("Fix")
 	d.fixRow.SetSubtitle(fixSubtitle(nil))
+	// Two buttons, because the plan has two honest shapes: everything this
+	// repository needs, and everything it needs that costs nothing. The free
+	// one sits to the left and stays flat — it is the cheaper click, not the
+	// primary one.
+	freeBtn := gtk.NewButtonWithLabel("Free steps")
+	freeBtn.SetVAlign(gtk.AlignCenter)
+	freeBtn.AddCSSClass("flat")
+	freeBtn.SetTooltipText("Run only the steps that need no API key: no LLM request is sent.")
+	freeBtn.ConnectClicked(d.a.actFixFree)
 	fixBtn := gtk.NewButtonWithLabel("Fix")
 	fixBtn.SetVAlign(gtk.AlignCenter)
 	fixBtn.AddCSSClass("suggested-action")
 	fixBtn.ConnectClicked(d.a.actFix)
+	d.fixRow.AddSuffix(freeBtn)
 	d.fixRow.AddSuffix(fixBtn)
 	d.fixRow.SetActivatableWidget(fixBtn)
 	g.Add(d.fixRow)
@@ -384,6 +396,7 @@ func (d *detailPane) buildActionGroups() *adw.PreferencesGroup {
 	add("Extract", "Full AST + semantic extraction. METERED — dispatches LLM requests.", "extract", d.a.actExtract, true)
 	add("Label communities", "Name the communities with an LLM. METERED.", "label", d.a.actLabel, true)
 	add("Add to global graph", "Merge this graph into ~/.graphify/global-graph.json. Free.", "global-add", d.a.actGlobalAdd, false)
+	add("Sync graft index", "Rebuild this checkout's graft/ — graft's wiring graph, the one agents query. Free, tree-sitter only.", "graft-build", d.a.actGraftBuild, false)
 	add("Install git hooks", "graphify writes post-commit/post-checkout hooks into this repository.", "hook-install", d.a.actHookInstall, false)
 
 	// The two openers, which are not jobs at all.
@@ -484,6 +497,11 @@ func (d *detailPane) loadOverview() {
 		}
 		fact("Size", board.Bytes(g.SizeBytes), "")
 	}
+	// The other index. Two lines at most, and only when there is one: a
+	// checkout graft has never run on says nothing here, exactly as the Graft
+	// column renders a bare ring for it.
+	fact("Graft", graftFact(r.Graft), graftClass(r.Graft.State))
+	fact("", graftExposureNote(r.Graft), "st-stale")
 	if s := d.a.jobFor(r.Path); s != nil {
 		fact("Last job", jobHeadline(s), "")
 	}
@@ -679,6 +697,9 @@ func (d *detailPane) buildJobs() gtk.Widgetter {
 	cancel := gtk.NewButtonWithLabel("Cancel")
 	cancel.AddCSSClass("destructive-action")
 	cancel.ConnectClicked(func() { d.a.cancelCurrent() })
+	d.jobPause = gtk.NewButtonWithLabel("Pause")
+	d.jobPause.AddCSSClass("flat")
+	d.jobPause.ConnectClicked(func() { d.a.pauseCurrent() })
 	copyCmd := gtk.NewButtonWithLabel("Copy command line")
 	copyCmd.AddCSSClass("flat")
 	copyCmd.ConnectClicked(func() {
@@ -699,6 +720,7 @@ func (d *detailPane) buildJobs() gtk.Widgetter {
 	d.jobHead.SetHExpand(true)
 	bar.Append(d.jobHead)
 	bar.Append(copyCmd)
+	bar.Append(d.jobPause)
 	bar.Append(cancel)
 
 	d.jobLog = gtk.NewTextView()
@@ -740,6 +762,7 @@ func (d *detailPane) reloadJobs() {
 		return
 	}
 	s := d.a.jobFor(d.row.Path)
+	setPauseButton(d.jobPause, s)
 	if s == nil {
 		d.jobHead.SetText("No job has run against this repository in this session.")
 		d.jobLog.Buffer().SetText("")
@@ -806,7 +829,11 @@ func jobHeadline(s *jobs.Snapshot) string {
 	var b strings.Builder
 	b.WriteString(s.Label)
 	b.WriteString(" — ")
-	b.WriteString(s.Status.String())
+	if s.Status == jobs.Running && s.Paused {
+		b.WriteString("paused")
+	} else {
+		b.WriteString(s.Status.String())
+	}
 	if s.Status == jobs.Running || s.Status.Done() {
 		b.WriteString(" (")
 		b.WriteString(shortDur(s.Elapsed()))

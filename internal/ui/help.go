@@ -59,6 +59,10 @@ func accelFor(keys string) string {
 		return "<Control>f <Control>b"
 	case "Ctrl+Q":
 		return "<Control>q"
+	case "Ctrl+H":
+		return "<Control>h"
+	case "Ctrl+G":
+		return "<Control>g"
 	}
 	return keys
 }

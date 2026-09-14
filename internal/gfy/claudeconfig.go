@@ -276,50 +276,17 @@ func (s ClaudeSetup) has(name string, st CheckState) bool {
 
 // State is the worst outcome across every check, which is what the summary
 // row shows.
-func (s ClaudeSetup) State() CheckState {
-	worst := CheckOK
-	for _, c := range s.Checks {
-		if c.State > worst {
-			worst = c.State
-		}
-	}
-	return worst
-}
+func (s ClaudeSetup) State() CheckState { return worstCheck(s.Checks) }
 
 // OK reports whether nothing needs attention.
 func (s ClaudeSetup) OK() bool { return s.State() == CheckOK }
 
 // Fixable reports whether re-running the installer would change anything.
-func (s ClaudeSetup) Fixable() bool {
-	for _, c := range s.Checks {
-		if c.Fixable && c.State != CheckOK {
-			return true
-		}
-	}
-	return false
-}
+func (s ClaudeSetup) Fixable() bool { return checksFixable(s.Checks) }
 
 // Summary is the one-line verdict.
 func (s ClaudeSetup) Summary() string {
-	var warn, bad int
-	for _, c := range s.Checks {
-		switch c.State {
-		case CheckWarn:
-			warn++
-		case CheckBad:
-			bad++
-		}
-	}
-	switch {
-	case bad == 0 && warn == 0:
-		return "Claude Code is wired up to graphify on this machine."
-	case bad > 0 && warn > 0:
-		return count(bad, "problem") + " and " + count(warn, "warning") + "."
-	case bad > 0:
-		return count(bad, "problem") + "."
-	default:
-		return count(warn, "warning") + "."
-	}
+	return summarizeChecks(s.Checks, "Claude Code is wired up to graphify on this machine.")
 }
 
 // FixArgv is the command that repairs what is repairable, for the button's

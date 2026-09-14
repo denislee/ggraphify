@@ -25,9 +25,29 @@ import (
 type Cache struct {
 	mu sync.Mutex
 	m  map[string]entry
+	// gen counts invalidations, per repository and board-wide. A derivation
+	// that was already in flight when its repository was invalidated must not
+	// store its result: it was computed from inputs the caller has since
+	// declared out of date, and storing it puts the superseded answer back in
+	// the cache for a whole TTL. That is exactly the "Fix cleared the drift,
+	// the row stayed stale" case — ackDrift records the baseline and
+	// invalidates while the refresh it raced is still walking the tree with
+	// the old one.
+	gen    map[string]uint64
+	clears uint64
 	// TTL bounds how stale a cached derivation may be. Zero means DefaultTTL.
 	TTL time.Duration
 }
+
+// stamp is the invalidation state one derivation was started under. Read only
+// stores its result when the stamp has not moved since.
+type stamp struct {
+	clears uint64
+	repo   uint64
+}
+
+// derived is called between a derivation and its store, by tests only.
+var derived func(repo string)
 
 // DefaultTTL is short enough that a file edited in an editor shows up as drift
 // within a tick or two, and long enough that the expensive half is skipped on
@@ -55,6 +75,7 @@ func (c *Cache) Read(opts Options) (Graph, error) {
 
 	c.mu.Lock()
 	e, ok := c.m[opts.Repo]
+	at := stamp{clears: c.clears, repo: c.gen[opts.Repo]}
 	c.mu.Unlock()
 	if ok && e.key == key && time.Since(e.at) < ttl {
 		return e.g, nil
@@ -64,11 +85,19 @@ func (c *Cache) Read(opts Options) (Graph, error) {
 	if err != nil {
 		return g, err
 	}
-	c.mu.Lock()
-	if c.m == nil {
-		c.m = map[string]entry{}
+	if derived != nil {
+		// Test seam: the whole question this function answers is what happens
+		// when an Invalidate lands *here*, between the derivation and the
+		// store, and there is no other way to put it there deterministically.
+		derived(opts.Repo)
 	}
-	c.m[opts.Repo] = entry{key: key, at: time.Now(), g: g}
+	c.mu.Lock()
+	if (stamp{clears: c.clears, repo: c.gen[opts.Repo]}) == at {
+		if c.m == nil {
+			c.m = map[string]entry{}
+		}
+		c.m[opts.Repo] = entry{key: key, at: time.Now(), g: g}
+	}
 	c.mu.Unlock()
 	return g, nil
 }
@@ -79,6 +108,10 @@ func (c *Cache) Read(opts Options) (Graph, error) {
 func (c *Cache) Invalidate(repo string) {
 	c.mu.Lock()
 	delete(c.m, repo)
+	if c.gen == nil {
+		c.gen = map[string]uint64{}
+	}
+	c.gen[repo]++
 	c.mu.Unlock()
 }
 
@@ -86,6 +119,8 @@ func (c *Cache) Invalidate(repo string) {
 func (c *Cache) Clear() {
 	c.mu.Lock()
 	c.m = nil
+	c.gen = nil
+	c.clears++
 	c.mu.Unlock()
 }
 

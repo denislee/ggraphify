@@ -45,6 +45,26 @@ func (a *App) buildHeader() gtk.Widgetter {
 	header.PackStart(selBtn)
 	a.selBtn = selBtn
 
+	// The board-wide free sweep. It sits with rescan rather than with the
+	// per-row actions in the detail pane because it is not about the selected
+	// row at all, and it is an icon button like the rest of the header: the
+	// dialog it opens is where the repository count and the plan are.
+	freeAll := gtk.NewButtonFromIconName("system-run-symbolic")
+	freeAll.AddCSSClass("flat")
+	freeAll.SetTooltipText("Run the free fix steps on every repository (Ctrl+H) — no API key, no LLM call")
+	freeAll.ConnectClicked(func() { a.actFixFreeAll() })
+	header.PackStart(freeAll)
+
+	// The graft sweep, beside the graphify one: same shape (a free, board-wide
+	// button whose dialog carries the count and the plan), different indexer.
+	// It is scoped to the folder filter in force, which is the dropdown one
+	// row below it.
+	graftAll := gtk.NewButtonFromIconName("folder-symbolic")
+	graftAll.AddCSSClass("flat")
+	graftAll.SetTooltipText("Sync the graft index for every repository in the selected folder (Ctrl+G) — free, no LLM call")
+	graftAll.ConnectClicked(func() { a.actSyncGraft() })
+	header.PackStart(graftAll)
+
 	// Right: the gear is rightmost because it is the canonical home of every
 	// preference the other buttons toggle, so it reads as the end of the row.
 	gear := gtk.NewButtonFromIconName("emblem-system-symbolic")

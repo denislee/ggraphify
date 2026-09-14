@@ -150,7 +150,23 @@ var Known = map[string]Spec{
 	"install":         {Kind: "install", Title: "Install agent skill", Cost: Free, Mutates: true},
 	"reflect":         {Kind: "reflect", Title: "Reflect on saved results", Cost: Free, Mutates: true, NeedsGraph: true},
 	"save-result":     {Kind: "save-result", Title: "Save query result", Cost: Free, Mutates: true},
+
+	// graft, the other indexer. `build` without --deep is tree-sitter only:
+	// no key, no network, no bill — the same shape as `update` is for
+	// graphify. It writes into <repo>/graft rather than into graphify-out/,
+	// which is why Mutates is true and why the board confirms it.
+	"graft-build": {Kind: "graft-build", Title: "Sync graft index", Cost: Free, Mutates: true},
+	// `graft init` is the installer: it writes the Claude Code wiring, both
+	// the user-level copy in ~/.claude and the repo-level one in the checkout
+	// it is pointed at. Free, and never run without the dialog that lists
+	// every file it touches.
+	"graft-init": {Kind: "graft-init", Title: "Wire Claude Code for graft", Cost: Free, Mutates: true},
 }
+
+// Graft reports whether a kind runs the graft CLI rather than graphify. The
+// two binaries are resolved differently and a job's Out means nothing to the
+// graft ones, so the board has to be able to tell them apart.
+func Graft(kind string) bool { return strings.HasPrefix(kind, "graft-") }
 
 // Argv builds the command line for a kind. The returned slice starts with the
 // graphify binary, so it is exec-ready and also copy-pasteable verbatim — the
@@ -159,7 +175,11 @@ var Known = map[string]Spec{
 // An unknown kind returns nil. Callers treat that as a programming error, not
 // as a user-facing condition: every kind the UI can reach is in Known.
 func Argv(kind string, p Params) []string {
-	a := []string{Bin()}
+	bin := Bin()
+	if Graft(kind) {
+		bin = GraftBin()
+	}
+	a := []string{bin}
 	add := func(v ...string) { a = append(a, v...) }
 	// flag appends `--name value` only when value is non-empty. Restating a
 	// default is what makes a GUI break on a release that moves one.
@@ -359,6 +379,27 @@ func Argv(kind string, p Params) []string {
 
 	case "save-result":
 		add("save-result", "--question", p.Question, "--answer", p.NodeA)
+
+	case "graft-init":
+		add("init", p.Repo)
+		// --no-build because the board has its own sync button for that and a
+		// dialog about wiring should not silently start an index of a
+		// monorepo; --no-agents because ggraphify speaks for Claude Code and
+		// has no business writing Cursor's or Copilot's files; --yes because
+		// graft's interactive picker cannot be answered from a job log.
+		//
+		// Note that the CLAUDE_CONFIG_DIR every job carries does NOT steer
+		// this one: graft's installer resolves its user-level targets from the
+		// home directory and reads the variable only inside the hooks it
+		// writes. The settings group says so rather than the argv pretending
+		// otherwise — see GraftInitDir and GraftSetup.InitWrites.
+		add("--no-build", "--no-agents", "--yes")
+
+	case "graft-build":
+		// The repository positionally, and nothing else: every flag graft
+		// build takes either costs money (--deep), or pins a choice graft
+		// persists in its own fingerprint and should keep making for itself.
+		add("build", p.Repo)
 
 	default:
 		return nil

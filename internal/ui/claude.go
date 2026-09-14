@@ -130,7 +130,10 @@ func (a *App) claudeAccountRow() *adw.ComboRow {
 		// Everything below this row described the previous account, and the
 		// running jobs keep the one they were launched with; re-checking is
 		// what stops the group from answering about a directory nobody uses.
+		// Both groups: graft's wiring lives in the same directory and moves
+		// with this choice exactly as graphify's skill does.
 		a.checkClaude(false)
+		a.checkGraftSetup(false)
 	})
 	a.claudeAccountCombo = row
 	return row
@@ -180,7 +183,7 @@ func (a *App) fillClaude(s gfy.ClaudeSetup) {
 	for _, c := range s.Checks {
 		row := adw.NewActionRow()
 		row.SetTitle(c.Name)
-		row.SetSubtitle(c.Detail)
+		row.SetSubtitle(escapeMarkup(c.Detail))
 		row.SetSubtitleLines(0)
 
 		mark := gtk.NewLabel(c.State.Glyph())
@@ -196,7 +199,7 @@ func (a *App) fillClaude(s gfy.ClaudeSetup) {
 		a.claudeRows = append(a.claudeRows, row)
 	}
 
-	a.claudeSummary.SetSubtitle(s.Summary() + "  ·  " + s.Dir)
+	a.claudeSummary.SetSubtitle(escapeMarkup(s.Summary() + "  ·  " + s.Dir))
 	a.claudeFixBtn.SetSensitive(s.Fixable())
 	if s.Fixable() {
 		a.claudeFixBtn.SetTooltipText("Re-run " + gfy.FixArgv() +
