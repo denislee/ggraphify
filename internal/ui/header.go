@@ -72,8 +72,9 @@ func (a *App) buildHeader() gtk.Widgetter {
 	// confirm dialog exists to prevent.
 	localAll := gtk.NewButtonFromIconName("computer-symbolic")
 	localAll.AddCSSClass("flat")
-	localAll.SetTooltipText("Full LLM extraction on every repository that never had one (Ctrl+L) — " +
-		"runs on the local model: no API key and no bill, but hours of this machine")
+	localAll.SetTooltipText("Force a full LLM extraction on EVERY repository on the board " +
+		"(Ctrl+L) — runs on the local model: no API key and no bill, but days of this machine, " +
+		"and it redoes rows that are already healthy. Ctrl+H is the free, surgical alternative.")
 	localAll.ConnectClicked(func() { a.actExtractLocalAll() })
 	header.PackStart(localAll)
 

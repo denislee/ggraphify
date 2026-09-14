@@ -631,18 +631,24 @@ confirm dialog now separates the three, and each names its fix:
 
 The local backend changes what a fan-out means, so it gets a button the metered
 backends deliberately do not have. **Ctrl+L**, or the `computer-symbolic` button beside the
-free sweep, runs a **full LLM extraction on every repository that has never had one**,
-against the local model.
+free sweep, **forces a full LLM extraction on every repository on the board**, against the
+local model.
 
 That sweep is the single most expensive thing this application could do against an API key,
 which is exactly why no button offers it there. Against a model on this machine it costs
 nothing but time, so the overnight pass over the backlog of checkouts nobody was going to
 pay to extract becomes the obvious thing to want. Three things keep it honest:
 
-- **Scoped to rows that never ran** — `StateNone` (no output directory) and `StateRaw` (a
-  graph whose communities were never named). A `fresh` or `stale` graph already has its
-  semantic layer; stale means the tree moved under it, which a *free* AST `update` repairs.
-  Re-extracting either would be hours of CPU to rebuild what is already there.
+- **Every row, with no state filter at all.** `--force` is passed and nothing is skipped for
+  already being healthy: a graph that is fresh, labelled and reported is re-extracted from
+  scratch alongside the ones that were never built. This is hours of CPU spent rebuilding
+  what was already correct, and it is only defensible because the local backend charges
+  nothing for it. **Ctrl+H** — the free Fix sweep, which plans the minimum command each row
+  actually needs — stays the right first choice; this is "redo everything, I do not care how
+  long it takes".
+- **Two exclusions survive**, and both are your own instruction rather than a judgement
+  about state: rows flagged `⊘` to stay out of batch actions, and rows with a job already in
+  flight.
 - **The backend is pinned, not auto-detected.** An exported `GEMINI_API_KEY` cannot turn a
   sweep you asked to run locally into a bill — the pinned name is in the argv the confirm
   dialog prints.

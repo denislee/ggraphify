@@ -262,27 +262,43 @@ func (a *App) startOllama() {
 	}()
 }
 
-// The board-wide local extraction: run the full LLM pass, against the model on
-// this machine, on every repository that has never had one.
+// The board-wide local extraction: force a full LLM extraction, against the
+// model on this machine, on every repository the board knows about.
 //
 // It exists because the local backend changes what a fan-out over a hundred
-// checkouts *means*. Against an API key that sweep is the single most
-// expensive thing this application can do, which is why nothing offers it as
-// one button. Against a local model it costs nothing but time, so the sweep
-// that was never safe to offer becomes the obvious one — overnight work on the
-// backlog of repositories nobody was going to pay to extract.
+// checkouts *means*. Against an API key this is the single most expensive
+// thing this application can do, and no button should make it one click.
+// Against a local model it costs nothing but time, so the sweep that was never
+// safe to offer becomes the one worth having — one overnight pass that leaves
+// every row on the board fully extracted.
 //
-// Three things keep it honest anyway:
+// It is the blunt instrument, and it is blunt in both directions on purpose:
+// `--force` is passed, and NO row is skipped for already being healthy. A
+// graph that is fresh, labelled and reported is re-extracted from scratch
+// along with the ones that were never built. That is hours of CPU spent
+// rebuilding what was already correct, and it is only defensible because the
+// local backend charges nothing for it. The free Fix sweep (Ctrl+H) plans the
+// minimum command each row actually needs and remains the right first choice;
+// this one is for "redo everything, I do not care what it costs in time".
 //
-//   - It is scoped to rows that never ran, not to the whole board. A fresh or
-//     stale graph already has its semantic layer; re-extracting it would be
-//     hours of CPU to rebuild what is there (see board.NeverExtracted).
+// Two exclusions survive, and both are the user's own instruction rather than
+// a judgement about state:
+//
+//   - rows flagged to stay out of batch actions (⊘), which means exactly this;
+//   - rows with a job already in flight, because the runner serializes
+//     mutating commands per repository and a second extract would only queue
+//     an hours-long job to redo what is already running.
+//
+// Three things keep it honest:
+//
+//   - Readiness is checked before anything is queued. A hundred jobs each
+//     failing against a stopped server is a log nobody can read.
 //   - It pins the backend to the local one explicitly rather than relying on
 //     auto-detect, so an exported API key cannot turn a sweep the user asked
 //     to run locally into a bill. The pinned name is in the argv the confirm
 //     dialog prints.
-//   - It goes through the ordinary confirm, which for a batch this size means
-//     the typed-count gate as well.
+//   - It goes through the ordinary confirm, which at this batch size means the
+//     typed-count gate as well.
 func (a *App) actExtractLocalAll() {
 	backend := gfy.OllamaBackend
 	model := a.opts.Store.Settings().Model
@@ -297,7 +313,7 @@ func (a *App) actExtractLocalAll() {
 	}
 
 	var rows []board.Row
-	var running, done, excluded int
+	var running, excluded int
 	for _, r := range a.allRows() {
 		// One read of the job table per row: jobFor takes the lock, and asking
 		// it twice in one switch would both cost double and let the answer
@@ -306,35 +322,28 @@ func (a *App) actExtractLocalAll() {
 		switch {
 		case r.Excluded:
 			excluded++
-		case !r.NeverExtracted():
-			done++
 		case job != nil && !job.Status.Done():
-			// Already building. The runner serializes mutating commands per
-			// repository, so a second extract would not corrupt anything — it
-			// would just queue an hours-long job to redo what is in flight.
 			running++
 		default:
 			rows = append(rows, r)
 		}
 	}
 	if len(rows) == 0 {
-		switch {
-		case done > 0 && running == 0 && excluded == 0:
-			a.toastf("every repository on the board has already been extracted (%d)", done)
-		default:
-			a.toastf("nothing to extract: %d already done, %d running, %d kept out of batches",
-				done, running, excluded)
-		}
+		a.toastf("nothing to extract: %d running, %d kept out of batches", running, excluded)
 		return
 	}
 
-	applog.Infof("local sweep: %d never extracted, %d already done, %d running, %d excluded — backend %s, model %s",
-		len(rows), done, running, excluded, backend, gfy.LocalModel(backend, model))
+	applog.Infof("local sweep: forced extract on all %d repositories (%d running, %d excluded) — backend %s, model %s",
+		len(rows), running, excluded, backend, gfy.LocalModel(backend, model))
 
 	a.run("extract", rows, func(p *gfy.Params) {
 		p.Backend = backend
 		if model != "" {
 			p.Model = model
 		}
+		// Force, because this sweep rebuilds graphs that already exist as well
+		// as building the ones that do not. Without it graphify declines to
+		// overwrite a graph.json whose rebuild came out smaller.
+		p.Force = true
 	})
 }
