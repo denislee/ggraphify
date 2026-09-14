@@ -43,3 +43,8 @@ go.work.sum
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+
+# graphify's own output for this checkout — graph.json, graph.html,
+# GRAPH_REPORT.md, the labels file and the dated backups. Same category as
+# graft/ above: regenerable by `graphify update .`, and twelve megabytes of it.
+/graphify-out/

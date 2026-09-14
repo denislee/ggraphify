@@ -309,8 +309,16 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 			}
 		case gfy.ClaudeCLIBackend:
 			names[i] = b + " (Claude Code on this machine, no API key)"
+		case gfy.OllamaBackend:
+			names[i] = b + " (a model on this machine — free, slow, no API key)"
 		default:
 			names[i] = b
+			// openai is the OpenAI API until OPENAI_BASE_URL says otherwise,
+			// at which point it is whatever local server that names. Saying so
+			// here is the only place a user would find out.
+			if gfy.IsLocalBackend(b) {
+				names[i] = b + " (→ " + gfy.LocalBaseURL(b) + ", local and free)"
+			}
 		}
 	}
 	backend.SetModel(gtk.NewStringList(names))
@@ -347,8 +355,8 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 			"will be used instead, and needs none.")
 	} else {
 		key.SetSubtitle("No API key is visible in this environment — metered commands will fail. " +
-			"Export one before launching, install the Claude Code CLI, or point " +
-			"OLLAMA_HOST at a local model.")
+			"Export one before launching, install the Claude Code CLI, or run a local model: " +
+			"see the group below.")
 	}
 	llm.Add(key)
 
@@ -379,6 +387,7 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 	llm.Add(cli)
 	page.Add(llm)
 
+	page.Add(a.settingsLocal())
 	page.Add(a.settingsClaude())
 	page.Add(a.settingsGraft())
 

@@ -109,6 +109,18 @@ func main() {
 	// LLM requests against the user's own key and costs real money, so it does
 	// not run on a typo.
 	if cost == gfy.Metered && !*yes {
+		if gfy.IsLocalBackend(p.Backend) {
+			// Not a bill — a local model spends time, not money. The gate
+			// stays, because a local extraction over a large repository is
+			// still hours of this machine's CPU and not a thing to start by
+			// typo, but it must not claim a charge that will never appear.
+			fmt.Fprint(os.Stderr, "\n"+gfy.LocalNotice(p.Backend, p.Model)+
+				"Re-run with -y to proceed.\n")
+			if ok, why := gfy.LocalReady(p.Backend, p.Model); !ok {
+				fmt.Fprintln(os.Stderr, "("+why+")")
+			}
+			os.Exit(3)
+		}
 		if p.Backend == gfy.ClaudeCLIBackend {
 			fmt.Fprintf(os.Stderr, "\nThis is a metered command — it dispatches LLM requests through the Claude\n"+
 				"Code CLI on this machine, billed to that login's plan. Re-run with -y to proceed.\n")

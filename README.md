@@ -53,6 +53,7 @@ rather than remembered.
 | Branch | branch and short SHA; `≠` when the graph was built at a different commit |
 | Graph | `2047n / 4835e` |
 | Graft | the *other* index: `● 951n`, plus `~12 −3` when the tree has moved under it |
+| Used | whether an agent actually *read* either index here: a week of daily calls as a sparkline, and the count |
 | Comm. | community count, or "83 unnamed" when the LLM labelling pass has not run |
 | Drift | `+12 ~30 −3` added / changed / removed versus `manifest.json`, or `needs-extract` |
 | Built | how long ago `graph.json` was written |
@@ -144,8 +145,10 @@ command a future build has never heard of could fan out over every repository wi
 confirm.
 
 "Metered" means *an LLM runs*, not *an API key is charged*: with no key set and Claude Code
-installed, the metered column runs through that CLI and is billed to its plan. See
-[Backends](#backends-no-api-key-required).
+installed, the metered column runs through that CLI and is billed to its plan, and against a
+**local model** it is billed to nobody at all — the confirm dialog says which of the three it
+is rather than warning about a bill that will never arrive. See
+[Backends](#backends-no-api-key-required) and [Local models](#local-models-no-key-no-bill).
 
 ## Preconditions
 
@@ -230,7 +233,8 @@ F s        folder filter   c  Re-cluster (free)      G          global graph
 g          top             E  Extract (METERED)      v Space A  batch select
 r          rescan          l  Label (METERED)        X          exclude from batch
 Enter      open detail     e w  export html / wiki
-t          colour scheme   W  watch on/off           ,  ?       settings, help
+t          colour scheme   W  watch on/off           U          usage dashboard
+                                                      ,  ?       settings, help
 Ctrl+F/B   page down / up  x  cancel this row's job   b  L       bottom panel, its log
 ```
 
@@ -251,6 +255,98 @@ not carry a widget that says zero.
 The same information is in the status line at the bottom, and the **jobs view** (`J`, or
 the list icon in the header) is the whole picture: every job across every repository,
 queued, running or finished, with its live log, its exit status and its exact command line.
+
+## Who actually uses the indexes
+
+Every column to the left of **Used** answers *does this repository have an index, and how
+stale is it*. None of them answers the question that decides whether building one was
+worth anything: **does an agent ever read it.** A fresh graph nothing has opened in three
+months is a cost with no return; a repository queried forty times this week with no graph
+at all is the next extraction.
+
+`U` — or the monitor icon in the header — replaces the whole window with the usage
+dashboard: not a dialog over the board, a second page of it. Rows, detail pane and bottom
+panel go; the header and the status line stay.
+
+```
+This repository | Everything          Watch live   7d 30d 90d   ⟳
+
+269 uses over 30 days, every repository
+239 graphify calls · 30 graft calls · 462 sessions · 41% reads through graft · 1.5M saved
+
+Every day    graphify  ▁▂▅█▃▁▁▂▄▇█▅▃▂▁▂▃▅█▆▃▂▁▄▇█▅▃▂▁
+             graft     ·····························▇
+What was run graphify: query 132 · update 59 · export wiki 6 …
+             graft:    ask 8 · grep 4 · skeleton 4 · build 3 …
+Where        135 ~/git/platform-nova-cli · 50 ~/tmp/ggraphify · 2 ~/git (not on the board)
+Latest       Sep 14 09:38  graphify  god-nodes  ggraphify  default
+```
+
+### Worth doing next
+
+The dashboard's first section is the only part of it that asks for an action. It is the
+join nothing else in the application can make: the board knows which repositories have an
+index, the rollup knows which ones agents actually work in, and **the interesting
+repositories are the ones where those two answers disagree.**
+
+```
+Worth doing next
+ 53  ggraphify — the tree has moved under the graph (+2 ~2) — the free AST pass catches it up   graphify update .
+  4  cc-docsboard — used 4 times, with a graphify graph but no graft index — graft build is free       graft build
+  2  platform-console — used 2 times, and has no graphify graph at all                     graphify extract .  $
+```
+
+Ranked by usage, because usage is the whole argument: a checkout an agent ran forty
+queries in with no graph is not "unconfigured" in the abstract — it is one extraction that
+would have paid for itself forty times. One recommendation per repository, and it is the
+first thing that is wrong in the order a person would fix them: a missing graph, then a
+pending re-extraction, then drift, then a missing graft index, and cosmetics — unnamed
+communities — last. **A repository nobody used produces no recommendation however unbuilt
+it is, and a repository with nothing wrong produces none either**, so a well-kept machine
+shows an empty section rather than a list of nits.
+
+A working directory that is not a boarded checkout gets the one recommendation that is not
+a job — *add a scan root* — except when it is merely the directory boarded checkouts live
+*under*, which is `~/git` and not a missing repository.
+
+The button runs the same job kind the board's own actions do, which means **a metered one
+goes through the same confirm** naming the repository, the backend, the model and the
+exact argv, with the free `--code-only` variant beside it. The page explains why the money
+would be worth spending; it is not a way around the gate that asks.
+
+**It is read from the filesystem, like everything else here** — no telemetry, nothing sent
+anywhere, and no `graphify`/`graft` subprocess. Two sources, because they answer different
+halves:
+
+- **Claude Code's transcripts**, `<config-dir>/projects/<slug>/*.jsonl`. Every tool call an
+  agent made is a line in there with a timestamp, the session's cwd, its branch and its
+  session id — which is where a `graphify query`, a `/graphify` skill invocation, an MCP
+  call into graft's server and a hook injection all come from. **Every login on the
+  machine is read**, not just the one jobs run as: which account was paying is an
+  attribute of the usage, not a filter on it.
+- **graft's own per-session counters**, `<repo>/graft/.cache/session/<id>.json`, which
+  carry what a transcript cannot cheaply reconstruct: reads that went through the index
+  versus straight to the source files, the tokens that saved, and what the session was
+  billed. They join to the transcripts on the session id.
+
+Two things the numbers deliberately are not. **Hook injections are counted separately from
+uses** — the integration firing is not an agent choosing to use anything, and folding
+eleven thousand of them into a headline would drown the hundred and thirty-two queries
+that matter. And the **billed figure is graft's own, for the whole session** that used
+graft — it is not the cost of graft.
+
+The corpus is gigabytes across thousands of files, so it is read **incrementally**: a byte
+offset per transcript and the last counters seen per graft session file, in
+`$XDG_DATA_HOME/ggraphify/usage.json`. The first read of a working machine is about six
+seconds on its own goroutine; every one after it is a few milliseconds of stat calls.
+Ninety days are retained.
+
+**Watch live** re-reads every two seconds while the page is on screen, which is how a call
+an agent makes *right now* appears in **Latest** a moment later. Off, the page refreshes
+with the board's own tick.
+
+`ggraphify-scan -usage` prints the same rollup — recommendations included — without a
+display.
 
 ## The bottom panel
 
@@ -476,7 +572,8 @@ nothing and every extraction would refuse. So when the backend is left on **auto
 | --- | --- | --- |
 | an API key is exported | blank — graphify detects from the key | `auto-detect` |
 | no key, `claude` installed | `claude-cli`, passed explicitly | `auto-detect (→ claude-cli)` |
-| neither | blank, and the confirm dialog says why the run will fail | `auto-detect` |
+| no key, no `claude`, a local server answering | `ollama`, passed explicitly | `auto-detect (→ ollama)` |
+| none of those | blank, and the confirm dialog says why the run will fail | `auto-detect` |
 
 The resolved name goes into the argv the confirm dialog prints and the job log records, so
 the substitution is on screen rather than behind it. Picking `claude-cli` in **Settings ▸
@@ -495,6 +592,67 @@ Three things worth knowing about this backend:
   it. ggraphify prepends the resolved directory to the `PATH` each job inherits. Settings ▸
   LLM defaults shows the path it resolved; `GGRAPHIFY_CLAUDE_BIN` overrides it, and
   `GGRAPHIFY_CLAUDE_BIN=off` hides an install the board should not use.
+
+## Local models: no key, no bill
+
+The third way to run the metered commands is a model **served from this machine**. It costs
+no money, sends nothing off the box, and is slower and weaker than a frontier model. That is
+the whole trade, and **Settings ▸ Local model** is where it is made.
+
+Two shapes, because they are the two that exist:
+
+| what you run | backend | how ggraphify finds it |
+| --- | --- | --- |
+| `ollama serve` | `ollama` | `OLLAMA_BASE_URL`, else `OLLAMA_HOST`, else `http://localhost:11434/v1` |
+| `llama-server`, vLLM, LM Studio | `openai` | `OPENAI_BASE_URL` pointed at a loopback or private address |
+
+The second is the one worth spelling out: graphify's `openai` backend is an ordinary
+OpenAI-compatible client, so repointing `OPENAI_BASE_URL` at `http://127.0.0.1:8080/v1`
+makes it llama.cpp. ggraphify checks whether that URL is *actually* local — loopback,
+`.local`, or an RFC1918 address — and only then treats the backend as free. A base URL
+pointed at some other vendor's proxy stays billed and is described as billed.
+
+**Readiness is probed, not assumed.** `ollama` used to be reported as "needs no credential,
+therefore fine", which is true and useless: a local backend fails for its own reasons. The
+confirm dialog now separates the three, and each names its fix:
+
+- nothing answering at the endpoint → start the server. The settings group has a **Start**
+  button, which takes the only route it can take unprivileged: an *enabled* per-user
+  systemd unit, else a detached `ollama serve`. Where a **system-wide** `ollama.service`
+  owns the machine it starts nothing and copies `sudo systemctl start ollama` instead —
+  a second server against a second model store is how an already-pulled model appears to
+  vanish, and `systemctl --user disable` leaves the user unit file on disk, so "the unit
+  exists" is not the question. "Is it enabled" is;
+- the server is up but serving no models → `ollama pull qwen2.5-coder:7b`;
+- the server is up but has not got the model the board is set to → pull it, or pick from the
+  list of what it does have, which the settings group offers as a combo.
+
+A **pull is not run for you.** It is gigabytes over your network, and a button that started
+one with no progress and no cancel would be worse than the terminal it replaced; the board
+copies the exact command instead.
+
+Three things worth knowing:
+
+- **Concurrency is 1.** graphify forces it for `ollama` the same way it does for
+  `claude-cli`, and for the same reason. The metered lane setting does not lift it.
+- **The variables are ollama's own**, not graphify's: `OLLAMA_HOST`, `OLLAMA_BASE_URL`,
+  `OLLAMA_MODEL`. graphify reads them unprefixed so a machine already configured for ollama
+  needs no second configuration. `GRAPHIFY_OLLAMA_MODEL` and `GRAPHIFY_OLLAMA_HOST` do not
+  exist in graphify 0.9.58 — earlier builds of this board offered them in the overlay
+  editor, where setting either silently did nothing.
+- **`GRAPHIFY_OLLAMA_NUM_CTX` matters more than it looks.** ollama defaults `num_ctx` to
+  2048 and *silently truncates* a longer prompt, which turns into empty extractions rather
+  than an error. graphify derives a value; the overlay editor is where to override it.
+
+One consequence of the system-wide unit worth knowing before you switch to it: it runs as
+the `ollama` user with `OLLAMA_MODELS=/var/lib/ollama`, which is **not** the `~/.ollama` a
+`ollama pull` you ran as yourself wrote into. The server comes up serving nothing, and the
+board says exactly that rather than leaving you to guess. Copying
+`~/.ollama/models/{blobs,manifests}` into `/var/lib/ollama/` moves the models across
+without re-downloading them.
+
+`GGRAPHIFY_OLLAMA_BIN` overrides where the executable is found, and `=off` hides an install
+the board should not use — the same contract as `GGRAPHIFY_CLAUDE_BIN`.
 
 ## Building and installing
 
@@ -529,6 +687,8 @@ ggraphify-scan -json -state stale    # …or as JSON, filtered
 ggraphify-scan -roots ~/git -no-drift
 ggraphify-scan -out-base ~/.cache/graphify       # graphs kept outside the checkouts
 ggraphify-scan -issues -unhealthy                # what Fix would act on, and why
+ggraphify-scan -usage                            # who actually ran graphify and graft
+ggraphify-scan -usage -usage-days 7 -json        # …last week, as JSON
 
 ggraphify-job -list                              # every command this build knows
 ggraphify-job -kind update -repo ~/git/svc -n    # print the argv, run nothing
@@ -557,6 +717,8 @@ internal/
               and OutSpec, the one resolver for where a repository's graph lives
   graphstate/ read graphify-out/: counters, labels, drift, freshness — plus its cache
   board/      join the two into the rows the GUI renders, plus the folder groups
+  usage/      who read the indexes: Claude Code transcripts + graft's session counters,
+              rolled up per day and per repository, read incrementally
   gfy/        the graphify CLI contract: argv builders, env composition, version probe
   jobs/       the job queue: two lanes, process groups, streaming, cancel, history
   ringbuf/    the bounded per-job log
@@ -583,7 +745,9 @@ what keep a board responsive:
   `AdwApplicationWindow`, `AdwToolbarView`, `AdwToastOverlay`, `AdwBanner`,
   `AdwPreferencesDialog`, `AdwAlertDialog`, `AdwShortcutsDialog`.
 - `gfy.Backends` is `gemini kimi claude claude-cli openai deepseek ollama`, taken from
-  `graphify --help` at 0.9.58, rather than the list the plan guessed at.
+  `graphify --help` at 0.9.58, rather than the list the plan guessed at. `ollama`, and
+  `openai` when `OPENAI_BASE_URL` is loopback, are *local*: see
+  [Local models](#local-models-no-key-no-bill).
 - VTE is not bound. The job log is a `GtkTextView` over the ring buffer; graphify's output
   is line-oriented and carries no terminal control sequences worth a terminal emulator.
 - M6's `graphify prs` and M7's PGO profile are not done. `make pgo` is wired and waiting

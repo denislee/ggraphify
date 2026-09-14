@@ -292,6 +292,16 @@ func describeBackend(set store.Settings) string {
 		acc := gfy.ClaudeAccountFor(set.ClaudeAccount)
 		name += ", account " + acc.Name + " (" + acc.Dir + ")"
 	}
+	// A local backend is the one case where "metered" is the wrong word, and a
+	// diagnostic report that omitted the endpoint would leave the reader
+	// unable to tell which model answered.
+	if gfy.IsLocalBackend(eff) {
+		name += ", LOCAL at " + gfy.LocalBaseURL(eff) + " (free)"
+		if ok, why := gfy.LocalReady(eff, set.Model); !ok {
+			return name + " — NOT READY: " + why
+		}
+		return name
+	}
 	if ok, why := gfy.BackendReady(eff); !ok {
 		name += " — NOT READY: " + why
 	}

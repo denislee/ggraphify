@@ -116,6 +116,21 @@ var columns = []colSpec{
 		},
 	},
 	{
+		// Whether anything actually READS the two indexes the columns to the
+		// left describe. A fresh graph nothing has opened is a cost with no
+		// return, and a repository queried all week with no graph at all is
+		// the next extraction — neither fact is visible anywhere else on the
+		// board. The series is the last seven days; the tooltip splits it
+		// between the two tools.
+		ID: "usage", Title: "Used", Width: 120,
+		cmp: func(a *App, x, y *board.Row) int { return usageWeight(a, y) - usageWeight(a, x) },
+		render: func(a *App, l *gtk.Label, r *board.Row) (string, string) {
+			u := a.usageFor(r.Path)
+			l.SetTooltipText(usageTooltip(r, u))
+			return usageCell(u)
+		},
+	},
+	{
 		ID: "drift", Title: "Drift", Width: 150,
 		// Sorting by the total, not by the string: "+12 ~30" and "~3" compare
 		// the wrong way round alphabetically, and drift is the column people
@@ -480,6 +495,12 @@ func (a *App) applyStoredSort() {
 // onSelectionChanged reloads the detail pane and remembers the selection.
 func (a *App) onSelectionChanged() {
 	r := a.current()
+	// The Usage page's narrow scope follows the board's selection even while
+	// the board is not the visible page, so switching to it lands on the row
+	// that was last highlighted rather than on whatever it saw first.
+	if a.usagePane != nil {
+		a.usagePane.setRow(r)
+	}
 	if r == nil {
 		a.detail.show(nil)
 		return

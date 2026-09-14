@@ -7,17 +7,21 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/discover"
+	"github.com/dns/ggraphify/internal/gfy"
 	"github.com/dns/ggraphify/internal/graphstate"
 	"github.com/dns/ggraphify/internal/store"
+	"github.com/dns/ggraphify/internal/usage"
 )
 
 func main() {
@@ -36,6 +40,8 @@ func main() {
 		unhealthy = flag.Bool("unhealthy", false, "only rows with something wrong — what the board's Fix button would act on")
 		issues    = flag.Bool("issues", false, "add a column naming each row's issues (no-graph, drift, unnamed, no-report…)")
 		rawDrift  = flag.Bool("raw-drift", false, "ignore the board's settled-drift baselines and show the unadjudicated walk")
+		usageMode = flag.Bool("usage", false, "report which agents actually ran graphify and graft, instead of the board")
+		usageDays = flag.Int("usage-days", 30, "the window -usage reports over, in days")
 	)
 	flag.Parse()
 
@@ -54,6 +60,23 @@ func main() {
 	if !*rawDrift {
 		st := store.Open(store.DefaultPath())
 		opts.Baseline = st.DriftBaseline
+	}
+
+	if *usageMode {
+		// The usage rollup is derived from Claude Code's transcripts and
+		// graft's own session counters, not from the checkouts, so it is
+		// reported before the scan filters get a say — but it still needs the
+		// repository list to find the graft counter files.
+		rows, err := board.Scan(board.Options{
+			Roots: opts.Roots, Depth: opts.Depth, SkipDrift: true,
+			OutName: opts.OutName, OutBase: opts.OutBase, ShowHidden: opts.ShowHidden,
+		})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ggraphify-scan:", err)
+			os.Exit(1)
+		}
+		printUsage(rows, *usageDays, *asJSON)
+		return
 	}
 
 	rows, err := board.Scan(opts)
@@ -147,6 +170,89 @@ func main() {
 	fmt.Printf("\n%d repos · %d graphed · %d fresh · %d stale · %d raw · %d broken · %d behind HEAD\n",
 		c.Repos, c.Graphed, c.Fresh, c.Stale, c.Raw, c.Broken, c.Behind)
 	fmt.Println("(* on COMM means the communities have placeholder names — run `label`)")
+}
+
+// printUsage is the headless twin of the board's Usage column and its U
+// dashboard: the same rollup, the same window, printed.
+func printUsage(rows []board.Row, days int, asJSON bool) {
+	home, _ := os.UserHomeDir()
+	var accounts []usage.Account
+	for _, c := range gfy.ClaudeAccounts("") {
+		if !c.Missing && c.Dir != "" {
+			accounts = append(accounts, usage.Account{Name: c.Name, Dir: c.Dir})
+		}
+	}
+	repos := make([]string, 0, len(rows))
+	for _, r := range rows {
+		repos = append(repos, r.Path)
+	}
+
+	path := usage.DefaultPath(store.DefaultDir())
+	x := usage.Load(path)
+	started := time.Now()
+	if err := x.Update(context.Background(), usage.Options{Accounts: accounts, Repos: repos}); err != nil {
+		fmt.Fprintln(os.Stderr, "ggraphify-scan:", err)
+		os.Exit(1)
+	}
+	if err := x.Save(path); err != nil {
+		fmt.Fprintln(os.Stderr, "ggraphify-scan: saving the rollup:", err)
+	}
+	took := time.Since(started).Round(time.Millisecond)
+	_, scanned := x.LastUpdate()
+
+	s := x.Summarize(usage.Window{Days: days})
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(s); err != nil {
+			fmt.Fprintln(os.Stderr, "ggraphify-scan:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	fmt.Printf("%d uses over %d days — graphify %d · graft %d · %d sessions · %d hook injections\n",
+		s.Events, s.Days, s.ByTool[usage.Graphify], s.ByTool[usage.Graft], s.Sessions, s.Hooks)
+	if mix, ok := s.Mix(); ok {
+		fmt.Printf("graft read %d%% of the time (%d through the index, %d straight to source), ~%d tokens saved\n",
+			mix, s.GraftReads, s.SourceReads, s.SavedTokens)
+	}
+	fmt.Printf("read %d account(s) in %v, %d transcripts were new; rollup at %s\n\n",
+		len(accounts), took, scanned, strings.Replace(path, home, "~", 1))
+
+	if recs := usage.Recommend(rows, s, 10); len(recs) > 0 {
+		fmt.Println("WORTH DOING NEXT — where usage and index state disagree")
+		rw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+		fmt.Fprintln(rw, "USES\tREPOSITORY\tDO\tWHY")
+		for _, r := range recs {
+			do := r.Action.Command()
+			if do == "" {
+				do = "add a scan root"
+			}
+			if r.Metered() {
+				do += " ($)"
+			}
+			fmt.Fprintf(rw, "%d\t%s\t%s\t%s\n", r.Uses, r.Name, do, r.Why)
+		}
+		rw.Flush()
+		fmt.Println()
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	fmt.Fprintln(w, "TOOL\tVERB\tCOUNT")
+	for _, tool := range []usage.Tool{usage.Graphify, usage.Graft} {
+		for _, c := range s.Verbs[tool] {
+			fmt.Fprintf(w, "%s\t%s\t%d\n", tool, c.Name, c.Count)
+		}
+	}
+	fmt.Fprintln(w, "\nCOUNT\tREPOSITORY\t")
+	for i, r := range s.Repos {
+		if i >= 20 {
+			break
+		}
+		fmt.Fprintf(w, "%d\t%s\t\n", r.Count, strings.Replace(r.Name, home, "~", 1))
+	}
+	w.Flush()
 }
 
 func filter(rows []board.Row, keep func(board.Row) bool) []board.Row {

@@ -266,6 +266,21 @@ func (a *App) meteredNotice(sample gfy.Params) string {
 	}
 
 	var b strings.Builder
+	// A local model spends no money at all, and saying otherwise would make
+	// the one warning this application exists to give mean nothing. The lane
+	// is still the metered one — a local run is slow and graphify serializes
+	// it — but the paragraph tells the truth about the bill.
+	if gfy.IsLocalBackend(backend) {
+		b.WriteString(gfy.LocalNotice(backend, sample.Model))
+		_, meteredLanes := a.runner.Lanes()
+		b.WriteString("Metered lane concurrency: " + gfy.Itoa(meteredLanes) + "\n")
+		if ok, why := gfy.LocalReady(backend, sample.Model); !ok {
+			b.WriteString("\n⚠ " + why + "\nEvery one of these runs is likely to fail.")
+		} else {
+			b.WriteString("\n" + why)
+		}
+		return b.String()
+	}
 	if backend == gfy.ClaudeCLIBackend {
 		acc := gfy.ClaudeAccountFor(sample.ClaudeDir)
 		b.WriteString("This is METERED. It dispatches LLM requests through the " +

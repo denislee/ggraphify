@@ -51,6 +51,7 @@ var keyBindings = []keyBinding{
 	{"K", "Wiki page", "Pages"},
 	{"q", "Query console", "Pages"},
 	{"J", "All jobs, across every repository", "Pages"},
+	{"U", "Usage tab: what agents actually ran, every repository", "Pages"},
 	{"G", "Cross-repo global graph", "Pages"},
 
 	{"v", "Select mode, for batch actions", "Batch"},
@@ -119,6 +120,27 @@ func (a *App) installKeys() {
 
 // dispatchKey routes one plain keystroke. Returning true stops propagation.
 func (a *App) dispatchKey(keyval uint) bool {
+	// The Usage page replaces the board, so the keys that act on a row would
+	// be acting on something nobody can see. Only the handful that are about
+	// the window itself stay live there; everything else is inert until U or
+	// Escape brings the board back.
+	if a.onUsagePage() {
+		switch keyval {
+		case gdk.KEY_U, gdk.KEY_Escape:
+			a.setMainPage(pageBoard)
+		case gdk.KEY_t:
+			a.cycleScheme()
+		case gdk.KEY_comma:
+			a.showSettings()
+		case gdk.KEY_question:
+			a.showHelp()
+		case gdk.KEY_J:
+			a.showJobs()
+		default:
+			return false
+		}
+		return true
+	}
 	switch keyval {
 	case gdk.KEY_j:
 		a.moveSelection(1)
@@ -174,6 +196,8 @@ func (a *App) dispatchKey(keyval uint) bool {
 		a.detail.SetPage("query")
 	case gdk.KEY_J:
 		a.showJobs()
+	case gdk.KEY_U:
+		a.showUsage()
 	case gdk.KEY_v:
 		a.setSelectMode(!a.selectMode)
 	case gdk.KEY_space:

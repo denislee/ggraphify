@@ -110,9 +110,10 @@ func HasClaudeCLI() bool { return ClaudeCLI() != "" }
 // but graphify's detection is key-based, so on a machine whose only credential
 // is a logged-in Claude Code install it would find nothing and the extraction
 // would refuse to run. There, blank resolves to claude-cli: the one backend
-// that is demonstrably available. The resolved name is what goes into the
-// argv the confirm dialog shows, so this is a visible substitution rather
-// than a silent one.
+// that is demonstrably available — and failing that, a local model server that
+// is answering on this machine. The resolved name is what goes into the argv
+// the confirm dialog shows, so this is a visible substitution rather than a
+// silent one.
 func EffectiveBackend(backend string) string {
 	if b := strings.TrimSpace(backend); b != "" {
 		return b
@@ -122,6 +123,15 @@ func EffectiveBackend(backend string) string {
 	}
 	if HasClaudeCLI() {
 		return ClaudeCLIBackend
+	}
+	// Last, a local model. graphify's detection does find ollama, but only
+	// when OLLAMA_HOST or OLLAMA_BASE_URL is exported — a running server on
+	// the default port with neither variable set is invisible to it. Probing
+	// the port closes that gap, and it is the right last resort rather than
+	// the first: a local model is free but slow and weaker, so it should never
+	// displace a key or a Claude Code login that is actually present.
+	if p := ProbeLocal(OllamaBackend); p.Reach && len(p.Models) > 0 {
+		return OllamaBackend
 	}
 	return ""
 }
@@ -142,17 +152,26 @@ func BackendReady(backend string) (bool, string) {
 		return false, "The claude-cli backend needs the Claude Code CLI on this machine, " +
 			"and none was found. Install it from https://claude.ai/code and run " +
 			"`claude` once to authenticate."
-	case "ollama":
-		return true, "A local ollama backend needs no credential."
+	case OllamaBackend:
+		// Not "needs no credential, therefore fine": a local backend fails for
+		// its own reasons — no server, no model pulled — and those are worth
+		// catching in the confirm rather than in the job log. See LocalReady.
+		return LocalReady(OllamaBackend, "")
 	case "bedrock":
 		return true, "Bedrock authenticates through the AWS credential chain."
 	case "":
 		if HasAPIKey() {
 			return true, "An API key is visible in this environment; graphify will auto-detect the backend."
 		}
-		return false, "No API key is visible in this environment and no Claude Code CLI was found, " +
-			"so there is nothing for graphify to auto-detect."
+		return false, "No API key is visible in this environment, no Claude Code CLI was found, " +
+			"and no local model server answered, so there is nothing for graphify to auto-detect."
 	default:
+		// openai with OPENAI_BASE_URL repointed at a loopback server is not the
+		// OpenAI API at all — it is llama.cpp, vLLM or LM Studio, and it wants
+		// the local verdict rather than a demand for a key it never checks.
+		if IsLocalBackend(backend) {
+			return LocalReady(backend, "")
+		}
 		if HasAPIKey() {
 			return true, "An API key is visible in this environment."
 		}

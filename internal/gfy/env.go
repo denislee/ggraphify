@@ -146,9 +146,18 @@ var KnownVars = []string{
 	"GRAPHIFY_BIN", "GRAPHIFY_PYTHON", "GRAPHIFY_CHANGED",
 	"GRAPHIFY_MTIME_GRANULARITY_MS", "GRAPHIFY_MAX_GRAPH_BYTES", "GRAPHIFY_BUILD_PERF",
 	"GRAPHIFY_ALLOW_LOCAL_PROVIDERS", "GRAPHIFY_HOOK_STRICT", "GRAPHIFY_HOOK_STRICT_TTL",
-	"GRAPHIFY_GEMINI_MODEL", "GRAPHIFY_OPENAI_MODEL", "GRAPHIFY_DEEPSEEK_MODEL",
+	"GRAPHIFY_GEMINI_MODEL", OpenAIModelVar, "GRAPHIFY_DEEPSEEK_MODEL",
 	ClaudeCLIModelVar, "GRAPHIFY_CLAUDE_CLI_PARALLEL",
-	"GRAPHIFY_OLLAMA_MODEL", "GRAPHIFY_OLLAMA_HOST",
+	// Local models. The first three are ollama's OWN variables, not graphify's:
+	// graphify reads them unprefixed so a machine already set up for ollama
+	// needs no second configuration. GRAPHIFY_OLLAMA_MODEL and
+	// GRAPHIFY_OLLAMA_HOST, which this list used to offer, are read by nothing
+	// in graphify 0.9.58 — setting either silently did nothing.
+	OllamaHostVar, OllamaBaseURLVar, OllamaModelVar, OllamaKeyVar,
+	"GRAPHIFY_OLLAMA_NUM_CTX", "GRAPHIFY_OLLAMA_KEEP_ALIVE", "GRAPHIFY_OLLAMA_PARALLEL",
+	"GRAPHIFY_OLLAMA_VISION",
+	// Any OpenAI-compatible server — llama.cpp's llama-server, vLLM, LM Studio.
+	OpenAIBaseURLVar,
 }
 
 // ValidVar rejects a name that cannot be an environment variable, which is the
@@ -180,9 +189,13 @@ func HasAPIKey() bool {
 			return true
 		}
 	}
-	// ollama needs no key of its own, only a host to talk to. claude-cli
-	// needs neither — ask HasClaudeCLI about that one, not this.
-	return strings.TrimSpace(os.Getenv("OLLAMA_HOST")) != ""
+	// A local model needs no key of its own, only a server to talk to, and
+	// graphify's own auto-detection opts into ollama on exactly this signal:
+	// one of ollama's two host variables being exported. A server running on
+	// the default port with neither set is NOT detectable by graphify, which
+	// is why EffectiveBackend probes the port separately rather than relying
+	// on this. claude-cli needs neither — ask HasClaudeCLI about that one.
+	return ollamaBaseURL("") != ""
 }
 
 // Itoa is strconv.Itoa, re-exported so the ui package can format overlay

@@ -93,6 +93,22 @@ func (a *App) buildHeader() gtk.Widgetter {
 	jobsBtn.ConnectClicked(func() { a.showJobs() })
 	header.PackEnd(jobsBtn)
 
+	// The whole-window Usage view. It is a toggle rather than a button
+	// because it REPLACES the board — rows, detail pane and dock — with the
+	// dashboard, and a toggle is the control that says "you are somewhere
+	// else now" rather than "a thing opened over the top".
+	a.usageBtn = gtk.NewToggleButton()
+	a.usageBtn.SetIconName("utilities-system-monitor-symbolic")
+	a.usageBtn.AddCSSClass("flat")
+	a.usageBtn.SetTooltipText("Agent usage: what actually ran graphify and graft (U)")
+	a.usageBtn.ConnectToggled(func() {
+		if a.usageGuard {
+			return
+		}
+		a.setMainPage(pageUsage(a.usageBtn.Active()))
+	})
+	header.PackEnd(a.usageBtn)
+
 	globalBtn := gtk.NewButtonFromIconName("network-workgroup-symbolic")
 	globalBtn.AddCSSClass("flat")
 	globalBtn.SetTooltipText("Cross-repo global graph (G)")
@@ -103,7 +119,7 @@ func (a *App) buildHeader() gtk.Widgetter {
 }
 
 // buildFilterBar is the search entry and the state chips.
-func (a *App) buildFilterBar() gtk.Widgetter {
+func (a *App) buildFilterBar() *gtk.Box {
 	bar := gtk.NewBox(gtk.OrientationHorizontal, 6)
 	bar.SetMarginStart(12)
 	bar.SetMarginEnd(12)

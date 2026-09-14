@@ -37,6 +37,7 @@ import (
 	"github.com/dns/ggraphify/internal/jobs"
 	"github.com/dns/ggraphify/internal/open"
 	"github.com/dns/ggraphify/internal/store"
+	"github.com/dns/ggraphify/internal/usage"
 )
 
 // AppID is the Wayland app_id the window carries. sway and fuzzel key their
@@ -182,6 +183,23 @@ type App struct {
 	graftFixBtn    *gtk.Button
 	graftSetup     gfy.GraftSetup
 	graftVersion   gfy.GraftVersion
+	// The local-model group: is there a model server on this machine, is it
+	// up, and what has it got. Four rows because the three ways it can be
+	// unusable have three different fixes.
+	localGroup      *adw.PreferencesGroup
+	localServerRow  *adw.ActionRow
+	localStartBtn   *gtk.Button
+	localModelsRow  *adw.ComboRow
+	localPullRow    *adw.ActionRow
+	localCompatRow  *adw.ActionRow
+	localModelNames []string
+	// localFilling suppresses the model combo's change handler while the
+	// combo is being repopulated. Handing GtkDropDown a new string list
+	// selects item 0 and notifies, which without this would overwrite a
+	// deliberately-chosen model with whatever the server happens to list
+	// first, every time the page is redrawn.
+	localFilling bool
+
 	// claudeAccountCombo is the account picker in the settings group; held so
 	// the rest of the page can read which login it is describing.
 	claudeAccountCombo *adw.ComboRow
@@ -196,6 +214,26 @@ type App struct {
 	items     []*coreglib.Object
 	jobByRepo map[string]*jobs.Snapshot
 	jobIDs    map[string]uint64
+
+	// The usage rollup: which agents actually ran graphify and graft, and
+	// where. It is refreshed on its own goroutine (see usage.go) because a
+	// cold read walks gigabytes of transcript, and published into usageUses
+	// — the per-row, one-week window the board column renders — when it is
+	// done. usageSaved throttles writing it back to disk.
+	usage      *usage.Index
+	usagePath  string
+	usageUses  map[string]usage.RepoUse
+	usageBusy  bool
+	usageSaved time.Time
+	// The Usage view is a whole page of the window, not a pane inside the
+	// board: main switches between the board and it, and usageGuard stops the
+	// header toggle and the keyboard from fighting each other over which one
+	// set it.
+	main       *gtk.Stack
+	usagePane  *usagePane
+	usageBtn   *gtk.ToggleButton
+	usageGuard bool
+	filterBar  *gtk.Box
 
 	runner  *jobs.Runner
 	cache   discover.Cache
@@ -251,6 +289,7 @@ func New(opts Options) *App {
 		setCols:   map[string]*adw.SwitchRow{},
 		dockRows:  map[string]*adw.SwitchRow{},
 		selected:  map[string]bool{},
+		usageUses: map[string]usage.RepoUse{},
 	}
 }
 
@@ -298,7 +337,8 @@ func (a *App) activate() {
 
 	toolbar := adw.NewToolbarView()
 	toolbar.AddTopBar(a.buildHeader())
-	toolbar.AddTopBar(a.buildFilterBar())
+	a.filterBar = a.buildFilterBar()
+	toolbar.AddTopBar(a.filterBar)
 
 	// The version banner. graphify moves fast and the argv builders in
 	// internal/gfy are pinned to one release; a board running against a
@@ -336,8 +376,19 @@ func (a *App) activate() {
 	a.vsplit.SetShrinkEndChild(false)
 	a.split.SetVExpand(true)
 
+	// The window has two pages, not one. The board — rows, detail pane and
+	// bottom dock — is one of them; the Usage dashboard is the other, and it
+	// takes the whole window rather than a corner of it, because what it
+	// reports is about the machine and not about the selected row.
+	a.usagePane = a.newUsagePane()
+	a.main = gtk.NewStack()
+	a.main.SetTransitionType(gtk.StackTransitionTypeCrossfade)
+	a.main.AddNamed(a.vsplit, pageBoard)
+	a.main.AddNamed(a.usagePane.widget, pageUsageName)
+	a.main.SetVExpand(true)
+
 	body := gtk.NewBox(gtk.OrientationVertical, 0)
-	body.Append(a.vsplit)
+	body.Append(a.main)
 	body.Append(a.buildStatusBar())
 
 	toolbar.SetContent(body)
@@ -349,6 +400,7 @@ func (a *App) activate() {
 	a.installKeys()
 	a.win.ConnectCloseRequest(func() bool {
 		a.saveWindow()
+		a.saveUsage()
 		// Nothing is torn down here: Run's deferred Close does it after the
 		// main loop returns, so a job's SIGTERM grace period does not happen
 		// with a half-destroyed window on screen.
@@ -359,6 +411,7 @@ func (a *App) activate() {
 	a.applyDockSettings()
 	a.restoreFilter()
 	a.refresh(true)
+	a.startUsage()
 	a.startTick()
 	go a.probeVersion()
 }
@@ -406,6 +459,10 @@ func (a *App) startTick() {
 	}
 	coreglib.TimeoutSecondsAdd(uint(every), func() bool {
 		a.refresh(false)
+		// The usage rollup rides the same interval. After the first read it
+		// is a few milliseconds of stat calls, and it is what keeps the usage
+		// column and the dashboard current while the board is left open.
+		a.refreshUsage()
 		return true
 	})
 	a.tickID = coreglib.TimeoutAdd(1000, func() bool {
@@ -419,6 +476,7 @@ func (a *App) startTick() {
 func (a *App) tick() {
 	a.refreshStatus()
 	a.detail.tick()
+	a.usagePane.tick(a.onUsagePage())
 	if a.dock != nil {
 		a.dock.tick()
 	}
