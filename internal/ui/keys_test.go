@@ -58,7 +58,7 @@ func accelNames(keys string) []string {
 		return []string{"k"}
 	case "g / G":
 		return []string{"g", "G"}
-	case "Enter", "Ctrl+Q", "Ctrl+H", "Ctrl+G", "Ctrl+F / Ctrl+B":
+	case "Enter", "Ctrl+Q", "Ctrl+H", "Ctrl+G", "Ctrl+L", "Ctrl+F / Ctrl+B":
 		return nil // handled by the view's activate signal / the ctrl branch
 	case "/":
 		return []string{"slash"}

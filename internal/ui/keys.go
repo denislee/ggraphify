@@ -35,6 +35,7 @@ var keyBindings = []keyBinding{
 	{"H", "Fix, free steps only — no API key, no LLM call", "Building"},
 	{"Ctrl+H", "Fix, free steps only, on every repository on the board", "Building"},
 	{"Ctrl+G", "Sync the graft index for every repository in the selected folder", "Building"},
+	{"Ctrl+L", "Full LLM extraction on every repository that never had one, on the local model", "Building"},
 	{"u", "Update — AST re-extraction, free", "Building"},
 	{"c", "Re-cluster, keeping placeholder names, free", "Building"},
 	{"E", "Extract — full LLM extraction, METERED", "Building"},
@@ -106,6 +107,9 @@ func (a *App) installKeys() {
 				return true
 			case gdk.KEY_g, gdk.KEY_G:
 				a.actSyncGraft()
+				return true
+			case gdk.KEY_l, gdk.KEY_L:
+				a.actExtractLocalAll()
 				return true
 			}
 			return false

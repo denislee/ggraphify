@@ -7,6 +7,7 @@ import (
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
 	"github.com/dns/ggraphify/internal/applog"
+	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/gfy"
 )
 
@@ -259,4 +260,81 @@ func (a *App) startOllama() {
 			a.checkLocalLLM(false)
 		})
 	}()
+}
+
+// The board-wide local extraction: run the full LLM pass, against the model on
+// this machine, on every repository that has never had one.
+//
+// It exists because the local backend changes what a fan-out over a hundred
+// checkouts *means*. Against an API key that sweep is the single most
+// expensive thing this application can do, which is why nothing offers it as
+// one button. Against a local model it costs nothing but time, so the sweep
+// that was never safe to offer becomes the obvious one — overnight work on the
+// backlog of repositories nobody was going to pay to extract.
+//
+// Three things keep it honest anyway:
+//
+//   - It is scoped to rows that never ran, not to the whole board. A fresh or
+//     stale graph already has its semantic layer; re-extracting it would be
+//     hours of CPU to rebuild what is there (see board.NeverExtracted).
+//   - It pins the backend to the local one explicitly rather than relying on
+//     auto-detect, so an exported API key cannot turn a sweep the user asked
+//     to run locally into a bill. The pinned name is in the argv the confirm
+//     dialog prints.
+//   - It goes through the ordinary confirm, which for a batch this size means
+//     the typed-count gate as well.
+func (a *App) actExtractLocalAll() {
+	backend := gfy.OllamaBackend
+	model := a.opts.Store.Settings().Model
+
+	// Refuse before queueing rather than after. A hundred jobs that each fail
+	// on a server that is not running is a log nobody can read and a board
+	// full of red rows, when the answer was one sentence.
+	if ok, why := gfy.LocalReady(backend, model); !ok {
+		a.toast(why)
+		applog.Errorf("local sweep refused: %s", why)
+		return
+	}
+
+	var rows []board.Row
+	var running, done, excluded int
+	for _, r := range a.allRows() {
+		// One read of the job table per row: jobFor takes the lock, and asking
+		// it twice in one switch would both cost double and let the answer
+		// change between the two arms.
+		job := a.jobFor(r.Path)
+		switch {
+		case r.Excluded:
+			excluded++
+		case !r.NeverExtracted():
+			done++
+		case job != nil && !job.Status.Done():
+			// Already building. The runner serializes mutating commands per
+			// repository, so a second extract would not corrupt anything — it
+			// would just queue an hours-long job to redo what is in flight.
+			running++
+		default:
+			rows = append(rows, r)
+		}
+	}
+	if len(rows) == 0 {
+		switch {
+		case done > 0 && running == 0 && excluded == 0:
+			a.toastf("every repository on the board has already been extracted (%d)", done)
+		default:
+			a.toastf("nothing to extract: %d already done, %d running, %d kept out of batches",
+				done, running, excluded)
+		}
+		return
+	}
+
+	applog.Infof("local sweep: %d never extracted, %d already done, %d running, %d excluded — backend %s, model %s",
+		len(rows), done, running, excluded, backend, gfy.LocalModel(backend, model))
+
+	a.run("extract", rows, func(p *gfy.Params) {
+		p.Backend = backend
+		if model != "" {
+			p.Model = model
+		}
+	})
 }

@@ -65,6 +65,18 @@ func (a *App) buildHeader() gtk.Widgetter {
 	graftAll.ConnectClicked(func() { a.actSyncGraft() })
 	header.PackStart(graftAll)
 
+	// The local-model sweep, third in the same row of board-wide buttons. It
+	// is the one of the three that runs an LLM, so it does NOT get the "free"
+	// wording the other two carry — a local run costs no money but it costs
+	// hours, and a button that implied otherwise would be the same lie the
+	// confirm dialog exists to prevent.
+	localAll := gtk.NewButtonFromIconName("computer-symbolic")
+	localAll.AddCSSClass("flat")
+	localAll.SetTooltipText("Full LLM extraction on every repository that never had one (Ctrl+L) — " +
+		"runs on the local model: no API key and no bill, but hours of this machine")
+	localAll.ConnectClicked(func() { a.actExtractLocalAll() })
+	header.PackStart(localAll)
+
 	// Right: the gear is rightmost because it is the canonical home of every
 	// preference the other buttons toggle, so it reads as the end of the row.
 	gear := gtk.NewButtonFromIconName("emblem-system-symbolic")

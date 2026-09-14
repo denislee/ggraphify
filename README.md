@@ -627,6 +627,32 @@ confirm dialog now separates the three, and each names its fix:
 - the server is up but has not got the model the board is set to → pull it, or pick from the
   list of what it does have, which the settings group offers as a combo.
 
+### The board-wide sweep
+
+The local backend changes what a fan-out means, so it gets a button the metered
+backends deliberately do not have. **Ctrl+L**, or the `computer-symbolic` button beside the
+free sweep, runs a **full LLM extraction on every repository that has never had one**,
+against the local model.
+
+That sweep is the single most expensive thing this application could do against an API key,
+which is exactly why no button offers it there. Against a model on this machine it costs
+nothing but time, so the overnight pass over the backlog of checkouts nobody was going to
+pay to extract becomes the obvious thing to want. Three things keep it honest:
+
+- **Scoped to rows that never ran** — `StateNone` (no output directory) and `StateRaw` (a
+  graph whose communities were never named). A `fresh` or `stale` graph already has its
+  semantic layer; stale means the tree moved under it, which a *free* AST `update` repairs.
+  Re-extracting either would be hours of CPU to rebuild what is already there.
+- **The backend is pinned, not auto-detected.** An exported `GEMINI_API_KEY` cannot turn a
+  sweep you asked to run locally into a bill — the pinned name is in the argv the confirm
+  dialog prints.
+- **The ordinary confirm still applies**, which at this batch size means the typed-count
+  gate too. Rows marked `⊘` and rows already building are skipped, and the toast says how
+  many fell into each bucket.
+
+Readiness is checked *before* anything is queued. A hundred jobs each failing against a
+server that is not running is a log nobody can read; the refusal is one sentence instead.
+
 A **pull is not run for you.** It is gigabytes over your network, and a button that started
 one with no progress and no cancel would be worse than the terminal it replaced; the board
 copies the exact command instead.

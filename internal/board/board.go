@@ -42,6 +42,33 @@ type Row struct {
 // directories can be shared, paths do not.
 func (r Row) Key() string { return r.Path }
 
+// NeverExtracted reports whether a full semantic extraction has never
+// completed on this checkout — the question the board-wide local-model sweep
+// asks, and the only question it asks.
+//
+// Two states answer yes, and they are different histories with the same
+// consequence:
+//
+//   - StateNone: no output directory at all. graphify has never run here.
+//   - StateRaw: a graph exists but its communities are unnamed. An AST pass
+//     (`update`, or `extract --no-label`) built the structure and the LLM half
+//     never ran, so the semantic layer this sweep exists to add is absent.
+//
+// The other three say no, and it matters that they do. StateFresh and
+// StateStale both had a full run — stale means the tree has moved under it
+// since, which is drift and is repaired by a *free* AST update, not by paying
+// for extraction again. StateBroken is an output directory whose graph.json
+// cannot be read; that is a repair, and lumping it in here would silently
+// widen a sweep the user asked to scope to "never ran".
+func (r Row) NeverExtracted() bool {
+	switch r.Graph.State {
+	case graphstate.StateNone, graphstate.StateRaw:
+		return true
+	default:
+		return false
+	}
+}
+
 // Options configures a scan.
 type Options struct {
 	Roots []string

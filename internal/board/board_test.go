@@ -245,3 +245,27 @@ func TestScanOverrideOutIsResolved(t *testing.T) {
 		t.Errorf("Out = %q, want %q", rows[0].Graph.Out, want)
 	}
 }
+
+// NeverExtracted is what the board-wide local sweep selects on, so the states
+// it excludes matter as much as the ones it includes: a false positive is
+// hours of CPU rebuilding a graph that was already there.
+func TestNeverExtracted(t *testing.T) {
+	cases := []struct {
+		state graphstate.State
+		want  bool
+		why   string
+	}{
+		{graphstate.StateNone, true, "no output directory — graphify never ran here"},
+		{graphstate.StateRaw, true, "a graph, but the LLM half never named its communities"},
+		{graphstate.StateFresh, false, "a full run already completed"},
+		{graphstate.StateStale, false, "a full run completed; drift is repaired free by update"},
+		{graphstate.StateBroken, false, "an unreadable graph is a repair, not a missing run"},
+		{graphstate.StateRunning, false, "a job is in flight; the sweep must not queue a second"},
+	}
+	for _, c := range cases {
+		r := Row{Graph: graphstate.Graph{State: c.state}}
+		if got := r.NeverExtracted(); got != c.want {
+			t.Errorf("NeverExtracted(%v) = %v, want %v — %s", c.state, got, c.want, c.why)
+		}
+	}
+}
