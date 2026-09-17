@@ -470,9 +470,9 @@ func (a *App) matches(r *board.Row) bool {
 	if !board.InGroup(*r, a.groupID) {
 		return false
 	}
-	switch f := a.activeFilter(); {
-	case f == "":
-	case f == filterGap:
+	switch f := a.activeFilter(); f {
+	case "":
+	case filterGap:
 		// Not a state, so it is answered before ParseState is asked: the whole
 		// point of this chip is a question no single state can express.
 		if !a.usageGap(r) {

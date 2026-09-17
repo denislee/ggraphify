@@ -484,17 +484,15 @@ func (a *App) watchInto(id uint64, view *gtk.TextView) {
 	view.Buffer().SetText("running…\n")
 	var lastGen uint64
 	tick := func() bool {
-		for _, s := range a.runner.Snapshot() {
-			if s.ID != id {
-				continue
-			}
-			if gen := s.Log.Gen(); gen != lastGen {
-				lastGen = gen
-				view.Buffer().SetText(strings.TrimRight(prettyIfJSON(s.Log.String()), "\n"))
-			}
-			return !s.Status.Done()
+		s, ok := a.runner.Get(id)
+		if !ok {
+			return false
 		}
-		return false
+		if gen := s.Log.Gen(); gen != lastGen {
+			lastGen = gen
+			view.Buffer().SetText(strings.TrimRight(prettyIfJSON(s.Log.String()), "\n"))
+		}
+		return !s.Status.Done()
 	}
 	timeoutAdd(400, tick)
 }

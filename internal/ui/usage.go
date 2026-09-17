@@ -385,14 +385,7 @@ func (a *App) newUsagePane() *usagePane {
 		all := i == 1
 		b := gtk.NewToggleButtonWithLabel(label)
 		b.SetActive(all == p.scopeAll)
-		b.ConnectClicked(func() {
-			if p.scopeAll == all {
-				return
-			}
-			p.scopeAll = all
-			p.syncButtons()
-			p.reload()
-		})
+		b.ConnectClicked(func() { p.setScopeAll(all) })
 		p.scope.Append(b)
 		p.scopeBtn = append(p.scopeBtn, b)
 	}
@@ -538,7 +531,9 @@ func (p *usagePane) syncButtons() {
 	}
 }
 
-// setScopeAll is how the keyboard opens the machine-wide view.
+// setScopeAll switches between this repository and the whole machine. It is
+// the one place that transition happens, so the toggle buttons and anything
+// else that wants it cannot drift apart on whether to repaint.
 func (p *usagePane) setScopeAll(all bool) {
 	if p.scopeAll == all {
 		return

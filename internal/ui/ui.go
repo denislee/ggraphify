@@ -17,6 +17,7 @@
 package ui
 
 import (
+	"context"
 	"log"
 	"os"
 	"strings"
@@ -198,6 +199,8 @@ type App struct {
 	localGroup      *adw.PreferencesGroup
 	localServerRow  *adw.ActionRow
 	localStartBtn   *gtk.Button
+	localAutoRow    *adw.SwitchRow
+	localIdleRow    *adw.SpinRow
 	localModelsRow  *adw.ComboRow
 	localPullRow    *adw.ActionRow
 	localCompatRow  *adw.ActionRow
@@ -223,6 +226,13 @@ type App struct {
 	items     []*coreglib.Object
 	jobByRepo map[string]*jobs.Snapshot
 	jobIDs    map[string]uint64
+	// pausing is the set of jobs whose pause or resume is still in flight.
+	// Both halves run off the main thread and a resume can sit inside
+	// lease.Resume for the ten seconds a cold model server takes, so without
+	// this a second click reads the same pre-click state as the first and
+	// queues an opposite transition behind it. Which of the two wins is then
+	// whichever goroutine reaches setPaused first.
+	pausing map[uint64]bool
 
 	// The usage rollup: which agents actually ran graphify and graft, and
 	// where. It is refreshed on its own goroutine (see usage.go) because a
@@ -253,10 +263,16 @@ type App struct {
 	// and must not do that on the main thread.
 	autofix     *autofix.Engine
 	autofixBusy bool
-	cache       discover.Cache
-	graphs      graphstate.Cache
-	grafts      graftstate.Cache
-	version     gfy.Version
+	// ollama is the local model server's lifecycle: the board starts it for
+	// a job that needs it and stops it again once nothing does. It is here
+	// rather than in the jobs package because the policy — is this switched
+	// on, how long is the grace period — is a setting, and the runner is not
+	// the thing that reads settings.
+	ollama  *gfy.AutoOllama
+	cache   discover.Cache
+	graphs  graphstate.Cache
+	grafts  graftstate.Cache
+	version gfy.Version
 
 	// selectMode is the batch-action mode. `Space` adds a row to selected;
 	// an action taken in this mode applies to all of them, behind a confirm
@@ -273,9 +289,6 @@ type App struct {
 	dirty bool
 
 	tickID coreglib.SourceHandle
-	// logGen is the ring-buffer generation last rendered into the job log
-	// pane, so a tick that finds it unmoved skips the render entirely.
-	logGen uint64
 }
 
 // New builds the board.
@@ -301,6 +314,7 @@ func New(opts Options) *App {
 		byPtr:     map[uintptr]*board.Row{},
 		jobByRepo: map[string]*jobs.Snapshot{},
 		jobIDs:    map[string]uint64{},
+		pausing:   map[uint64]bool{},
 		cols:      map[string]*gtk.ColumnViewColumn{},
 		sorters:   map[string]*gtk.CustomSorter{},
 		chips:     map[string]*gtk.ToggleButton{},
@@ -327,6 +341,10 @@ func (a *App) Run(args []string) int {
 		// for the process groups to go.
 		a.runner.Close()
 	}
+	// After Close, so the last job has already given its lease back: a server
+	// stopped while a graphify process was still sending to it would turn a
+	// clean shutdown into that job's failure.
+	a.ollama.Shutdown()
 	if a.opts.Store != nil {
 		if err := a.opts.Store.Flush(); err != nil {
 			log.Printf("store: %v", err)
@@ -340,12 +358,21 @@ func (a *App) activate() {
 	a.loadCSS()
 
 	set := a.opts.Store.Settings()
+	// Both policy funcs read the store at the moment they are asked rather
+	// than closing over `set`, so flipping the switch or dragging the grace
+	// period takes effect on the next job with nothing to re-apply.
+	a.ollama = &gfy.AutoOllama{
+		Enabled: func() bool { return a.opts.Store.Settings().AutoOllama() },
+		Idle:    func() time.Duration { return a.opts.Store.Settings().OllamaIdle() },
+		Logf:    applog.Infof,
+	}
 	a.runner = jobs.New(jobs.Options{
 		FreeLanes:    set.FreeLanes,
 		MeteredLanes: set.MeteredLanes,
 		LocalLanes:   set.LocalLanes,
 		LogBytes:     set.LogBytes,
 		Precheck:     jobs.RequireGraph,
+		LocalLease:   a.leaseOllama,
 	})
 	// Before the pump, because Restore deliberately emits nothing: the views
 	// below are built from Snapshot, which already has the restored jobs in
@@ -826,7 +853,7 @@ func (a *App) refreshStatus() {
 // probeVersion resolves the graphify binary off the main thread and raises the
 // banner when the version is not the one the argv builders were written for.
 func (a *App) probeVersion() {
-	v := gfy.Probe(nil)
+	v := gfy.Probe(context.TODO())
 	coreglib.IdleAdd(func() {
 		a.version = v
 		if v.Found {
@@ -869,6 +896,16 @@ func (a *App) pumpJobs() {
 
 // onJobEvent folds one job transition into the board. Main thread.
 func (a *App) onJobEvent(ev jobs.Event) {
+	if ev.Output {
+		// Log-only, and it carries no snapshot: the panes render from the ring
+		// buffer on their own tick and compare its generation against the last
+		// one they drew, so there is nothing to fold in here. Returning before
+		// the repo bookkeeping below is not a shortcut — that bookkeeping reads
+		// fields an output event does not have, and cannot change mid-run
+		// anyway.
+		return
+	}
+
 	s := ev.Job
 	if s.Repo != "" {
 		a.mu.Lock()
@@ -882,12 +919,6 @@ func (a *App) onJobEvent(ev jobs.Event) {
 			a.jobByRepo[s.Repo] = &snap
 		}
 		a.mu.Unlock()
-	}
-
-	if ev.Output {
-		// Log-only. The panes render from the ring buffer on their own tick;
-		// nothing to do here beyond letting them know there is something new.
-		return
 	}
 
 	if ev.Pause {

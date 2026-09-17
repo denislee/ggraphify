@@ -304,7 +304,7 @@ func printUsage(rows []board.Row, days int, asJSON, asMarkdown bool) {
 			}
 			fmt.Fprintf(rw, "%d\t%s\t%s\t%s\n", r.Uses, r.Name, do, r.Why)
 		}
-		rw.Flush()
+		_ = rw.Flush() // a terminal that will not take our output cannot be told so
 		fmt.Println()
 	}
 

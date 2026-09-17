@@ -201,3 +201,13 @@ func HasAPIKey() bool {
 // Itoa is strconv.Itoa, re-exported so the ui package can format overlay
 // numbers without importing strconv for one call.
 func Itoa(n int) string { return strconv.Itoa(n) }
+
+// Utoa is Itoa for a job id, which is a uint64.
+//
+// It exists so the callers that render one do not write Itoa(int(id)). That
+// conversion is safe here — the id is a monotonic counter that would need 2^63
+// submissions to overflow — but it is indistinguishable, to a reader and to a
+// scanner, from the narrowing conversions that are not. One function that
+// cannot narrow anything is cheaper than four annotations explaining why a
+// narrowing is fine.
+func Utoa(n uint64) string { return strconv.FormatUint(n, 10) }

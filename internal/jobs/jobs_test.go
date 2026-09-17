@@ -4,7 +4,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -119,10 +121,7 @@ wait $child
 
 	// Wait until it is genuinely running before cancelling.
 	deadline := time.After(10 * time.Second)
-	for {
-		if strings.Contains(job.Log.String(), "started") {
-			break
-		}
+	for !strings.Contains(job.Log.String(), "started") {
 		select {
 		case <-deadline:
 			t.Fatal("the fake never started")
@@ -760,5 +759,498 @@ func TestCloseDoesNotRaceAFinishingJobsEvent(t *testing.T) {
 		time.Sleep(time.Duration(i%4) * time.Millisecond)
 		r.Close()
 		<-done
+	}
+}
+
+// The lease must bracket the job's process: taken before it starts, given
+// back after it ends. Both halves matter — a lease taken late would let the
+// job send to a server that is not up yet, and one released early would let
+// the idle timer stop a server mid-run.
+func TestLocalLeaseBracketsTheProcess(t *testing.T) {
+	fakeGraphify(t, `sleep 0.2`)
+	var (
+		held     atomic.Int32
+		peak     atomic.Int32
+		released atomic.Int32
+		duringMu sync.Mutex
+		during   []int32
+	)
+	r := New(Options{
+		FreeLanes: 4,
+		LocalLease: func(j *Job) Lease {
+			n := held.Add(1)
+			for {
+				p := peak.Load()
+				if n <= p || peak.CompareAndSwap(p, n) {
+					break
+				}
+			}
+			return &countingLease{onRelease: func() {
+				held.Add(-1)
+				released.Add(1)
+			}}
+		},
+	})
+	defer r.Close()
+
+	repo := repoDir(t)
+	j, err := r.SubmitCmd("update", repo, "local", gfy.Params{Repo: repo, Backend: gfy.OllamaBackend}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Sampled while the subprocess is still sleeping: the lease has to be out
+	// for the whole of it, not merely acquired and dropped around the exec.
+	time.Sleep(100 * time.Millisecond)
+	duringMu.Lock()
+	during = append(during, held.Load())
+	duringMu.Unlock()
+
+	snap := wait(t, r, j.ID)
+	if snap.Status != Succeeded {
+		t.Fatalf("job status = %v, want Succeeded", snap.Status)
+	}
+	if during[0] != 1 {
+		t.Fatalf("%d leases held while the process ran, want 1", during[0])
+	}
+	if got := held.Load(); got != 0 {
+		t.Fatalf("%d leases still out after the job ended, want 0", got)
+	}
+	if got := released.Load(); got != 1 {
+		t.Fatalf("release called %d times, want 1", got)
+	}
+	if got := peak.Load(); got != 1 {
+		t.Fatalf("peak leases = %d, want 1", got)
+	}
+}
+
+// A job that dies is still a job whose lease has to come back, or the server
+// stays up forever after one failure.
+func TestLocalLeaseReleasedOnFailureAndCancellation(t *testing.T) {
+	fakeGraphify(t, `sleep 0.3; exit 7`)
+	var held atomic.Int32
+	r := New(Options{
+		FreeLanes: 4,
+		LocalLease: func(*Job) Lease {
+			held.Add(1)
+			return &countingLease{onRelease: func() { held.Add(-1) }}
+		},
+	})
+	defer r.Close()
+
+	repo := repoDir(t)
+	fail, _ := r.SubmitCmd("update", repo, "fails", gfy.Params{Repo: repo, Backend: gfy.OllamaBackend}, nil)
+	if snap := wait(t, r, fail.ID); snap.Status != Failed {
+		t.Fatalf("status = %v, want Failed", snap.Status)
+	}
+	if got := held.Load(); got != 0 {
+		t.Fatalf("%d leases out after a failed job, want 0", got)
+	}
+
+	other := repoDir(t)
+	cancelled, _ := r.SubmitCmd("update", other, "cancelled", gfy.Params{Repo: other, Backend: gfy.OllamaBackend}, nil)
+	time.Sleep(100 * time.Millisecond)
+	r.Cancel(cancelled.ID)
+	if snap := wait(t, r, cancelled.ID); snap.Status != Canceled {
+		t.Fatalf("status = %v, want Canceled", snap.Status)
+	}
+	if got := held.Load(); got != 0 {
+		t.Fatalf("%d leases out after a cancelled job, want 0", got)
+	}
+}
+
+// A nil hook, and a hook that declines a particular job by returning nil, are
+// both ordinary: neither may stop the job from running.
+func TestLocalLeaseOptional(t *testing.T) {
+	fakeGraphify(t, `echo ok`)
+	for _, tc := range []struct {
+		name string
+		hook func(*Job) Lease
+	}{
+		{"nil hook", nil},
+		{"hook declines", func(*Job) Lease { return nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := New(Options{LocalLease: tc.hook})
+			defer r.Close()
+			repo := repoDir(t)
+			j, err := r.SubmitCmd("update", repo, "x", gfy.Params{Repo: repo}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if snap := wait(t, r, j.ID); snap.Status != Succeeded {
+				t.Fatalf("status = %v, want Succeeded", snap.Status)
+			}
+		})
+	}
+}
+
+// countingLease records every transition the runner drives, in order, so a
+// test can assert on the sequence rather than on a final count. onRelease is
+// the hook the older lease tests use.
+type countingLease struct {
+	mu        sync.Mutex
+	steps     []string
+	resumedAt time.Time
+	onRelease func()
+}
+
+func (l *countingLease) note(step string) {
+	l.mu.Lock()
+	l.steps = append(l.steps, step)
+	l.mu.Unlock()
+}
+
+func (l *countingLease) Suspend() { l.note("suspend") }
+
+// Resume deliberately takes a moment, the way a real cold start does. The
+// point of the delay is that a runner which signalled first would have the
+// process awake during it, and the test below can see that.
+func (l *countingLease) Resume() {
+	time.Sleep(150 * time.Millisecond)
+	l.mu.Lock()
+	l.resumedAt = time.Now()
+	l.mu.Unlock()
+	l.note("resume")
+}
+
+func (l *countingLease) Release() {
+	l.note("release")
+	if l.onRelease != nil {
+		l.onRelease()
+	}
+}
+
+func (l *countingLease) sequence() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.steps...)
+}
+
+func (l *countingLease) resumed() time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.resumedAt
+}
+
+// Pausing a job suspends its lease, and resuming takes it back — so a paused
+// job that was using the local model server gives the server up, and gets it
+// back before it runs again.
+func TestPauseSuspendsTheLeaseAndResumeTakesItBack(t *testing.T) {
+	fakeGraphify(t, `sleep 2`)
+	lease := &countingLease{}
+	r := New(Options{FreeLanes: 4, LocalLease: func(*Job) Lease { return lease }})
+	defer r.Close()
+
+	repo := repoDir(t)
+	j, err := r.SubmitCmd("update", repo, "local", gfy.Params{Repo: repo, Backend: gfy.OllamaBackend}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Wait for the process, because setPaused refuses a job whose pgid is
+	// still zero and would otherwise report "nothing happened".
+	waitRunning(t, r, j.ID)
+
+	if !r.Pause(j.ID) {
+		t.Fatal("Pause reported that it changed nothing")
+	}
+	if got := lease.sequence(); len(got) != 1 || got[0] != "suspend" {
+		t.Fatalf("after Pause the lease saw %v, want [suspend]", got)
+	}
+
+	if !r.Resume(j.ID) {
+		t.Fatal("Resume reported that it changed nothing")
+	}
+	if got := lease.sequence(); len(got) != 2 || got[1] != "resume" {
+		t.Fatalf("after Resume the lease saw %v, want [suspend resume]", got)
+	}
+
+	r.Cancel(j.ID)
+	wait(t, r, j.ID)
+	if got := lease.sequence(); got[len(got)-1] != "release" {
+		t.Fatalf("the lease was not released at the end: %v", got)
+	}
+}
+
+// The ordering that makes resume correct: the lease is back BEFORE the process
+// is woken. A SIGCONT sent first would wake graphify into a model server the
+// pause had taken away, and it would find out as a connection error.
+func TestResumeRestoresTheLeaseBeforeSignalling(t *testing.T) {
+	// The script records when it wakes: it traps SIGCONT and stamps a file.
+	dir := t.TempDir()
+	stamp := filepath.Join(dir, "woke")
+	fakeGraphify(t, `
+trap 'date +%s.%N > `+stamp+`' CONT
+i=0
+while [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+`)
+	lease := &countingLease{}
+	r := New(Options{FreeLanes: 4, LocalLease: func(*Job) Lease { return lease }})
+	defer r.Close()
+
+	repo := repoDir(t)
+	j, _ := r.SubmitCmd("update", repo, "local", gfy.Params{Repo: repo, Backend: gfy.OllamaBackend}, nil)
+	waitRunning(t, r, j.ID)
+	r.Pause(j.ID)
+	r.Resume(j.ID)
+
+	woke := readStamp(t, stamp)
+	if woke.IsZero() {
+		t.Skip("the shell did not report the SIGCONT; nothing to order against")
+	}
+	if resumed := lease.resumed(); !resumed.Before(woke) {
+		t.Fatalf("the process woke at %v, before the lease was back at %v", woke, resumed)
+	}
+	r.Cancel(j.ID)
+	wait(t, r, j.ID)
+}
+
+// A job cancelled while paused still gets exactly one Release, and the lease
+// is told nothing else — no resume it did not ask for on the way out.
+func TestCancelWhilePausedReleasesTheLeaseOnce(t *testing.T) {
+	fakeGraphify(t, `sleep 5`)
+	lease := &countingLease{}
+	r := New(Options{FreeLanes: 4, LocalLease: func(*Job) Lease { return lease }})
+	defer r.Close()
+
+	repo := repoDir(t)
+	j, _ := r.SubmitCmd("update", repo, "local", gfy.Params{Repo: repo, Backend: gfy.OllamaBackend}, nil)
+	waitRunning(t, r, j.ID)
+	r.Pause(j.ID)
+	r.Cancel(j.ID)
+	if snap := wait(t, r, j.ID); snap.Status != Canceled {
+		t.Fatalf("status = %v, want Canceled", snap.Status)
+	}
+
+	got := lease.sequence()
+	var releases int
+	for _, s := range got {
+		if s == "release" {
+			releases++
+		}
+	}
+	if releases != 1 {
+		t.Fatalf("lease saw %d releases in %v, want exactly 1", releases, got)
+	}
+	if got[0] != "suspend" {
+		t.Fatalf("lease sequence %v does not start with the pause", got)
+	}
+}
+
+// A job with no lease — anything not against ollama — pauses and resumes
+// exactly as it always did.
+func TestPauseWithoutALeaseStillWorks(t *testing.T) {
+	fakeGraphify(t, `sleep 1`)
+	r := New(Options{FreeLanes: 4, LocalLease: func(*Job) Lease { return nil }})
+	defer r.Close()
+
+	repo := repoDir(t)
+	j, _ := r.SubmitCmd("update", repo, "x", gfy.Params{Repo: repo}, nil)
+	waitRunning(t, r, j.ID)
+	if !r.Pause(j.ID) {
+		t.Fatal("Pause on a job with no lease reported no change")
+	}
+	if !r.Paused(j.ID) {
+		t.Fatal("the job is not paused")
+	}
+	if !r.Resume(j.ID) {
+		t.Fatal("Resume on a job with no lease reported no change")
+	}
+	r.Cancel(j.ID)
+	wait(t, r, j.ID)
+}
+
+// waitRunning blocks until the job's process actually exists, which is what
+// Pause requires: a job dispatched but not yet exec'd has no process group to
+// signal and is correctly refused.
+func waitRunning(t *testing.T, r *Runner, id uint64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		for _, s := range r.Snapshot() {
+			if s.ID == id && s.Status == Running {
+				// Status is set before exec.Start returns, so give the pgid a
+				// moment to land rather than racing it.
+				time.Sleep(50 * time.Millisecond)
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the job never started running")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// readStamp reads the unix timestamp the fake graphify wrote when it woke.
+func readStamp(t *testing.T, path string) time.Time {
+	t.Helper()
+	// The trap runs when the shell next gets control, which is after the
+	// sleep it was in; poll rather than assume it is already there.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		b, err := os.ReadFile(path)
+		if err == nil && len(strings.TrimSpace(string(b))) > 0 {
+			var sec, nsec int64
+			parts := strings.SplitN(strings.TrimSpace(string(b)), ".", 2)
+			sec, _ = strconv.ParseInt(parts[0], 10, 64)
+			if len(parts) == 2 {
+				frac := (parts[1] + "000000000")[:9]
+				nsec, _ = strconv.ParseInt(frac, 10, 64)
+			}
+			return time.Unix(sec, nsec)
+		}
+		if time.Now().After(deadline) {
+			return time.Time{}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A status change is the one event a consumer cannot reconstruct, so it must
+// not be droppable. Output events fill the 256-slot buffer routinely — a
+// chatty graphify under several parallel jobs does it in a second — and the
+// completion event arriving behind them used to be thrown on the floor.
+//
+// For the GUI that is a row stuck at "running". For ggraphify-job, whose whole
+// body is a range over this channel waiting for Status.Done(), it is a hang.
+func TestTerminalEventSurvivesAFullEventChannel(t *testing.T) {
+	// Comfortably more lines than the channel holds, with nothing draining it.
+	fakeGraphify(t, `i=0; while [ $i -lt 600 ]; do echo "line $i"; i=$((i+1)); done`)
+
+	r := New(Options{})
+	defer r.Close()
+	repo := repoDir(t)
+	job, err := r.SubmitCmd("update", repo, "Update",
+		gfy.Params{Repo: repo}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait on the job itself rather than on the channel: done is closed before
+	// the terminal event is emitted, so this arrives with the buffer still
+	// full and the emit still to come.
+	select {
+	case <-job.Done():
+	case <-time.After(20 * time.Second):
+		t.Fatal("the job never finished")
+	}
+	// Long enough for the terminal emit to have been attempted against the
+	// full buffer, which is the moment under test.
+	time.Sleep(200 * time.Millisecond)
+
+	deadline := time.After(20 * time.Second)
+	for {
+		select {
+		case ev, ok := <-r.Events():
+			if !ok {
+				t.Fatal("event channel closed before the terminal event arrived")
+			}
+			if ev.Job.ID == job.ID && ev.Job.Status.Done() {
+				return
+			}
+		case <-deadline:
+			t.Fatal("the terminal event was dropped: a consumer waiting for " +
+				"Status.Done() would wait forever")
+		}
+	}
+}
+
+// An output event is an ID and a generation, and nothing else. It used to be a
+// full Snapshot built under the runner's global lock — the same lock that
+// serializes dispatch, Cancel and completion — once per pipe read from every
+// parallel job, to produce a struct copy the UI read two fields of.
+//
+// The ID lives on the event itself rather than on the snapshot precisely
+// because there is no snapshot: a consumer filtering on ev.Job.ID would
+// silently discard the entire log stream.
+func TestOutputEventsCarryOnlyTheIDAndGeneration(t *testing.T) {
+	fakeGraphify(t, `echo one; echo two; echo three`)
+
+	r := New(Options{})
+	defer r.Close()
+	repo := repoDir(t)
+	job, err := r.SubmitCmd("update", repo, "Update", gfy.Params{Repo: repo}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seen := 0
+	deadline := time.After(20 * time.Second)
+	for done := false; !done; {
+		select {
+		case ev, ok := <-r.Events():
+			if !ok {
+				t.Fatal("event channel closed early")
+			}
+			if ev.ID != job.ID {
+				continue
+			}
+			if ev.Output {
+				seen++
+				if ev.Gen == 0 {
+					t.Error("output event carries no ring-buffer generation")
+				}
+				if ev.Job.Kind != "" || ev.Job.Repo != "" || ev.Job.Log != nil {
+					t.Errorf("output event carries a snapshot: %+v", ev.Job)
+				}
+				continue
+			}
+			// Transitions still carry the whole thing, and their ID agrees.
+			if ev.Job.ID != ev.ID {
+				t.Errorf("transition ID mismatch: ev.ID=%d snapshot=%d", ev.ID, ev.Job.ID)
+			}
+			done = ev.Job.Status.Done()
+		case <-deadline:
+			t.Fatal("the job never finished")
+		}
+	}
+	if seen == 0 {
+		t.Fatal("no output events arrived at all")
+	}
+}
+
+// Get answers about one job without building, copying and sorting every job
+// the runner knows about — and it has to agree with Snapshot in every state a
+// job can be in, since the callers it replaced were reading Snapshot's output.
+func TestGetAgreesWithSnapshotAndMissesNothing(t *testing.T) {
+	fakeGraphify(t, `exit 0`)
+
+	r := New(Options{})
+	defer r.Close()
+	repo := repoDir(t)
+	job, err := r.SubmitCmd("update", repo, "Update", gfy.Params{Repo: repo}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Queued or running, depending on how fast dispatch was — either way Get
+	// must find it, and agree with the whole-list answer.
+	assertAgrees := func(when string) {
+		t.Helper()
+		got, ok := r.Get(job.ID)
+		if !ok {
+			t.Fatalf("%s: Get did not find job %d", when, job.ID)
+		}
+		var want Snapshot
+		for _, s := range r.Snapshot() {
+			if s.ID == job.ID {
+				want = s
+			}
+		}
+		if got.ID != want.ID || got.Kind != want.Kind || got.Repo != want.Repo {
+			t.Errorf("%s: Get = %+v, Snapshot said %+v", when, got, want)
+		}
+	}
+	assertAgrees("before it finished")
+
+	wait(t, r, job.ID)
+
+	// And in history, which is a different slice again.
+	assertAgrees("after it finished")
+	if s, _ := r.Get(job.ID); !s.Status.Done() {
+		t.Errorf("Get returned a stale status %v for a finished job", s.Status)
+	}
+	if _, ok := r.Get(job.ID + 9999); ok {
+		t.Error("Get invented a job that was never submitted")
 	}
 }

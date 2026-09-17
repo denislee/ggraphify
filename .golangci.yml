@@ -1,0 +1,31 @@
+# golangci-lint is this repository's single linter.
+#
+# Standalone `staticcheck` is not used: it is built against whatever Go the
+# person who installed it had, and a copy built against go1.26 refuses this
+# module outright ("package requires newer Go version go1.27"). golangci-lint
+# bundles a staticcheck that tracks its own toolchain, so there is one tool and
+# one answer rather than two that disagree about whether the code compiles.
+
+version: "2"
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  exclusions:
+    rules:
+      # Writes to an in-memory buffer. ringbuf.Buf, bytes.Buffer and
+      # strings.Builder document that their Write/WriteString never returns an
+      # error; checking one is noise that hides a check that would matter.
+      - linters: [errcheck]
+        source: '^\s*(_ = )?[\w.]*(Log|buf|b|sb|log|quiet\.Log)\.WriteString\('
+      # Output to a tabwriter or to stderr in the scan tool: there is nothing
+      # to do about a failed write to the terminal except fail to report it.
+      - linters: [errcheck]
+        path: cmd/ggraphify-scan/
+        text: 'Error return value of `(fmt\.Fprint(f|ln)?|w\.Flush)`'
+      # Closing something opened for reading, after the read has finished.
+      - linters: [errcheck]
+        text: 'Error return value of `(resp\.Body\.Close|f\.Close)` is not checked'
+      # Test setup: a failed WriteFile/MkdirAll in a t.TempDir surfaces
+      # immediately as the assertion that follows it.
+      - linters: [errcheck]
+        path: _test\.go

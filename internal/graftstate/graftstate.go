@@ -484,7 +484,11 @@ func exists(path string) bool {
 // dirSize totals a directory tree, ignoring what it cannot read.
 func dirSize(dir string) int64 {
 	var n int64
-	filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+	// The walk's own error is dropped on purpose: every per-entry error is
+	// already swallowed below, so the only thing left for WalkDir to report is
+	// that the root does not exist — and "a tree that is not there totals
+	// zero" is this function's documented answer, not a failure.
+	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}

@@ -407,8 +407,6 @@ func (a *App) actTree() {
 	})
 }
 
-func (a *App) actCallflow() { a.run("export-callflow", a.batch(), nil) }
-
 // actWatch starts or stops `graphify watch` for the selected repository. A
 // watcher is a long-running child of the board and is cancelled when the board
 // exits — the runner's Close does it.
@@ -465,8 +463,6 @@ func (a *App) actHookInstall() {
 	dlg.Present(a.win)
 }
 
-func (a *App) actHookStatus() { a.run("hook-status", a.batch(), nil) }
-
 // updateSkills re-runs graphify's own installer for the Claude Code platform,
 // which is the fix for the skew warning the banner reports. It is the same
 // command the settings dialog's Claude Code group offers, built in one place.
@@ -494,12 +490,58 @@ func (a *App) cancelCurrent() {
 // It is one call rather than a Pause and a Resume button because the two are
 // never both meaningful: a job is either stopped or it is not, and a control
 // that shows the state it will move to is the one that can live in a row.
+// Both halves run off the main thread, because both can block: a pause stops
+// the local model server it was holding up, and a resume waits for that server
+// to answer again before the process is woken — up to about ten seconds of a
+// cold start, which is ten seconds this thread owes to drawing. The row
+// redraws from the Pause event either way, so there is nothing here to wait
+// for.
 func (a *App) togglePause(id uint64) {
-	if a.runner.Paused(id) {
-		a.runner.Resume(id)
+	// One transition per job at a time. The state is read here, on the main
+	// thread, and acted on in the goroutine below — so two quick clicks would
+	// otherwise both read the same pre-click state, both spawn, and the
+	// outcome would be whichever reached setPaused first. A resume can sit
+	// inside lease.Resume for the ten seconds a cold model server takes, which
+	// is ample room for the second click.
+	a.mu.Lock()
+	if a.pausing[id] {
+		a.mu.Unlock()
 		return
 	}
-	a.runner.Pause(id)
+	a.pausing[id] = true
+	a.mu.Unlock()
+
+	resume := a.runner.Paused(id)
+	// A resume against the local model server has to wait for that server to
+	// come back before the process is woken, and the row cannot show the
+	// change until it has: the Pause event is emitted at the end. So say so
+	// now, or a click would look ignored for ten seconds.
+	if resume && a.resumeWaitsForOllama(id) {
+		a.toast("resuming — starting ollama first")
+	}
+	go func() {
+		defer func() {
+			a.mu.Lock()
+			delete(a.pausing, id)
+			a.mu.Unlock()
+		}()
+		if resume {
+			a.runner.Resume(id)
+			return
+		}
+		a.runner.Pause(id)
+	}()
+}
+
+// resumeWaitsForOllama reports whether resuming this job means waiting for the
+// local model server, which is true exactly when the board is managing that
+// server for a job that talks to it.
+func (a *App) resumeWaitsForOllama(id uint64) bool {
+	if !a.opts.Store.Settings().AutoOllama() {
+		return false
+	}
+	s, ok := a.runner.Get(id)
+	return ok && s.Local && gfy.ArgvBackend(s.Argv) == gfy.OllamaBackend
 }
 
 // pauseCurrent pauses or resumes whatever is running for the selected row.

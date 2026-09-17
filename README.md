@@ -743,6 +743,84 @@ confirm dialog now separates the three, and each names its fix:
 - the server is up but has not got the model the board is set to → pull it, or pick from the
   list of what it does have, which the settings group offers as a combo.
 
+### The server's lifecycle: started for a job, stopped when idle
+
+**Start and stop the server automatically** is on by default. The board starts ollama when
+a job that will talk to it is about to run, and stops it again once no job does — so a
+machine that reaches for a local model occasionally is not holding a 7B's weights resident
+between sweeps, out of the page cache the rest of the desktop wants.
+
+It is a **lease counter**, not a per-job start: every job takes a lease just before its
+process starts and gives it back when that process ends, whatever it ended as — succeeded,
+failed, cancelled, killed at shutdown. The server stays up while at least one lease is out.
+The hook is on the runner (`jobs.Options.LocalLease`), which is the one path every job
+takes: the board's buttons, the batch sweep and the unattended fix loop all go through it,
+so the fourth caller somebody adds next cannot forget the server. What it hands back is a
+`jobs.Lease` — `Suspend`, `Resume`, `Release` — because a job has three ends and not one,
+and the runner drives those three in exactly the places it signals the process group. The
+runner is told nothing about what it is leasing.
+
+When the last lease comes back a **grace period** starts — five minutes by default,
+configurable on the row below the switch — and the server is stopped only if no new job
+arrives before it runs down. The grace period is the point: a sweep is a run of short jobs
+with gaps between them, and stopping too eagerly is paid twice, once for the cold start and
+once for reading the weights off disk again.
+
+**Pausing a job gives the server up too.** A paused graphify is a SIGSTOPped process that
+will not send another request until somebody says so, and holding a 7B's weights resident
+for it defeats the point of having paused it. So the lease is *suspended* rather than
+released: the server stops if nothing else holds one, and the job's place in the counter is
+taken again when it resumes.
+
+Two details carry that:
+
+- **the stop is immediate, not after the grace period.** The grace period exists because
+  the lull between two jobs in a sweep is shorter than a cold start is expensive. A pause
+  is somebody asking for their machine back, and answering "in five minutes" would be
+  answering a different question;
+- **the resume brings the server back BEFORE the process is woken**, and blocks while it
+  does. A SIGCONT sent first would wake graphify into a dead port, and it would find that
+  out as a connection error rather than as a wait. `Resume` therefore blocks for up to a
+  cold start, so the board calls it off the thread that draws and toasts *resuming —
+  starting ollama first*, because the row cannot show the change until the wait is over.
+
+One consequence worth knowing: a request that was *in flight* when the job was paused does
+not survive the server going away, so a short pause-and-resume can cost the chunk that was
+mid-flight where previously it would have continued. A pause longer than graphify's own API
+timeout already lost that request either way, which is most of them.
+
+Three rules bound what it will do, and none of them has a setting that relaxes it:
+
+- **it only ever stops a server it started itself.** An ollama that was already answering
+  when the first job asked for one belongs to whoever started it — they may have a chat
+  open against it or a second tool pointed at it — and there is no reading of "manage the
+  server automatically" that means "kill things other people started". The evidence is
+  recorded at the moment of the start, not inferred afterwards;
+- **a server started by hand is exempt** — from the idle stop, from the pause stop and from
+  the stop at exit. The **Start** button pins the server: the click asked for a running
+  ollama, not for one that vanishes when a timer nobody saw runs down, and pausing a job is
+  not a retraction of it. Manual start, manual stop;
+- **only ollama.** `j.Local` is true for any local backend, which includes the `openai`
+  backend repointed at a loopback llama-server, vLLM or LM Studio. Those the board did not
+  start, cannot start and has no business stopping, so the job's *argv* is asked which
+  backend it was built for and only `ollama` is managed. The argv rather than the current
+  setting, because a queued job restored from the previous session must be leased against
+  the server **it** will talk to.
+
+The stop mirrors the start, route for route: `systemctl --user stop ollama` for a per-user
+unit, and for a detached `ollama serve` a SIGTERM to the process **group** — `ollama serve`
+spawns a runner subprocess per loaded model, and signalling the pid alone would leave a
+runner holding the weights, and the GPU, after the server it belonged to had gone. A
+system-wide unit is never stopped, for the same reason it is never started. An auto-started
+server is also taken down when the board quits, after the runner has closed so the last job
+is already gone — a server the board started silently outliving the board is the one
+outcome nobody could have intended, since nothing on the machine would say where the
+resident weights came from.
+
+`ggraphify-job` gets the same behaviour for the single job it runs, under `-auto-ollama`
+(default true). It reads no state file, so a headless run behaves identically whoever's
+board last touched which switch.
+
 ### The board-wide sweep
 
 The local backend changes what a fan-out means, so it gets a button the metered

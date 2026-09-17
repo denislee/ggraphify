@@ -9,6 +9,8 @@ import (
 	"github.com/dns/ggraphify/internal/applog"
 	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/gfy"
+	"github.com/dns/ggraphify/internal/jobs"
+	"github.com/dns/ggraphify/internal/store"
 )
 
 // The local-model group: run the metered commands against a model on this
@@ -111,7 +113,49 @@ func (a *App) settingsLocal() *adw.PreferencesGroup {
 	compat.SetSubtitleLines(0)
 	g.Add(compat)
 
+	// The lifecycle rows. They sit at the bottom of this group, below the
+	// facts about the machine, because they are the one thing here that is a
+	// preference rather than a property of the hardware.
+	set := a.opts.Store.Settings()
+
+	auto := adw.NewSwitchRow()
+	auto.SetTitle("Start and stop the server automatically")
+	auto.SetSubtitleLines(0)
+	auto.SetSubtitle(escapeMarkup("On: the board starts ollama when a job needs it and stops " +
+		"it again once no job does, so a model's weights are not resident between sweeps. It " +
+		"only ever stops a server it started itself — an ollama that was already running when " +
+		"the first job asked for one is left alone, including when the board quits."))
+	auto.SetActive(set.AutoOllama())
+	auto.NotifyProperty("active", func() {
+		s := a.opts.Store.Settings()
+		// Stored inverted: see store.Settings.NoAutoOllama. The switch shows
+		// the positive, the file records the departure from the default.
+		s.NoAutoOllama = !auto.Active()
+		a.opts.Store.SetSettings(s)
+		if s.AutoOllama() {
+			a.toast("the board will start and stop ollama as jobs need it")
+		} else {
+			a.toast("ollama is yours to start and stop now")
+		}
+		a.updateLocalIdleRow()
+	})
+	g.Add(auto)
+
+	idle := adw.NewSpinRow(gtk.NewAdjustment(set.OllamaIdle().Seconds(), 10, 3600, 10, 60, 0), 10, 0)
+	idle.SetTitle("Stop after idle (seconds)")
+	idle.SetSubtitleLines(0)
+	idle.NotifyProperty("value", func() {
+		s := a.opts.Store.Settings()
+		s.OllamaIdleStop = int(idle.Value())
+		a.opts.Store.SetSettings(s)
+		a.updateLocalIdleRow()
+	})
+	g.Add(idle)
+
 	a.localGroup = g
+	a.localAutoRow = auto
+	a.localIdleRow = idle
+	a.updateLocalIdleRow()
 	a.localServerRow = server
 	a.localStartBtn = start
 	a.localModelsRow = models
@@ -265,6 +309,52 @@ func (a *App) fillLocalLLM(ollama, compat gfy.LocalProbe, model string) {
 	}
 }
 
+// updateLocalIdleRow keeps the grace-period row's subtitle and sensitivity in
+// step with the switch above it. A number nobody will act on is worse than no
+// number, so the row goes insensitive when the lifecycle is switched off.
+func (a *App) updateLocalIdleRow() {
+	if a.localIdleRow == nil {
+		return
+	}
+	set := a.opts.Store.Settings()
+	a.localIdleRow.SetSensitive(set.AutoOllama())
+	sub := "How long a server the board started stays up after the last job that " +
+		"used it finished. Default " + gfy.Itoa(int(store.DefaultOllamaIdleStop.Seconds())) +
+		": a sweep is a run of short jobs with gaps between them, and every gap shorter " +
+		"than this costs nothing, where stopping too eagerly is paid twice — a cold start " +
+		"and the weights read from disk again."
+	if !set.AutoOllama() {
+		sub += " The lifecycle is switched off, so nothing is stopped on a timer."
+	} else if n := a.ollama.Leases(); n > 0 {
+		sub += " Right now " + plural(n, "job", "jobs") + " holding the server up."
+	}
+	a.localIdleRow.SetSubtitle(escapeMarkup(sub))
+}
+
+// leaseOllama is the runner's LocalLease hook: it decides whether a job about
+// to start needs this machine's ollama, and if so keeps the server up for as
+// long as that job runs.
+//
+// Two conditions, and the second is the one that is easy to miss. j.Local is
+// true for ANY local backend, which includes the openai backend repointed at
+// a loopback llama-server, vLLM or LM Studio — servers this board did not
+// start, cannot start, and has no business stopping. So the argv is asked
+// which backend it was actually built for, and only ollama is managed.
+//
+// The argv rather than the settings, because a job's backend was fixed when
+// it was submitted: a queued job restored from the previous session, or one
+// submitted before somebody changed the backend, must be leased against the
+// server IT will talk to and not against the current preference.
+func (a *App) leaseOllama(j *jobs.Job) jobs.Lease {
+	if j == nil || !j.Local {
+		return nil
+	}
+	if gfy.ArgvBackend(j.Argv) != gfy.OllamaBackend {
+		return nil
+	}
+	return a.ollama.Acquire()
+}
+
 // startOllama runs the start off the main thread: it waits for the port to
 // answer, which is up to ten seconds of a cold start.
 func (a *App) startOllama() {
@@ -288,6 +378,11 @@ func (a *App) startOllama() {
 				a.localStartBtn.SetSensitive(true)
 				return
 			}
+			// A server somebody asked for by hand outlives the lifecycle's
+			// idle timer and the board itself: the click was for a running
+			// ollama, not for one that disappears when a timer nobody saw
+			// runs down. Stopping it again is a manual act too.
+			gfy.PinOllama()
 			applog.Infof("started ollama via %s", how)
 			a.toastf("ollama started (%s)", how)
 			a.checkLocalLLM(false)

@@ -517,3 +517,55 @@ func TestOutLocationIsTheOnlyResolver(t *testing.T) {
 		t.Errorf("stored OutBase = %q — a flag leaked into the settings", got)
 	}
 }
+
+// The ollama lifecycle has to be on for a state file written before it
+// existed, which is what "enabled by default" means in practice: the default
+// is carried by the zero value, not by a migration.
+func TestOllamaLifecycleDefaultsOnForAnOldStateFile(t *testing.T) {
+	var s Settings
+	if !s.AutoOllama() {
+		t.Fatal("AutoOllama() is false for a zero Settings; the default must be on")
+	}
+	if got := s.OllamaIdle(); got != DefaultOllamaIdleStop {
+		t.Fatalf("OllamaIdle() = %v for a zero Settings, want %v", got, DefaultOllamaIdleStop)
+	}
+	// And switching it off has to survive a write, which is the half a stored
+	// inverted flag gets wrong when the JSON tag says omitempty and the
+	// reader forgets the inversion.
+	s.NoAutoOllama = true
+	if s.AutoOllama() {
+		t.Fatal("AutoOllama() is true after NoAutoOllama was set")
+	}
+	s.OllamaIdleStop = 90
+	if got := s.OllamaIdle(); got != 90*time.Second {
+		t.Fatalf("OllamaIdle() = %v, want 90s", got)
+	}
+	// A negative or zero value is one nobody chose, not an instruction to
+	// stop the server the instant a job ends.
+	for _, n := range []int{0, -1} {
+		s.OllamaIdleStop = n
+		if got := s.OllamaIdle(); got != DefaultOllamaIdleStop {
+			t.Fatalf("OllamaIdle() with %d = %v, want the default", n, got)
+		}
+	}
+}
+
+// The round trip, because the switch is only useful if it is remembered.
+func TestOllamaLifecycleRoundTrips(t *testing.T) {
+	s, path := tempStore(t)
+	set := s.Settings()
+	set.NoAutoOllama = true
+	set.OllamaIdleStop = 120
+	s.SetSettings(set)
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := Open(path).Settings()
+	if got.AutoOllama() {
+		t.Fatal("the lifecycle came back on after being switched off")
+	}
+	if got.OllamaIdle() != 120*time.Second {
+		t.Fatalf("idle period came back as %v, want 120s", got.OllamaIdle())
+	}
+}

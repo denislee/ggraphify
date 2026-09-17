@@ -349,7 +349,7 @@ func (d *dockPane) waitReason(s jobs.Snapshot, l laneUse) string {
 	}
 	if s.Repo != "" {
 		if id, held := d.a.runner.Busy(s.Repo); held && id != s.ID {
-			return "waiting for job " + gfy.Itoa(int(id)) + " on the same repository"
+			return "waiting for job " + gfy.Utoa(id) + " on the same repository"
 		}
 	}
 	if l.full(s.Cost, s.Local) {
@@ -695,7 +695,7 @@ func dockRowTooltip(e dockEntry) string {
 	text, _ := dockStatus(e)
 	var b strings.Builder
 	b.WriteString(s.Label + "\n")
-	b.WriteString("job " + gfy.Itoa(int(s.ID)) + " · " + s.Kind + " · " + laneName(s.Cost, s.Local) + " lane\n")
+	b.WriteString("job " + gfy.Utoa(s.ID) + " · " + s.Kind + " · " + laneName(s.Cost, s.Local) + " lane\n")
 	if s.Repo != "" {
 		b.WriteString(s.Repo + "\n")
 	}
@@ -763,7 +763,7 @@ func dockKey(entries []dockEntry) string {
 			b.WriteByte('|')
 			continue
 		}
-		b.WriteString(gfy.Itoa(int(e.snap.ID)))
+		b.WriteString(gfy.Utoa(e.snap.ID))
 		b.WriteByte(':')
 		b.WriteString(e.snap.Status.String())
 		// Pausing does not change the status, but it changes the row — the

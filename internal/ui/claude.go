@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"strings"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
@@ -271,7 +272,7 @@ func (a *App) installClaudeSkill(label string) {
 // redone rather than left saying what was true a minute ago.
 func (a *App) onSkillInstalled() {
 	go func() {
-		v := gfy.Reprobe(nil)
+		v := gfy.Reprobe(context.TODO())
 		idle(func() {
 			a.version = v
 			a.refreshStatus()

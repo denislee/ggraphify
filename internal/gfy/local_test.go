@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The base-URL resolver has to agree with graphify's _resolve_ollama_base_url
@@ -770,5 +771,96 @@ func TestLocalNoticeStatesTheRealConcurrency(t *testing.T) {
 	}
 	if strings.Contains(n, "forces one request at a time") {
 		t.Errorf("notice still claims the serialization that was just removed: %q", n)
+	}
+}
+
+// ProbeLocal is reached from the Run button, on the thread that draws: via
+// SubmitCmd → LocalEnv → LocalConcurrency. A synchronous probe there froze the
+// UI for up to two seconds every time the 5s TTL had expired against a server
+// that was down. A stale entry is returned immediately instead, and refreshed
+// behind the caller.
+func TestProbeLocalReturnsStaleImmediatelyRatherThanBlocking(t *testing.T) {
+	// A port nothing is listening on: the reach attempt is the slow path under
+	// test, since it has to run out its own timeout.
+	t.Setenv(OllamaHostVar, "http://127.0.0.1:1")
+	InvalidateLocalProbe()
+	t.Cleanup(InvalidateLocalProbe)
+
+	// Cold: this one is allowed to block, and does the measuring.
+	cold := time.Now()
+	first := ProbeLocal(OllamaBackend)
+	coldTook := time.Since(cold)
+	if first.Reach {
+		t.Skip("something is listening on port 1; this test needs a dead port")
+	}
+
+	// Force the entry stale without dropping it, which is what the TTL does.
+	probeCache.Lock()
+	p := probeCache.m[OllamaBackend+" "+LocalBaseURL(OllamaBackend)]
+	p.ProbedAt = time.Now().Add(-time.Hour)
+	probeCache.m[OllamaBackend+" "+LocalBaseURL(OllamaBackend)] = p
+	probeCache.Unlock()
+
+	warm := time.Now()
+	got := ProbeLocal(OllamaBackend)
+	warmTook := time.Since(warm)
+
+	// The identity of the answer is the real assertion: the caller got the OLD
+	// entry, timestamp and all, rather than waiting for a new measurement. A
+	// synchronous re-probe would have returned one stamped just now.
+	if !got.ProbedAt.Equal(p.ProbedAt) {
+		t.Errorf("ProbeLocal re-measured synchronously (ProbedAt moved to %v) instead of "+
+			"handing back the stale entry — this runs on the thread that draws", got.ProbedAt)
+	}
+	// And a latency floor as a backstop, deliberately loose.
+	if warmTook > 100*time.Millisecond {
+		t.Errorf("a stale probe blocked for %v (cold probe took %v)", warmTook, coldTook)
+	}
+
+	// The background refresh does land, eventually.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		probeCache.Lock()
+		now := probeCache.m[OllamaBackend+" "+LocalBaseURL(OllamaBackend)]
+		probeCache.Unlock()
+		if now.ProbedAt.After(p.ProbedAt) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("the background refresh never updated the cache: the entry would stay stale forever")
+}
+
+// And a refresh that is still in flight when the server is started or stopped
+// must not store its now-false measurement over the invalidation.
+func TestInvalidateLocalProbeBeatsAnInFlightRefresh(t *testing.T) {
+	t.Setenv(OllamaHostVar, "http://127.0.0.1:1")
+	InvalidateLocalProbe()
+	t.Cleanup(InvalidateLocalProbe)
+
+	key := OllamaBackend + " " + LocalBaseURL(OllamaBackend)
+
+	// A probe that captured the epoch before the invalidation.
+	probeCache.Lock()
+	epoch := probeCache.epoch
+	probeCache.Unlock()
+	InvalidateLocalProbe()
+
+	probeCache.Lock()
+	stored := probeCache.epoch == epoch
+	probeCache.Unlock()
+	if stored {
+		t.Fatal("InvalidateLocalProbe did not move the epoch")
+	}
+
+	// Simulate that late store landing.
+	probeCache.Lock()
+	if probeCache.epoch == epoch {
+		probeCache.m = map[string]LocalProbe{key: {Backend: OllamaBackend, Reach: true}}
+	}
+	_, present := probeCache.m[key]
+	probeCache.Unlock()
+	if present {
+		t.Error("a refresh from before the invalidation re-populated the cache")
 	}
 }

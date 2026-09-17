@@ -169,3 +169,22 @@ func TestLastLineOfAnAllBlankBufferIsEmpty(t *testing.T) {
 		t.Errorf("LastLine() = %q, want empty", got)
 	}
 }
+
+// BenchmarkWriteLinesPastCapacity is the shape that actually happens: a verbose
+// subprocess writing line by line into a buffer that is already full. Trimming
+// to exactly cap made every one of these writes a full-buffer memmove; the
+// low-water mark amortizes it over the next quarter of the buffer.
+func BenchmarkWriteLinesPastCapacity(b *testing.B) {
+	buf := New(DefaultCap)
+	line := []byte(strings.Repeat("x", 63) + "\n")
+	// Fill it first, so the benchmark measures the steady state and not the
+	// free writes before the first eviction.
+	for buf.Len() < DefaultCap {
+		buf.Write(line)
+	}
+	b.SetBytes(int64(len(line)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf.Write(line)
+	}
+}

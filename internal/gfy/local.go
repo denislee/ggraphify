@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -579,30 +580,50 @@ type ollamaModelInfo struct {
 	} `json:"details"`
 }
 
-// ollamaSlots establishes how many requests the server answers at once, and
-// says where the number came from.
+// How many requests the local server answers at once, and where the number
+// came from, in two halves: what the operator STATED, and what can be DERIVED.
 //
-// There is no endpoint for this. /api/ps reports the PER-SLOT context and
+// There is no endpoint for either. /api/ps reports the PER-SLOT context and
 // nothing about the slot count, and ollama publishes its own configuration
 // nowhere on the wire — so the question is answered by reading the
 // configuration of the process that is serving, which is only possible when
 // that process is on this machine and under a manager that will say.
 //
-// The order is authority-first, not convenience-first. A systemd unit's
+// statedSlots is the operator's own answer, read from the environment and
+// nothing else: no HTTP, no systemctl, no reachable server required.
+//
+// It is separate from derivedSlots precisely so it can be asked
+// unconditionally. "Stated beats derived" is not a rule a probe gets to apply
+// only when it happens to reach the server — a server that is still coming up,
+// or one whose failed reach is sitting in the 5s cache, is exactly the moment a
+// job is submitted, and reading the variable a moment later is no use to the
+// argv that has already been built. Discarding the override there clamped
+// graphify back to one chunk and silently dropped the --max-concurrency
+// already in the command line: the precise serialization the setting exists to
+// prevent.
+//
+// Returns 0 when nothing is stated, which is the caller's signal to infer.
+func statedSlots() (int, string) {
+	if v := strings.TrimSpace(os.Getenv(OllamaSlotsVar)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n, OllamaSlotsVar + "=" + strconv.Itoa(n)
+		}
+	}
+	return 0, ""
+}
+
+// derivedSlots infers the count from the manager of the process that is
+// serving. It spawns up to two systemctl subprocesses, so it is only worth
+// asking of a server that answered — unlike statedSlots above.
+//
+// Its own order is authority-first, not convenience-first. A systemd unit's
 // Environment= is what the running server was actually given; this process's
 // own environment is what a server started FROM this session would have been
 // given, which is the right answer for a detached `ollama serve` and the wrong
 // one for a system unit configured differently. Getting that order backwards
 // would have the board confidently drive two chunks at a one-slot server on
 // the strength of a variable in the user's shell profile.
-func ollamaSlots(base string) (int, string) {
-	// Stated beats derived. Whoever set this knows the server; the code below
-	// only ever infers it.
-	if v := strings.TrimSpace(os.Getenv(OllamaSlotsVar)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n, OllamaSlotsVar + "=" + strconv.Itoa(n)
-		}
-	}
+func derivedSlots(base string) (int, string) {
 	// A server somewhere else is a server whose configuration is not on this
 	// disk. Guessing at it is how a remote one-slot server gets four chunks.
 	if !IsLocalURL(base) {
@@ -911,11 +932,40 @@ const probeTTL = 5 * time.Second
 var probeCache struct {
 	sync.Mutex
 	m map[string]LocalProbe
+	// refreshing guards against a second background probe for a key that
+	// already has one in flight. Without it a burst of callers arriving on a
+	// stale entry each spawn their own HTTP-plus-systemctl round, which is the
+	// cost the cache exists to avoid, merely moved off the caller's thread.
+	refreshing map[string]bool
+	// epoch is bumped by InvalidateLocalProbe. A background refresh started
+	// before an invalidation must not store its result after one: starting or
+	// stopping the server is exactly when a measurement taken a moment earlier
+	// becomes a lie, and re-caching it would undo the invalidation that the
+	// start/stop performed on purpose.
+	epoch uint64
 }
 
 // ProbeLocal asks a local backend's server what it has, with a short timeout
 // and a short cache. It never returns an error: "down" is an answer, and the
 // caller's job is to render it, not to handle it.
+//
+// A STALE entry is returned immediately and refreshed in the background. This
+// matters because ProbeLocal is not only on the settings page's off-thread
+// poll: it is reached from LocalConcurrency, which SubmitCmd calls, which the
+// Run button calls — on the GTK main thread, the one that draws. Probing
+// synchronously there froze the UI for up to two seconds (an HTTP GET with a
+// 2s timeout, then two more HTTP calls, then up to two systemctl spawns) every
+// time the 5s TTL happened to have expired, with the server down.
+//
+// Returning slightly stale is consistent with what this function already
+// promises. Every caller renders the answer rather than acting on it, and a
+// five-second-old "the server is up" is the same class of fact as a
+// four-second-old one — both were true when measured and neither is a
+// guarantee about now.
+//
+// A COLD cache still blocks: there is no previous answer to hand back, and
+// inventing "down" for a server that is up would be worse than the wait. That
+// happens once per backend per process.
 func ProbeLocal(backend string) LocalProbe {
 	backend = strings.TrimSpace(backend)
 	base := LocalBaseURL(backend)
@@ -925,10 +975,40 @@ func ProbeLocal(backend string) LocalProbe {
 	key := backend + " " + base
 
 	probeCache.Lock()
-	if p, ok := probeCache.m[key]; ok && time.Since(p.ProbedAt) < probeTTL {
+	p, cached := probeCache.m[key]
+	if cached && time.Since(p.ProbedAt) < probeTTL {
 		probeCache.Unlock()
 		return p
 	}
+	if cached {
+		// Stale. Hand it back now and bring it up to date behind the caller.
+		if !probeCache.refreshing[key] {
+			if probeCache.refreshing == nil {
+				probeCache.refreshing = map[string]bool{}
+			}
+			probeCache.refreshing[key] = true
+			go func() {
+				defer func() {
+					probeCache.Lock()
+					delete(probeCache.refreshing, key)
+					probeCache.Unlock()
+				}()
+				probeLocalNow(backend, base, key)
+			}()
+		}
+		probeCache.Unlock()
+		return p
+	}
+	probeCache.Unlock()
+
+	return probeLocalNow(backend, base, key)
+}
+
+// probeLocalNow does the measuring and stores the result. It is the blocking
+// half, called directly on a cold cache and from a goroutine on a stale one.
+func probeLocalNow(backend, base, key string) LocalProbe {
+	probeCache.Lock()
+	epoch := probeCache.epoch
 	probeCache.Unlock()
 
 	p := LocalProbe{Backend: backend, BaseURL: base, ProbedAt: time.Now()}
@@ -940,20 +1020,34 @@ func ProbeLocal(backend string) LocalProbe {
 	// The context slot is an ollama question and only worth asking of a server
 	// that answered: it is a second and third HTTP call, and on anything but
 	// ollama the native paths 404.
-	if p.Reach && backend == OllamaBackend {
-		p.Ctx, p.CtxMax, p.CtxModel = fetchOllamaContext(base)
-		// The slot count is not on the wire at all, so it is read off the
-		// manager of the process that is serving. Cached with the rest of the
-		// probe: it costs up to two systemctl subprocesses, and the settings
-		// page renders on every redraw.
-		p.Slots, p.SlotsWhy = ollamaSlots(base)
+	if backend == OllamaBackend {
+		// The stated slot count first, and independently of the reach: it is
+		// the operator telling us about their server, and it is true whether or
+		// not the port answered this instant. A probe that dropped it whenever
+		// the server was still coming up left LocalConcurrency at 0 and
+		// LocalEnv declining to unlock graphify's parallelism at all.
+		p.Slots, p.SlotsWhy = statedSlots()
+
+		// The rest is measurement, and only worth asking of a server that
+		// answered: two more HTTP calls, and on anything but ollama the native
+		// paths 404. Cached with the rest of the probe, because the slot count
+		// costs up to two systemctl subprocesses and the settings page renders
+		// on every redraw.
+		if p.Reach {
+			p.Ctx, p.CtxMax, p.CtxModel = fetchOllamaContext(base)
+			if p.Slots == 0 {
+				p.Slots, p.SlotsWhy = derivedSlots(base)
+			}
+		}
 	}
 
 	probeCache.Lock()
-	if probeCache.m == nil {
-		probeCache.m = map[string]LocalProbe{}
+	if probeCache.epoch == epoch {
+		if probeCache.m == nil {
+			probeCache.m = map[string]LocalProbe{}
+		}
+		probeCache.m[key] = p
 	}
-	probeCache.m[key] = p
 	probeCache.Unlock()
 	return p
 }
@@ -964,6 +1058,7 @@ func ProbeLocal(backend string) LocalProbe {
 func InvalidateLocalProbe() {
 	probeCache.Lock()
 	probeCache.m = nil
+	probeCache.epoch++
 	probeCache.Unlock()
 }
 
@@ -1153,7 +1248,7 @@ func StartOllama() (string, error) {
 	// clicks. Nothing below is worth doing twice.
 	InvalidateLocalProbe()
 	if ProbeLocal(OllamaBackend).Reach {
-		return "already running", nil
+		return alreadyRunning, nil
 	}
 	bin := Ollama()
 	if bin == "" {
@@ -1168,6 +1263,7 @@ func StartOllama() (string, error) {
 		// board exits.
 		how = "systemctl --user start ollama"
 		_ = exec.Command("systemctl", "--user", "start", "ollama").Run()
+		noteOllamaStart(startedUserUnit, 0)
 
 	case unitExists("ollama.service"):
 		// A SYSTEM unit owns ollama on this machine. Starting a user unit
@@ -1199,9 +1295,16 @@ func StartOllama() (string, error) {
 		// output goes nowhere — the server logs to journald or to its own
 		// file, and a pipe nobody reads would eventually block it.
 		cmd.Stdout, cmd.Stderr, cmd.Stdin = nil, nil, nil
+		// Its own process group, which is what makes this server STOPPABLE.
+		// `ollama serve` spawns a runner subprocess per loaded model; signalling
+		// the group reaches those too, where signalling the pid alone would
+		// leave a runner holding the weights — and the GPU — after the server
+		// it belonged to had gone.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		if err := cmd.Start(); err != nil {
 			return how, err
 		}
+		noteOllamaStart(startedDetached, cmd.Process.Pid)
 		go func() { _ = cmd.Wait() }() // reap, so it never becomes a zombie
 	}
 
@@ -1217,6 +1320,12 @@ func StartOllama() (string, error) {
 		time.Sleep(400 * time.Millisecond)
 	}
 }
+
+// alreadyRunning is StartOllama's answer when the port was already
+// answering. A constant because the lease counter tests it to decide whether
+// the start was an event worth logging, and a string compared in two files is
+// a string that drifts.
+const alreadyRunning = "already running"
 
 // ollamaServerEnv is the tuning a server the board starts itself is given,
 // as KEY=VALUE, omitting anything the environment already sets.

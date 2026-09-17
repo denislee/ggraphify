@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"os"
 	"sort"
 	"strings"
@@ -569,7 +570,7 @@ func (a *App) settingsAbout() *adw.PreferencesPage {
 	reprobe.SetVAlign(gtk.AlignCenter)
 	reprobe.ConnectClicked(func() {
 		go func() {
-			v := gfy.Reprobe(nil)
+			v := gfy.Reprobe(context.TODO())
 			idle(func() {
 				a.version = v
 				if v.Found {

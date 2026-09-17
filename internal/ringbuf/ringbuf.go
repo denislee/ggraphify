@@ -43,6 +43,19 @@ func New(capBytes int) *Buf {
 // Write appends p, evicting whole lines off the front to stay within cap.
 // It never fails and never blocks on anything but its own mutex, so a
 // subprocess cannot be back-pressured by a slow UI.
+//
+// Eviction trims down to a LOW-WATER MARK rather than to exactly cap, and that
+// is the whole performance story of this package. Reclaiming exactly the
+// overflow means the very next write overflows again, so past capacity every
+// single write paid a memmove of up to cap — 256 KiB by default — to make room
+// for one line. graphify is verbose: a 50 MB log arriving line by line is tens
+// of thousands of full-buffer compactions per job, multiplied by the number of
+// lanes. Freeing a quarter of the buffer instead amortizes that one memmove
+// over the next cap/4 bytes written, which for line-sized writes is a three
+// order of magnitude reduction and costs one extra constant.
+//
+// Len stays within cap throughout, as documented: the mark is below cap, never
+// above it.
 func (b *Buf) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -51,9 +64,12 @@ func (b *Buf) Write(p []byte) (int, error) {
 	if len(b.buf) <= b.cap {
 		return len(p), nil
 	}
-	// Trim to the first newline at or after the overflow point, so the buffer
+	// Trim to the first newline at or after the low-water mark, so the buffer
 	// always starts at a line boundary and the UI never renders half a line.
-	over := len(b.buf) - b.cap
+	over := len(b.buf) - b.lowWater()
+	if over < 0 {
+		over = 0
+	}
 	if i := bytes.IndexByte(b.buf[over:], '\n'); i >= 0 {
 		over += i + 1
 	} else {
@@ -65,6 +81,26 @@ func (b *Buf) Write(p []byte) (int, error) {
 	n := copy(b.buf, b.buf[over:])
 	b.buf = b.buf[:n]
 	return len(p), nil
+}
+
+// trimFraction is how much of the buffer an eviction reclaims, as a divisor:
+// 4 means "drop a quarter". Larger wastes less of the retained tail and
+// compacts more often; smaller is the reverse. A quarter is the point where the
+// amortized cost is already negligible and the retained log is still within a
+// screenful of the budget the user was promised.
+const trimFraction = 4
+
+// lowWater is the size an eviction trims down to. Caller holds mu.
+//
+// Never zero and never cap: a buffer that trimmed to cap would evict on every
+// write (the case this exists to avoid), and one that trimmed to zero would
+// throw the whole log away to make room for one line.
+func (b *Buf) lowWater() int {
+	w := b.cap - b.cap/trimFraction
+	if w < 1 {
+		w = 1
+	}
+	return w
 }
 
 // WriteString is Write for a string, without the conversion.

@@ -205,7 +205,7 @@ func activityLabel(queued, running int) string {
 func activityKey(live []jobs.Snapshot) string {
 	var b strings.Builder
 	for _, s := range live {
-		b.WriteString(gfy.Itoa(int(s.ID)))
+		b.WriteString(gfy.Utoa(s.ID))
 		b.WriteByte(':')
 		b.WriteString(s.Status.String())
 		b.WriteByte('|')

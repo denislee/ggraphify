@@ -72,12 +72,11 @@ func (a *App) applyDockHeight(h int) {
 		h = dockDefaultHeight
 	}
 	tries := 0
-	var try func() bool
-	try = func() bool {
+	try := func() bool {
 		if a.vsplit == nil || !a.dock.widget.Visible() {
 			return false
 		}
-		total := a.vsplit.AllocatedHeight()
+		total := a.vsplit.Height()
 		if total <= 0 {
 			tries++
 			return tries < 40 // ~2s, then give up and leave GTK's own position
@@ -105,7 +104,7 @@ func (a *App) saveDockHeight() {
 	if a.dock == nil || a.vsplit == nil || !a.dock.widget.Visible() {
 		return
 	}
-	h := a.dock.widget.AllocatedHeight()
+	h := a.dock.widget.Height()
 	if h < dockMinHeight {
 		return
 	}

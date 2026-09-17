@@ -126,7 +126,9 @@ func (l *Log) Add(level Level, msg string) {
 	l.mu.Unlock()
 
 	if w != nil {
-		fmt.Fprintln(w, e.String())
+		// The mirror is a convenience (stderr, or a file the user pointed at).
+		// A log that failed to write cannot report that it failed to write.
+		_, _ = fmt.Fprintln(w, e.String())
 	}
 }
 

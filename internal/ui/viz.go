@@ -182,13 +182,6 @@ func (v *vizPage) show(r *board.Row) {
 	}
 }
 
-// reload re-fetches the page, for after a regenerate job lands.
-func (v *vizPage) reload() {
-	if v.view != nil && v.loaded != "" {
-		v.view.Reload()
-	}
-}
-
 func (v *vizPage) openExternal() {
 	p := v.path()
 	if p == "" {

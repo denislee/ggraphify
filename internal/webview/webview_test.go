@@ -48,9 +48,13 @@ func TestNoWidgetNativeDerivation(t *testing.T) {
 // UI asks it on every visit to the Visualize page to decide whether to embed
 // or to offer the browser fallback.
 func TestAvailableIsSafeToCall(t *testing.T) {
-	if Available() != Available() {
-		t.Fatal("Available() is not stable")
-	}
+	// The assertion is that the call RETURNS — a panic or a hang here is the
+	// failure, and on a headless machine both are plausible ways for a
+	// WebKit binding to answer "no display". Comparing two calls to each other
+	// asserted nothing: it is true of any pure function and the compiler is
+	// free to fold it away.
+	got := Available()
+	t.Logf("webview available: %v", got)
 }
 
 func source(t *testing.T) string {

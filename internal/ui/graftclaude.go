@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"context"
+
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
@@ -74,9 +76,9 @@ func (a *App) checkGraftSetup(announce bool) {
 		// The version probe is cached for the process's lifetime, so this is
 		// one subprocess on the first check and none after it — except from
 		// the button, which is the one place re-asking is the point.
-		v := gfy.GraftProbe(nil)
+		v := gfy.GraftProbe(context.TODO())
 		if announce {
-			v = gfy.GraftReprobe(nil)
+			v = gfy.GraftReprobe(context.TODO())
 		}
 		s := gfy.InspectGraft(v, sel)
 		idle(func() {

@@ -228,15 +228,8 @@ func (q *queryPage) tick() {
 	if q.jobID == 0 {
 		return
 	}
-	var s *jobs.Snapshot
-	for _, snap := range q.a.runner.Snapshot() {
-		if snap.ID == q.jobID {
-			snap := snap
-			s = &snap
-			break
-		}
-	}
-	if s == nil {
+	s, ok := q.a.runner.Get(q.jobID)
+	if !ok {
 		return
 	}
 	gen := s.Log.Gen()

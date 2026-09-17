@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
-	coreglib "github.com/diamondburned/gotk4/pkg/core/glib"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
 	"github.com/dns/ggraphify/internal/board"
@@ -183,6 +182,15 @@ func (d *detailPane) reload() {
 // tick is the once-a-second repaint: only the job log needs it, and only when
 // it has actually moved.
 func (d *detailPane) tick() {
+	// The query console renders on this tick too, and is the one page whose
+	// job output IS the result rather than a log beside it — so it pulls its
+	// own buffer and compares its own generation. It was written and never
+	// wired, which left the Query tab showing "running…" until the user
+	// switched away and back.
+	if d.query != nil && d.stack.VisibleChildName() == "query" {
+		d.query.tick()
+		return
+	}
 	if d.row == nil || d.stack.VisibleChildName() != "jobs" {
 		return
 	}
@@ -866,10 +874,4 @@ func (a *App) opener() openConfig {
 		c.Editor = set.Editor
 	}
 	return c
-}
-
-// idleReload defers a reload to the next main-loop iteration, for the cases
-// where a widget is being rebuilt from inside one of its own signals.
-func (d *detailPane) idleReload() {
-	coreglib.IdleAdd(func() { d.reload() })
 }

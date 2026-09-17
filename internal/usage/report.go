@@ -355,15 +355,6 @@ func kindLine(s Summary) string {
 	return strings.Join(parts, " · ")
 }
 
-func verbCount(list []Count, name string) int {
-	for _, c := range list {
-		if c.Name == name {
-			return c.Count
-		}
-	}
-	return 0
-}
-
 // ratio renders n/of as a percentage, guarding the empty denominator that a
 // quiet window produces.
 func ratio(n, of int) string {

@@ -57,6 +57,27 @@ type Settings struct {
 	// written before this setting existed reads back as.
 	ClaudeAccount string `json:"claude_account,omitempty"`
 
+	// The ollama lifecycle: the board starts the local model server when a
+	// job needs it and stops it again once nothing does, so a machine that
+	// uses a local model occasionally does not keep several gigabytes of
+	// weights resident between sweeps.
+	//
+	// Stored as an *off* flag, so the zero value — a state file written
+	// before this existed — reads back as the default rather than as a choice
+	// nobody made, and the default is on. It is safe as a default because the
+	// board only ever stops a server IT started: an ollama that was already
+	// running when the first job asked for it is left alone forever.
+	NoAutoOllama bool `json:"no_auto_ollama,omitempty"`
+	// OllamaIdleStop is how many seconds of no local job pass before a server
+	// the board started is stopped. Zero means DefaultOllamaIdleStop.
+	//
+	// It is a grace period rather than an immediate stop because the cost of
+	// stopping too eagerly is paid twice: a cold start on the next job, and a
+	// model loaded from disk again. A sweep of many repositories is a run of
+	// short jobs with gaps between them, and every gap shorter than this one
+	// is free.
+	OllamaIdleStop int `json:"ollama_idle_stop_seconds,omitempty"`
+
 	// OutName is the directory name graphify writes its knowledge into inside
 	// each checkout. Blank means $GRAPHIFY_OUT_NAME, then "graphify-out".
 	OutName string `json:"out_name"`
@@ -136,6 +157,34 @@ type Settings struct {
 // stored inverted so that "not written down" means "on"; these two readers are
 // the only place that inversion is spelled out.
 func (s Settings) AutoFix() bool { return !s.NoAutoFix }
+
+// AutoOllama reports whether the board manages the local model server's
+// lifecycle, and OllamaIdle how long it waits before stopping one it started.
+// AutoOllama is stored inverted for the same reason AutoFix is: not written
+// down has to mean on.
+func (s Settings) AutoOllama() bool { return !s.NoAutoOllama }
+
+// OllamaIdle is always a positive duration, so no caller has to decide what a
+// zero or negative stored value meant.
+func (s Settings) OllamaIdle() time.Duration {
+	if s.OllamaIdleStop <= 0 {
+		return DefaultOllamaIdleStop
+	}
+	return time.Duration(s.OllamaIdleStop) * time.Second
+}
+
+// DefaultOllamaIdleStop is the idle grace period before an auto-started
+// server is stopped.
+//
+// Five minutes, because it has to be longer than the gap between two jobs in
+// the same sweep — one repository's graphify process exiting and the next
+// one's starting, with a scan tick in between — and shorter than the time
+// somebody would notice weights sitting in RAM after they walked away. It is
+// deliberately the same order as ollama's own 30-minute keep-alive is not:
+// keep-alive decides when the SERVER unloads the model, this decides when the
+// board stops the server, and the board can afford to be the more eager of
+// the two because it knows whether any job still wants it.
+const DefaultOllamaIdleStop = 5 * time.Minute
 
 // AutoFixLocal is what makes the loop worth having on by default: against a
 // model on this machine the full extraction and the community naming cost
@@ -736,7 +785,13 @@ func (s *Store) Save() error {
 	if path == "" {
 		return errors.New("store: no path")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// 0700/0600, not 0755/0644. This file holds ClaudeAccount — which names one
+	// of this machine's Claude logins by its configuration directory — and
+	// Overlay, an arbitrary environment map the user fills in themselves and
+	// which is therefore exactly where a key ends up. It is per-user state in
+	// the user's own data directory; nothing else on the machine has a reason
+	// to read it.
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(snap, "", "  ")
@@ -750,19 +805,22 @@ func (s *Store) Save() error {
 		return err
 	}
 	name := tmp.Name()
-	defer os.Remove(name) // no-op once the rename has succeeded
+	defer func() { _ = os.Remove(name) }() // no-op once the rename has succeeded
+	// The Close errors on these two paths are deliberately dropped: the write
+	// or the sync has already failed, that is the error worth returning, and
+	// the deferred Remove above takes the temp file either way.
 	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Chmod(name, 0o644); err != nil {
+	if err := os.Chmod(name, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(name, path)

@@ -153,10 +153,13 @@ func splitList(s string) []string {
 // against the same repository.
 func singleInstance() bool {
 	dir := store.DefaultDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 0700/0600: this is the same directory state.json lives in, and the lock
+	// is a single-user guard — a second instance of this user's board, not
+	// anybody else's.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return true // cannot guard; do not block the user over it
 	}
-	f, err := os.OpenFile(filepath.Join(dir, "ggraphify.lock"), os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(filepath.Join(dir, "ggraphify.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return true
 	}

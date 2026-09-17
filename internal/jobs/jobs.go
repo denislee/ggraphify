@@ -122,6 +122,12 @@ type Job struct {
 	// records as this job's duration.
 	pausedAt  time.Time
 	pausedFor time.Duration
+	// lease is this job's claim on the local model server, held for exactly
+	// as long as its process is running and suspended while it is paused. It
+	// lives on the job rather than as a local in run() because pausing
+	// happens on another goroutine entirely — the one that handled the click
+	// — and that goroutine has to be able to reach it.
+	lease Lease
 	// done is closed exactly once, when the job reaches a terminal status.
 	// It is what lets a chain wait for one step without polling Snapshot or
 	// subscribing to the event channel, which has a single consumer (the UI)
@@ -230,7 +236,22 @@ func (s Snapshot) Command() string { return gfy.Quote(s.Argv) }
 // delivered on a buffered channel; the UI forwards it to the main thread with
 // glib.IdleAdd and folds it into the board.
 type Event struct {
+	// ID is the job this event is about, on EVERY event. Prefer it to
+	// Job.ID: an Output event carries no snapshot at all (see below), so
+	// Job.ID is zero there and a consumer filtering on it silently drops the
+	// entire log stream.
+	ID uint64
+	// Job is the job's state at the moment of the event — on transitions
+	// only. It is deliberately NOT populated for an Output event: building it
+	// meant taking the runner's global lock, the same one that serializes
+	// dispatch, Snapshot, Cancel and completion, once per pipe read from every
+	// parallel job, to copy a struct the UI then discarded. ID and Gen are
+	// everything an output event actually says.
 	Job Snapshot
+	// Gen is the log ring buffer's generation as of this event, for an Output
+	// event. A pane whose last rendered generation still matches has nothing
+	// to redraw.
+	Gen uint64
 	// Output is true for a log-only event, which the UI coalesces: a running
 	// job produces many of these and the log pane redraws on a tick, not on
 	// each line.
@@ -274,6 +295,48 @@ type Options struct {
 	// what a graph is — the UI supplies the rule — but it does guarantee that
 	// whatever the rule is, nothing runs around it.
 	Precheck func(*Job) error
+
+	// LocalLease is consulted for every job just before its process starts,
+	// and the handle it returns follows that process for the rest of its
+	// life. It is how the local model server is brought up for a job that
+	// needs one and taken down again when none do; a nil hook, or a nil
+	// return, means the job simply runs.
+	//
+	// It lives here for the same reason Precheck does — this is the one path
+	// every job takes, and a server started per call site is a server the
+	// next call site forgets — and it is deliberately one hook returning its
+	// own undo rather than a Before/After pair: the runner cannot leak a
+	// lease it was never given the option of dropping.
+	//
+	// It is called on the job's own goroutine and MAY BLOCK for as long as a
+	// cold server takes. That costs the lane the job is already holding and
+	// nothing else, which is the correct thing to spend: the job cannot run
+	// before its server answers anyway.
+	LocalLease func(*Job) Lease
+}
+
+// Lease is a job's claim on a resource that exists only while it runs — in
+// practice the local model server, though the runner is deliberately told
+// nothing about what it is leasing.
+//
+// Three transitions, because a job has three ends and not one: it finishes
+// (Release), and it can stop consuming the resource without finishing
+// (Suspend) and start again later (Resume), which is what pausing it is. The
+// runner calls them in exactly the places it signals the process group, so
+// whatever is on the other end tracks the process rather than the job record.
+//
+// Every method must tolerate being called in any order and repeatedly: the
+// runner pairs them correctly, but a cancelled-while-paused job reaches
+// Release through a path no caller should have to reason about.
+type Lease interface {
+	// Suspend gives the resource up while the process is stopped.
+	Suspend()
+	// Resume takes it back, and MAY BLOCK: the runner does not send SIGCONT
+	// until this has returned, so a resumed process never wakes into a
+	// resource that is not there yet.
+	Resume()
+	// Release gives it up for good.
+	Release()
 }
 
 // DefaultHistory bounds the in-memory job list.
@@ -338,6 +401,9 @@ type Runner struct {
 
 	events chan Event
 	wake   chan struct{}
+	// quit is closed at the start of Close, to release a status emit parked on
+	// a full events channel. It is the only thing that unblocks such a send.
+	quit   chan struct{}
 	closed atomic.Bool
 	wg     sync.WaitGroup
 	// emitMu makes "is it closed?" and "send on it" one indivisible step.
@@ -373,6 +439,7 @@ func New(opts Options) *Runner {
 		busyRepo: map[string]uint64{},
 		events:   make(chan Event, 256),
 		wake:     make(chan struct{}, 1),
+		quit:     make(chan struct{}),
 	}
 	r.wg.Add(1)
 	go r.loop()
@@ -437,7 +504,7 @@ func (r *Runner) Submit(j *Job) *Job {
 	snap := snapshot(j)
 	r.mu.Unlock()
 
-	r.emit(Event{Job: snap})
+	r.emit(Event{ID: snap.ID, Job: snap})
 	r.kick()
 	return j
 }
@@ -487,6 +554,13 @@ func (r *Runner) SubmitCmd(kind, repo, label string, p gfy.Params, env gfy.Env) 
 		}
 	}
 	return r.Submit(j), nil
+}
+
+// localLease reads the hook under the lock, for the same reason precheck does.
+func (r *Runner) localLease() func(*Job) Lease {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.opts.LocalLease
 }
 
 // precheck reads the hook under the lock, because SetLanes' sibling settings
@@ -568,7 +642,7 @@ func (r *Runner) Release(id uint64) bool {
 	if !found {
 		return false
 	}
-	r.emit(Event{Job: snap})
+	r.emit(Event{ID: snap.ID, Job: snap})
 	r.kick()
 	return true
 }
@@ -586,7 +660,7 @@ func (r *Runner) ReleaseAll() int {
 	}
 	r.mu.Unlock()
 	for _, s := range snaps {
-		r.emit(Event{Job: s})
+		r.emit(Event{ID: s.ID, Job: s})
 	}
 	if len(snaps) > 0 {
 		r.kick()
@@ -643,7 +717,7 @@ func (r *Runner) Cancel(id uint64) bool {
 		r.retire(j)
 		snap := snapshot(j)
 		r.mu.Unlock()
-		r.emit(Event{Job: snap})
+		r.emit(Event{ID: snap.ID, Job: snap})
 		return true
 	}
 	j := r.running[id]
@@ -673,6 +747,16 @@ func (r *Runner) Cancel(id uint64) bool {
 // workers hold the CPU, and stopping only the parent would pause the bookkeeping
 // while the fan-out kept burning cores.
 //
+// Both carry the job's Lease with them — suspended when the process stops,
+// taken back before it is woken — so pausing a job that uses the local model
+// server gives the server up too. Holding several gigabytes of weights
+// resident for a process that is frozen and will not send another request is
+// precisely what somebody pausing it asked not to happen.
+//
+// RESUME THEREFORE BLOCKS for as long as the server takes to come back, which
+// is up to about ten seconds on a cold start. Call it off any thread that
+// draws.
+//
 // Only a running job can be paused — a queued one is not consuming anything, and
 // pausing it would mean "hold a lane", which is Cancel's job, not this one.
 // Both report whether they changed anything.
@@ -700,14 +784,39 @@ func (r *Runner) setPaused(id uint64, want bool) bool {
 		return false
 	}
 	pgid := j.pgid
+	lease := j.lease
 	r.mu.Unlock()
+
+	// A resume takes the lease back BEFORE the process is woken, and blocks
+	// while whatever is on the other end gets ready. The order is the whole
+	// point: a SIGCONT sent first would wake graphify into a model server
+	// that the pause took away, and it would find that out as a connection
+	// error rather than as a wait.
+	if !want && lease != nil {
+		lease.Resume()
+	}
 
 	sig := syscall.SIGCONT
 	if want {
 		sig = syscall.SIGSTOP
 	}
 	if err := syscall.Kill(-pgid, sig); err != nil {
+		// A resume that could not signal leaves the job paused, so the lease
+		// it just took has to go back — otherwise a job that is not running
+		// holds the server up for as long as it stays that way.
+		if !want && lease != nil {
+			lease.Suspend()
+		}
 		return false
+	}
+
+	// A pause gives the lease up only once the process is actually stopped.
+	// This way round because a frozen process will not send another request,
+	// where one still running might send into a server being shut down — and
+	// because the reverse order would make a failed SIGSTOP cost the server
+	// for nothing.
+	if want && lease != nil {
+		lease.Suspend()
 	}
 
 	now := time.Now()
@@ -729,7 +838,7 @@ func (r *Runner) setPaused(id uint64, want bool) bool {
 	} else {
 		j.Log.WriteString("ggraphify: resumed — SIGCONT to the process group\n")
 	}
-	r.emit(Event{Job: snap, Pause: true})
+	r.emit(Event{ID: snap.ID, Job: snap, Pause: true})
 	return true
 }
 
@@ -749,6 +858,37 @@ func (r *Runner) Busy(repo string) (uint64, bool) {
 	defer r.mu.Unlock()
 	id, ok := r.busyRepo[repo]
 	return id, ok
+}
+
+// Get returns one job by id: a map lookup and a single copy.
+//
+// It exists because the callers that want exactly one job were reaching for
+// Snapshot and scanning the result — which allocates a slice of every queued,
+// running and historical job (up to DefaultHistory of them), copies each one,
+// and sorts the lot, all under the runner's global lock, to answer a question
+// about one. On a tick, per open pane.
+//
+// Snapshot stays for the views that genuinely render the whole list.
+func (r *Runner) Get(id uint64) (Snapshot, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if j, ok := r.running[id]; ok {
+		return snapshot(j), true
+	}
+	// Queue and history are slices rather than maps, but both are short and
+	// bounded — the queue by what a person has submitted, the history by
+	// opts.History — and a running job is the overwhelmingly common lookup.
+	for _, j := range r.queue {
+		if j.ID == id {
+			return snapshot(j), true
+		}
+	}
+	for _, j := range r.history {
+		if j.ID == id {
+			return snapshot(j), true
+		}
+	}
+	return Snapshot{}, false
 }
 
 // Snapshot returns every job the runner knows about, newest first.
@@ -781,6 +921,10 @@ func (r *Runner) Close() {
 	if r.closed.Swap(true) {
 		return
 	}
+	// Released first, before anything that waits: a status change sends
+	// blocking now, so an emit already past the closed check and parked on a
+	// full channel has to be let go before Close can take emitMu below.
+	close(r.quit)
 	r.CancelAll()
 	r.kick()
 	r.wg.Wait()
@@ -801,10 +945,24 @@ func (r *Runner) kick() {
 	}
 }
 
-// emit delivers an event without ever blocking. A full channel means the UI is
-// behind; dropping a log-only event is invisible (the next tick re-reads the
-// ring buffer), and dropping a transition is recovered by the UI's periodic
-// reconciliation against Snapshot.
+// emit delivers an event. Whether it may be dropped depends on what it says.
+//
+// A log-only event is droppable and always was: it means "there is more" and
+// the next tick re-reads the ring buffer, so a full channel costs nothing but
+// a few milliseconds of latency. There are thousands of them.
+//
+// A STATUS CHANGE is not droppable, and treating it as if it were is how a
+// burst of output from several parallel jobs came to fill the 256-slot buffer
+// just in time for the completion event behind it to be thrown away. In the
+// GUI that leaves a row stuck at "running" until the next full redraw. In
+// ggraphify-job, whose entire body is a range over this channel waiting for
+// Status.Done(), it is a hang: the terminal event never arrives and nothing
+// else ever closes the channel.
+//
+// So transitions send blocking. The only thing that can be waiting on the
+// other side is a consumer that will drain, and a runner that blocks briefly
+// on a slow UI is strictly better than one that silently loses the one event
+// a caller cannot reconstruct.
 func (r *Runner) emit(ev Event) {
 	// Read-locked, so any number of jobs emit concurrently as before and only
 	// Close is exclusive. The check has to happen inside the lock: outside it
@@ -814,9 +972,19 @@ func (r *Runner) emit(ev Event) {
 	if r.closed.Load() {
 		return
 	}
+	if ev.Output {
+		select {
+		case r.events <- ev:
+		default:
+		}
+		return
+	}
+	// Blocking, but never forever: quit is closed at the top of Close, so a
+	// shutdown that nobody is draining for cannot wedge the runner — and
+	// cannot wedge Close itself behind the emitMu this send is holding.
 	select {
 	case r.events <- ev:
-	default:
+	case <-r.quit:
 	}
 }
 
@@ -868,7 +1036,7 @@ func (r *Runner) dispatch() {
 		snap := snapshot(j)
 		r.mu.Unlock()
 
-		r.emit(Event{Job: snap})
+		r.emit(Event{ID: snap.ID, Job: snap})
 		go r.run(j, ctx, cancel)
 	}
 }
@@ -922,6 +1090,35 @@ func (r *Runner) run(j *Job, ctx context.Context, cancel context.CancelFunc) {
 		}
 	}
 
+	// The model server this job needs, up before the process that will talk
+	// to it and released once that process is gone.
+	//
+	// It is published on the job under the lock before the process starts, so
+	// that a pause arriving the instant it does finds a lease to suspend.
+	// setPaused cannot fire earlier than this: it refuses a job whose pgid is
+	// still zero, and the pgid is not set until exec.Start below has returned.
+	//
+	// release gives the lease back, at most once however many times it is
+	// called. The explicit call after the process exits is the one that
+	// normally fires; the defer is there for an early return that never
+	// reaches it, including a process that failed to start.
+	//
+	// Once rather than relying on the lease: the interface asks implementations
+	// to tolerate repeated calls, but "the runner returns each lease exactly
+	// once" is a property of the runner, and one a counting test double is
+	// entitled to check.
+	release := func() {}
+	if hook := r.localLease(); hook != nil {
+		if l := hook(j); l != nil {
+			r.mu.Lock()
+			j.lease = l
+			r.mu.Unlock()
+			var once sync.Once
+			release = func() { once.Do(l.Release) }
+			defer release()
+		}
+	}
+
 	cmd := exec.Command(j.Argv[0], j.Argv[1:]...)
 	cmd.Dir = j.Dir
 	cmd.Env = j.Env.Compose(os.Environ())
@@ -949,15 +1146,25 @@ func (r *Runner) run(j *Job, ctx context.Context, cancel context.CancelFunc) {
 	}
 	close(exited)
 
+	// The lease goes back HERE — the process is gone, so the resource it was
+	// holding is genuinely free — and not on the way out of this function.
+	//
+	// A deferred release runs after the terminal bookkeeping below: after
+	// j.finish() closes done, after the terminal event is published, and after
+	// kick() has dispatched the next job. That ordering makes the job
+	// observably complete while its lease is still outstanding, so Leases()
+	// over-counts for that window and the next job takes its own lease before
+	// this one has been returned — which is what a settings subtitle reading
+	// "1 lease out" after the last job finished was reporting, correctly.
+	release()
+
 	r.mu.Lock()
 	j.Ended = time.Now()
 	// A cancelled job can be paused at the moment it dies: reap sends SIGCONT
 	// so the SIGTERM lands. Close the open pause here so the final duration
 	// counts the time it was stopped as stopped.
 	if j.paused {
-		if !j.pausedAt.IsZero() {
-			j.pausedFor += j.Ended.Sub(j.pausedAt)
-		}
+		j.pausedFor = j.held(j.Ended)
 		j.pausedAt = time.Time{}
 		j.paused = false
 	}
@@ -988,7 +1195,7 @@ func (r *Runner) run(j *Job, ctx context.Context, cancel context.CancelFunc) {
 	snap := snapshot(j)
 	r.mu.Unlock()
 
-	r.emit(Event{Job: snap})
+	r.emit(Event{ID: snap.ID, Job: snap})
 	r.kick()
 }
 
@@ -1067,11 +1274,17 @@ type logWriter struct {
 	job *Job
 }
 
+// Write is on the hot path of every running job — once per pipe read — so it
+// touches no shared state but the ring buffer's own mutex.
+//
+// It used to take the runner's global lock to build a full Snapshot, which put
+// every parallel job's output in contention with dispatch, cancellation and
+// completion in order to produce a struct copy the UI read two fields of. The
+// event says "job N is at generation G"; the panes render from the buffer on
+// their tick, and a tick that finds the generation unmoved skips the render
+// entirely.
 func (w logWriter) Write(p []byte) (int, error) {
 	n, err := w.buf.Write(p)
-	w.r.mu.Lock()
-	snap := snapshot(w.job)
-	w.r.mu.Unlock()
-	w.r.emit(Event{Job: snap, Output: true})
+	w.r.emit(Event{ID: w.job.ID, Gen: w.buf.Gen(), Output: true})
 	return n, err
 }
