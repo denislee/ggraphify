@@ -11,6 +11,7 @@ import (
 	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/graftstate"
 	"github.com/dns/ggraphify/internal/graphstate"
+	"github.com/dns/ggraphify/internal/jobs"
 )
 
 // colSpec is one column's registry entry: its stable id (which is what the
@@ -126,8 +127,9 @@ var columns = []colSpec{
 		cmp: func(a *App, x, y *board.Row) int { return usageWeight(a, y) - usageWeight(a, x) },
 		render: func(a *App, l *gtk.Label, r *board.Row) (string, string) {
 			u := a.usageFor(r.Path)
-			l.SetTooltipText(usageTooltip(r, u))
-			return usageCell(u)
+			gap := a.usageGap(r)
+			l.SetTooltipText(usageTooltip(r, u, gap))
+			return usageCell(u, gap)
 		},
 	},
 	{
@@ -188,21 +190,29 @@ var columns = []colSpec{
 }
 
 // jobWeight orders the Job column by how much attention the row wants:
-// failures first, then running, then queued, then everything else.
+// failures first, then running, then held, then queued, then what has finished
+// quietly — and last the rows with no job at all, which on this board are most
+// of them. A row with no job weighing LESS than a finished one is what put a
+// run of blank cells in the middle of a board sorted by this column.
 func jobWeight(a *App, r *board.Row) int {
 	s := a.jobFor(r.Path)
 	if s == nil {
+		return 5
+	}
+	switch s.Status {
+	case jobs.Failed:
 		return 0
+	case jobs.Running:
+		return 1
+	case jobs.Queued:
+		// Held is a queued job that will never run without a click, so it
+		// wants a person more than one that is merely waiting its turn.
+		if s.Held {
+			return 2
+		}
+		return 3
 	}
-	switch s.Status.String() {
-	case "failed":
-		return -3
-	case "running":
-		return -2
-	case "queued":
-		return -1
-	}
-	return 1
+	return 4
 }
 
 // graftWeight orders the Graft column the way the state column is ordered: by
@@ -266,6 +276,10 @@ type rowCell struct {
 	label *gtk.Label
 	text  string
 	class string
+	// row is what this cell is currently bound to, so a column whose value
+	// lives beside the row rather than in it can re-render the realised cells
+	// in place when that value arrives. Nil while unbound.
+	row *board.Row
 }
 
 // buildBoard constructs the ColumnView and its models.
@@ -355,6 +369,7 @@ func (a *App) addColumn(spec colSpec, width int) *gtk.ColumnViewColumn {
 		if r == nil {
 			return
 		}
+		c.row = r
 		text, class := spec.render(a, c.label, r)
 		if c.text != text {
 			c.label.SetText(text)
@@ -369,6 +384,7 @@ func (a *App) addColumn(spec colSpec, width int) *gtk.ColumnViewColumn {
 		if li := asCell(obj); li != nil {
 			if c := cells[li.Native()]; c != nil {
 				c.label.SetHasTooltip(false)
+				c.row = nil
 			}
 		}
 	})
@@ -393,9 +409,19 @@ func (a *App) addColumn(spec colSpec, width int) *gtk.ColumnViewColumn {
 			return cmp(a, rx, ry)
 		})
 		col.SetSorter(&sorter.Sorter)
+		// Kept because a sorter's keys can change without the model changing:
+		// the state and job columns both sort on the runner's view of a row,
+		// and a job starting or failing has to be able to say so. GTK only
+		// re-sorts when the sorter emits "changed".
+		a.sorters[spec.ID] = sorter
 	}
 	a.view.AppendColumn(col)
 	a.cols[spec.ID] = col
+	// The Used column is the one whose value is not carried on the row, so it
+	// is the one that has to be repainted out of band. See repaintUsageCells.
+	if spec.ID == "usage" {
+		a.usageCells = cells
+	}
 	// Wired after SetFixedWidth above, so the board's own write is not read
 	// back as a drag.
 	col.NotifyProperty("fixed-width", func() {
@@ -444,7 +470,15 @@ func (a *App) matches(r *board.Row) bool {
 	if !board.InGroup(*r, a.groupID) {
 		return false
 	}
-	if f := a.activeFilter(); f != "" {
+	switch f := a.activeFilter(); {
+	case f == "":
+	case f == filterGap:
+		// Not a state, so it is answered before ParseState is asked: the whole
+		// point of this chip is a question no single state can express.
+		if !a.usageGap(r) {
+			return false
+		}
+	default:
 		want, ok := graphstate.ParseState(f)
 		if ok && a.displayState(r) != want {
 			return false
@@ -473,6 +507,29 @@ func (a *App) searchText() string {
 		return ""
 	}
 	return a.search.Text()
+}
+
+// resortJobs re-runs the board's sort after a job transition.
+//
+// The Job column and the state dot are both derived from the runner rather
+// than from the row, so a job that starts, fails or finishes changes a sort key
+// without changing the model. QueueDraw repaints the cell but leaves the row
+// where it was, which is how a running job could sit halfway down a board
+// sorted by attention until an unrelated rescan happened to shuffle the model.
+//
+// Only the column actually being sorted by is invalidated: every Changed costs
+// a full re-sort of the model, and job transitions are not rare.
+func (a *App) resortJobs() {
+	if a.view == nil {
+		return
+	}
+	col, _ := a.currentSort()
+	if col != "job" && col != "state" {
+		return
+	}
+	if s := a.sorters[col]; s != nil {
+		s.Changed(gtk.SorterChangeDifferent)
+	}
 }
 
 // applyStoredSort puts the board back on the column it was sorted by.

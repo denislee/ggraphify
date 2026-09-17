@@ -47,6 +47,30 @@ func (a *App) params(r board.Row) gfy.Params {
 	// run would refuse; there this names claude-cli. The resolved name is in
 	// the argv the confirm dialog prints, so the substitution is on screen.
 	p.Backend = gfy.EffectiveBackend(p.Backend)
+	// Size the chunk to the local server's context slot. graphify derives a
+	// num_ctx per request and sends it, but ollama's OpenAI-compatible
+	// endpoint drops it, so the slot stays at whatever the server was started
+	// with and an oversized prompt is truncated from the front — taking the
+	// system prompt that asks for JSON with it, which is how an extraction
+	// spends hours and writes nothing. gfy.LocalTokenBudget returns 0 when the
+	// slot could not be measured, and a zero leaves graphify's own default
+	// alone rather than guessing at it.
+	//
+	// It is set before p.Extra is appended, so a repository that overrides
+	// --token-budget by hand still wins: graphify's parser takes the last
+	// occurrence.
+	// It also gives the reply time to arrive: graphify allows a request 600
+	// seconds, and a local model answering a chunk at a few tokens a second
+	// needs longer than that. A request killed on the deadline costs the whole
+	// file — it is dropped from the graph, and enough of them fail the run on
+	// the shrink guard.
+	//
+	// The lane count goes in first because the request timeout is derived from
+	// it: with more than one job sharing this machine's model server, a chunk
+	// waits in the server's queue behind the other jobs' chunks, and the
+	// timeout has to cover the wait as well as the answer.
+	_, _, p.LocalLanes = a.runner.Lanes()
+	gfy.ApplyLocalSizing(&p)
 	return p
 }
 
@@ -272,7 +296,7 @@ func (a *App) meteredNotice(sample gfy.Params) string {
 	// it — but the paragraph tells the truth about the bill.
 	if gfy.IsLocalBackend(backend) {
 		b.WriteString(gfy.LocalNotice(backend, sample.Model))
-		_, meteredLanes := a.runner.Lanes()
+		_, meteredLanes, _ := a.runner.Lanes()
 		b.WriteString("Metered lane concurrency: " + gfy.Itoa(meteredLanes) + "\n")
 		if ok, why := gfy.LocalReady(backend, sample.Model); !ok {
 			b.WriteString("\n⚠ " + why + "\nEvery one of these runs is likely to fail.")
@@ -292,7 +316,7 @@ func (a *App) meteredNotice(sample gfy.Params) string {
 			"own API key and will be billed.\n")
 	}
 	b.WriteString("Backend: " + shown + "\nModel: " + model + "\n")
-	_, meteredLanes := a.runner.Lanes()
+	_, meteredLanes, _ := a.runner.Lanes()
 	b.WriteString("Metered lane concurrency: " + gfy.Itoa(meteredLanes) + "\n")
 	if ok, why := gfy.BackendReady(backend); !ok {
 		b.WriteString("\n⚠ " + why + "\nEvery one of these runs is likely to fail.")

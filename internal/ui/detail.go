@@ -831,6 +831,8 @@ func jobHeadline(s *jobs.Snapshot) string {
 	b.WriteString(" — ")
 	if s.Status == jobs.Running && s.Paused {
 		b.WriteString("paused")
+	} else if s.Status == jobs.Queued && s.Held {
+		b.WriteString("held — waiting to be started")
 	} else {
 		b.WriteString(s.Status.String())
 	}

@@ -94,6 +94,10 @@ func main() {
 		NodeA:     *ask,
 		NodeB:     *nodeB,
 	}
+	// The same sizing the board applies before it submits: without it a local
+	// backend gets graphify's 60_000-token default chunks, which an ollama
+	// context slot silently truncates from the front.
+	gfy.ApplyLocalSizing(&p)
 	argv := gfy.Argv(*kind, p)
 	if argv == nil {
 		fmt.Fprintf(os.Stderr, "ggraphify-job: no command builder for %q\n", *kind)

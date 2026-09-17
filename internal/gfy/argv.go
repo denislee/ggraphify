@@ -60,7 +60,13 @@ type Params struct {
 	// ~/.claude* the installer writes the skill into. It is not a graphify
 	// flag: it travels as CLAUDE_CONFIG_DIR in the job's environment, which
 	// is where the confirm dialog shows it. Blank inherits the environment.
-	ClaudeDir      string
+	ClaudeDir string
+	// LocalLanes is how many jobs the board will run against the same local
+	// model server at once. Like ClaudeDir it is not a graphify flag: it is an
+	// input to ApplyLocalSizing, which has to know how many other jobs will be
+	// queueing behind this one at the same server before it can say how long a
+	// single request is allowed to take. Zero means one.
+	LocalLanes     int
 	Deep           bool
 	Force          bool
 	NoCluster      bool
@@ -476,4 +482,19 @@ func Title(kind string) string {
 func NeedsGraph(kind string) bool {
 	s, ok := Known[kind]
 	return ok && s.NeedsGraph
+}
+
+// JobLabel is the name a job carries on the board: its kind's human title and
+// the checkout it ran against. It exists here, rather than at the one call
+// site that builds it when a job is submitted, because a job can also reach
+// the board without ever passing through that call — restored from a sidecar
+// written by a build that did not record labels, or folded in from the old
+// history key. A row with no name is unreadable, so both of those paths
+// rebuild the name from what the entry does carry.
+func JobLabel(kind, repo string) string {
+	t := Title(kind)
+	if repo == "" {
+		return t
+	}
+	return t + " · " + filepath.Base(repo)
 }

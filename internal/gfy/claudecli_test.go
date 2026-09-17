@@ -18,6 +18,19 @@ func noCredentials(t *testing.T) {
 	} {
 		t.Setenv(k, "")
 	}
+	// EffectiveBackend's last resort PROBES the default ollama port rather
+	// than reading a variable, so on a machine actually running ollama — the
+	// machine most likely to be working on this file — clearing the
+	// environment still leaves it finding a server. Pointing OLLAMA_BASE_URL
+	// or OLLAMA_HOST at a dead port does not help: exporting either is
+	// precisely the signal HasAPIKey reads as "ollama is configured", which
+	// turns "no credential" into "a credential". So the probe itself is
+	// stubbed, and restored when the test ends.
+	orig := probeLocal
+	probeLocal = func(backend string) LocalProbe {
+		return LocalProbe{Backend: backend}
+	}
+	t.Cleanup(func() { probeLocal = orig })
 }
 
 // The Claude Code CLI is the one backend graphify cannot auto-detect, because

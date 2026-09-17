@@ -4,12 +4,15 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
+	"github.com/dns/ggraphify/internal/autofix"
 	"github.com/dns/ggraphify/internal/discover"
 	"github.com/dns/ggraphify/internal/gfy"
+	"github.com/dns/ggraphify/internal/jobs"
 	"github.com/dns/ggraphify/internal/store"
 )
 
@@ -248,14 +251,16 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 	lanes.SetTitle("Concurrency")
 	lanes.SetDescription("Free work (AST extraction, clustering, exports, reads) fans out. " +
 		"Metered work dispatches LLM requests against your own API key and is deliberately " +
-		"serialized — raising this lane is the one setting here that can cost money.")
+		"serialized — raising this lane is the one setting here that can cost money. " +
+		"LLM work against a model on THIS machine has its own lane, because there the " +
+		"limit is cores and memory rather than spend.")
 
-	free, metered := a.runner.Lanes()
+	free, metered, local := a.runner.Lanes()
 	freeRow := adw.NewSpinRow(gtk.NewAdjustment(float64(free), 1, 32, 1, 2, 0), 1, 0)
 	freeRow.SetTitle("Free lanes")
 	freeRow.NotifyProperty("value", func() {
-		_, m := a.runner.Lanes()
-		a.runner.SetLanes(int(freeRow.Value()), m)
+		_, m, l := a.runner.Lanes()
+		a.runner.SetLanes(int(freeRow.Value()), m, l)
 		s := a.opts.Store.Settings()
 		s.FreeLanes = int(freeRow.Value())
 		a.opts.Store.SetSettings(s)
@@ -264,16 +269,73 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 
 	meteredRow := adw.NewSpinRow(gtk.NewAdjustment(float64(metered), 1, 16, 1, 1, 0), 1, 0)
 	meteredRow.SetTitle("Metered lanes")
-	meteredRow.SetSubtitle("Default 1. Never raised implicitly.")
+	meteredRow.SetSubtitle("Billed backends only. Default 1. Never raised implicitly.")
 	meteredRow.AddCSSClass("metered")
 	meteredRow.NotifyProperty("value", func() {
-		f, _ := a.runner.Lanes()
-		a.runner.SetLanes(f, int(meteredRow.Value()))
+		f, _, l := a.runner.Lanes()
+		a.runner.SetLanes(f, int(meteredRow.Value()), l)
 		s := a.opts.Store.Settings()
 		s.MeteredLanes = int(meteredRow.Value())
 		a.opts.Store.SetSettings(s)
 	})
 	lanes.Add(meteredRow)
+
+	// The local lane, and the arithmetic that makes its number mean something.
+	// A lane count on its own is not a decision anybody can make: what matters
+	// is lanes x chunks against the slots the server actually has, and that
+	// product is three numbers the user would otherwise have to find in three
+	// different places.
+	localRow := adw.NewSpinRow(
+		gtk.NewAdjustment(float64(local), 1, float64(gfy.MaxLocalLanes), 1, 1, 0), 1, 0)
+	localRow.SetTitle("Local model lanes")
+	localRow.SetSubtitleLines(0)
+	localSubtitle := func(n int) string {
+		s := "Jobs run at once against a model on this machine. Free — the limit here is " +
+			"cores and memory, not money. Default " + gfy.Itoa(jobs.DefaultLocalLanes) +
+			": a graphify run alternates between a CPU-bound AST pass that leaves the model " +
+			"idle and a semantic pass that is nothing but requests to it, and a second job " +
+			"fills the first job's idle stretches."
+		set := a.opts.Store.Settings()
+		eff := gfy.EffectiveBackend(set.Backend)
+		if !gfy.IsLocalBackend(eff) {
+			return s + " No local backend is selected, so nothing takes this lane right now."
+		}
+		p := gfy.ProbeLocal(eff)
+		if !p.Reach {
+			return s
+		}
+		chunks := gfy.LocalConcurrency(eff)
+		if chunks < 1 {
+			chunks = 1
+		}
+		s += " Right now: " + plural(n, "job", "jobs") + " x " +
+			plural(chunks, "chunk", "chunks") + " = " +
+			plural(n*chunks, "request", "requests") + " at "
+		if p.Slots > 0 {
+			s += plural(p.Slots, "server slot", "server slots") + "."
+		} else {
+			s += "a server whose slot count could not be read."
+		}
+		if p.Slots > 0 && n*chunks > p.Slots {
+			// Not a warning. The surplus is the point — it is what keeps the
+			// slots fed while another job is in its AST phase — but somebody
+			// reading "8 jobs" should see what that actually queues.
+			s += " The surplus queues inside the server; the request timeout " +
+				"scales with the lane count so a queued chunk is not killed waiting."
+		}
+		return s
+	}
+	localRow.SetSubtitle(escapeMarkup(localSubtitle(local)))
+	localRow.NotifyProperty("value", func() {
+		n := int(localRow.Value())
+		f, m, _ := a.runner.Lanes()
+		a.runner.SetLanes(f, m, n)
+		s := a.opts.Store.Settings()
+		s.LocalLanes = n
+		a.opts.Store.SetSettings(s)
+		localRow.SetSubtitle(escapeMarkup(localSubtitle(n)))
+	})
+	lanes.Add(localRow)
 
 	confirm := adw.NewSpinRow(gtk.NewAdjustment(float64(set.ConfirmBatchAt), 2, 500, 1, 5, 0), 1, 0)
 	confirm.SetTitle("Type-to-confirm threshold")
@@ -386,6 +448,8 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 	}
 	llm.Add(cli)
 	page.Add(llm)
+
+	page.Add(a.settingsAutoFix())
 
 	page.Add(a.settingsLocal())
 	page.Add(a.settingsClaude())
@@ -824,4 +888,182 @@ func overlayClash(overlay map[string]string) string {
 		}
 	}
 	return strings.Join(found, " and ")
+}
+
+// settingsAutoFix is the unattended repair loop's switch board.
+//
+// It is on the Jobs page rather than General because everything it does is
+// queue jobs, and the two numbers below it — the lanes — are what decides how
+// much of the machine it may take while doing so.
+//
+// The group's job is to make one thing unmissable: the loop is on, and it does
+// not spend money. Every LLM step it runs goes to a model on this machine, and
+// the one switch that changes that is off, marked, and says what it costs.
+func (a *App) settingsAutoFix() *adw.PreferencesGroup {
+	set := a.opts.Store.Settings()
+
+	g := adw.NewPreferencesGroup()
+	g.SetTitle("Automatic fixes")
+	g.SetDescription("The board repairs unhealthy repositories on its own, on the same tick " +
+		"that scans them — the Fix button with the click taken out. Same plan, same commands, " +
+		"same order. On by default, because with a model on this machine it costs nothing but " +
+		"time; it never reaches for a billed backend unless the switch below says it may.")
+
+	// Everything under the master switch is desensitized with it, so a page
+	// with auto-fix off does not read as a page of live settings.
+	var dependents []interface{ SetSensitive(bool) }
+	sensitize := func(on bool) {
+		for _, w := range dependents {
+			w.SetSensitive(on)
+		}
+	}
+
+	enabled := adw.NewSwitchRow()
+	enabled.SetTitle("Fix repositories automatically")
+	enabled.SetSubtitleLines(0)
+	enabled.SetSubtitle("Unhealthy repositories are repaired without being selected or " +
+		"confirmed. Repositories kept out of batch actions (the X flag) are left alone, and " +
+		"so is any repository with a job already running.")
+	enabled.SetActive(set.AutoFix())
+	g.Add(enabled)
+
+	local := adw.NewSwitchRow()
+	local.SetTitle("Use a local model for the LLM steps")
+	local.SetSubtitleLines(0)
+	local.SetActive(set.AutoFixLocal())
+	local.SetSubtitle(a.autoFixLocalSubtitle())
+	g.Add(local)
+	dependents = append(dependents, local)
+
+	metered := adw.NewSwitchRow()
+	metered.SetTitle("Allow metered fixes")
+	metered.AddCSSClass("metered")
+	metered.SetSubtitleLines(0)
+	metered.SetSubtitle("Off. Lets the loop run the LLM steps against the billed backend when " +
+		"no local model is available — a full extraction and a community naming per repository, " +
+		"unattended, on your own key. Leave it off unless you have read what that costs over a " +
+		"board of this size.")
+	metered.SetActive(set.AutoFixMetered)
+	g.Add(metered)
+	dependents = append(dependents, metered)
+
+	maxRow := adw.NewSpinRow(
+		gtk.NewAdjustment(float64(autoFixOr(set.AutoFixMax, autofix.DefaultMax)), 1, 16, 1, 1, 0), 1, 0)
+	maxRow.SetTitle("Repositories at once")
+	maxRow.SetSubtitleLines(0)
+	maxRow.SetSubtitle("How many repairs the loop keeps in flight. Default " +
+		gfy.Itoa(autofix.DefaultMax) + ". The lanes above are the real limit on what runs at " +
+		"the same time; this one stops a large board from queueing a chain per checkout the " +
+		"moment it starts.")
+	g.Add(maxRow)
+	dependents = append(dependents, maxRow)
+
+	coolRow := adw.NewSpinRow(gtk.NewAdjustment(
+		float64(autoFixOr(set.AutoFixCooldown, int(autofix.DefaultCooldown/time.Minute)*60))/60, 1, 720, 1, 5, 0), 1, 0)
+	coolRow.SetTitle("Cooldown (minutes)")
+	coolRow.SetSubtitleLines(0)
+	coolRow.SetSubtitle("The least time before the same repository is attempted again, doubled " +
+		"and tripled as attempts fail. Default " +
+		gfy.Itoa(int(autofix.DefaultCooldown/time.Minute)) + " minutes.")
+	g.Add(coolRow)
+	dependents = append(dependents, coolRow)
+
+	triesRow := adw.NewSpinRow(
+		gtk.NewAdjustment(float64(autoFixOr(set.AutoFixAttempts, autofix.DefaultAttempts)), 1, 10, 1, 1, 0), 1, 0)
+	triesRow.SetTitle("Attempts before giving up")
+	triesRow.SetSubtitleLines(0)
+	triesRow.SetSubtitle("How many times the same set of defects may be attacked before the " +
+		"repository is left alone and said so in the log. Default " +
+		gfy.Itoa(autofix.DefaultAttempts) + ". A repository whose defects CHANGE gets a fresh " +
+		"count, so a multi-stage repair is never mistaken for a loop.")
+	g.Add(triesRow)
+	dependents = append(dependents, triesRow)
+
+	// One writer for the whole group. Each row edits its own field of a fresh
+	// copy of the settings, and the engine's memory is cleared afterwards:
+	// whatever it was refusing to retry under the old policy it must be
+	// willing to retry under the new one, or a setting changed to unblock a
+	// repository would leave it blocked.
+	save := func(f func(*store.Settings)) {
+		s := a.opts.Store.Settings()
+		f(&s)
+		a.opts.Store.SetSettings(s)
+		if a.autofix != nil {
+			a.autofix.Reset()
+		}
+	}
+
+	enabled.NotifyProperty("active", func() {
+		on := enabled.Active()
+		save(func(s *store.Settings) { s.NoAutoFix = !on })
+		sensitize(on)
+		if on {
+			a.toast("automatic fixes on — the next scan repairs what it finds")
+		} else {
+			a.toast("automatic fixes off — nothing runs unless you ask")
+		}
+	})
+	local.NotifyProperty("active", func() {
+		save(func(s *store.Settings) { s.NoAutoFixLocal = !local.Active() })
+		local.SetSubtitle(a.autoFixLocalSubtitle())
+	})
+	metered.NotifyProperty("active", func() {
+		on := metered.Active()
+		save(func(s *store.Settings) { s.AutoFixMetered = on })
+		if on {
+			a.toast("automatic fixes may now use the billed backend")
+		}
+	})
+	maxRow.NotifyProperty("value", func() {
+		save(func(s *store.Settings) { s.AutoFixMax = int(maxRow.Value()) })
+	})
+	coolRow.NotifyProperty("value", func() {
+		save(func(s *store.Settings) { s.AutoFixCooldown = int(coolRow.Value()) * 60 })
+	})
+	triesRow.NotifyProperty("value", func() {
+		save(func(s *store.Settings) { s.AutoFixAttempts = int(triesRow.Value()) })
+	})
+
+	sensitize(set.AutoFix())
+	return g
+}
+
+// autoFixOr is the stored value, or the package default when nothing was ever
+// stored. The zero in the state file means "whatever autofix decides", and
+// that has to survive a trip through a spin button that cannot show it.
+func autoFixOr(v, def int) int {
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+// autoFixLocalSubtitle says what the local half of the loop will actually do
+// on THIS machine right now — which model it would use, or why it cannot — so
+// the switch is not a promise the hardware cannot keep.
+//
+// It reads the cached probe rather than forcing one: the settings page is
+// redrawn on every open and an HTTP round trip per redraw would be felt.
+func (a *App) autoFixLocalSubtitle() string {
+	const lead = "The steps that need an LLM — a full extraction, naming communities — run " +
+		"against a model on this machine instead of a billed backend. No API key, nothing " +
+		"leaves here, and no bill: this is what lets the loop be on by default. "
+
+	set := a.opts.Store.Settings()
+	eff := gfy.EffectiveBackend(set.Backend)
+	backend, preferred := eff, set.Model
+	if !gfy.IsLocalBackend(eff) {
+		backend, preferred = gfy.OllamaBackend, ""
+	}
+	model, ok, why := gfy.AutoLocalModel(backend, preferred)
+	if !ok {
+		return lead + "Right now there is none: " + why +
+			" Until there is, the loop runs the free steps only and leaves the rest undone."
+	}
+	s := lead + "Right now: " + backend + " / " + model + "."
+	if !gfy.IsLocalBackend(eff) {
+		s += " The board's backend is " + eff + ", so this is the fallback the loop uses " +
+			"for its own runs only — nothing you start by hand changes."
+	}
+	return s
 }

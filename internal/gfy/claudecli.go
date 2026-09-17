@@ -130,11 +130,19 @@ func EffectiveBackend(backend string) string {
 	// the port closes that gap, and it is the right last resort rather than
 	// the first: a local model is free but slow and weaker, so it should never
 	// displace a key or a Claude Code login that is actually present.
-	if p := ProbeLocal(OllamaBackend); p.Reach && len(p.Models) > 0 {
+	if p := probeLocal(OllamaBackend); p.Reach && len(p.Models) > 0 {
 		return OllamaBackend
 	}
 	return ""
 }
+
+// probeLocal is the seam this last resort is reached through. It is a variable
+// solely so a test can say "no local server" on a machine that is in fact
+// running one — which is the machine most likely to be running these tests.
+// Clearing the environment cannot express that: the probe reads a port, not a
+// variable, and exporting a variable to point it at a dead port is precisely
+// the signal HasAPIKey reads as "ollama is configured".
+var probeLocal = ProbeLocal
 
 // BackendReady reports whether a metered run against this backend has the
 // credential it needs, and why not when it does not. The reason is written to

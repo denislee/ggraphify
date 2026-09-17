@@ -362,6 +362,13 @@ func (a *App) runFix(plans []rowPlan, metered bool) {
 	}
 	for _, rp := range plans {
 		rp := rp
+		// A fix by hand is also an instruction to the unattended loop: forget
+		// whatever you concluded about this repository. Otherwise a checkout
+		// the loop had given up on stays given-up-on even after the user has
+		// gone and cleared the thing it kept tripping over.
+		if a.autofix != nil {
+			a.autofix.Retry(rp.row.Path)
+		}
 		total := len(rp.plan.Steps)
 		steps := make([]jobs.ChainStep, 0, total)
 		for n, s := range rp.plan.Steps {

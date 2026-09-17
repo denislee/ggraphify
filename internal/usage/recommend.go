@@ -147,6 +147,25 @@ func Recommend(rows []board.Row, s Summary, limit int) []Rec {
 	return out
 }
 
+// UsedWithoutGraph is the sharpest form of the disagreement Recommend ranks:
+// an agent worked in this checkout and there is no graphify graph to have
+// answered it with.
+//
+// Broken counts as absent. A graphify-out/ directory that cannot be read is
+// not a graph a query can use, and a board that showed it as "has one" would
+// be telling a person the work is done when every query in it fell through to
+// raw source.
+//
+// It is exported because three places need the same answer and must not each
+// have their own: the board's Used column marks it, the board's filter selects
+// on it, and `ggraphify-scan -gap` prints it.
+func UsedWithoutGraph(r board.Row, uses int) bool {
+	if uses <= 0 {
+		return false
+	}
+	return r.Graph.State == graphstate.StateNone || r.Graph.State == graphstate.StateBroken
+}
+
 // recFor is the per-repository verdict.
 func recFor(r *board.Row, uses int) *Rec {
 	if r == nil || uses <= 0 {

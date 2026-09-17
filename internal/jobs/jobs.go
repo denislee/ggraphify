@@ -77,10 +77,27 @@ type Job struct {
 	Repo  string // the checkout this job belongs to; "" for global commands
 	Label string // what the UI calls it, e.g. "Update · cc-docsboard"
 	Cost  gfy.Cost
+	// Local is true for a metered job running against a model on this
+	// machine. It is deliberately NOT a third value of Cost: the cost of a
+	// kind is what decides whether a confirm dialog stands in front of it, and
+	// a local extraction still needs that gate — it is hours of this machine,
+	// started by one click. What it does not need is the metered lane, whose
+	// whole purpose is to stop parallel API requests becoming a parallel bill.
+	// A local run has no bill to parallelize, so it gets its own limit.
+	Local bool
 	Argv  []string
 	Env   gfy.Env
 	Dir   string // working directory; normally the checkout root
 	Out   string // the graphify-out directory this job reads or writes
+
+	// Held is true for a job that sits in the queue without being dispatched.
+	// It is not a fourth status: the job IS queued, and everything that reads
+	// Status — the row, the history, Active — is right to say so. What Held
+	// adds is consent. A queue restored from the previous session is a queue
+	// nobody clicked, so the jobs in it that cost something (an LLM bill, or
+	// hours of this machine) come back held, and Release is the click that
+	// was missing.
+	Held bool
 
 	Status  Status
 	Exit    int
@@ -172,30 +189,38 @@ func (j *Job) Command() string { return gfy.Quote(j.Argv) }
 // runner's lock. The log is shared by pointer: ringbuf.Buf is itself safe for
 // concurrent use, and copying a quarter-megabyte buffer per frame would not be.
 type Snapshot struct {
-	ID     uint64
-	Kind   string
-	Repo   string
-	Label  string
-	Cost   gfy.Cost
-	Argv   []string
+	ID    uint64
+	Kind  string
+	Repo  string
+	Label string
+	Cost  gfy.Cost
+	Local bool
+	Argv  []string
+	// Dir and Out travel with the snapshot because a snapshot is what the
+	// session outlives the process as: restoring a queue from the sidecar
+	// needs the working directory and the output directory the job was built
+	// for, and neither is recoverable from the argv alone.
+	Dir    string
+	Out    string
 	Status Status
-	// Paused, PausedAt and Held are the pause state as of this snapshot. The
-	// UI holds a snapshot across ticks and recomputes Elapsed from it, so the
-	// clock has to be reconstructible from the value alone.
-	Paused   bool
-	PausedAt time.Time
-	Held     time.Duration
-	Exit     int
-	Err      string
-	Queued   time.Time
-	Started  time.Time
-	Ended    time.Time
-	Log      *ringbuf.Buf
+	Held   bool
+	// Paused, PausedAt and PausedFor are the pause state as of this snapshot.
+	// The UI holds a snapshot across ticks and recomputes Elapsed from it, so
+	// the clock has to be reconstructible from the value alone.
+	Paused    bool
+	PausedAt  time.Time
+	PausedFor time.Duration
+	Exit      int
+	Err       string
+	Queued    time.Time
+	Started   time.Time
+	Ended     time.Time
+	Log       *ringbuf.Buf
 }
 
 // Elapsed mirrors Job.Elapsed for a snapshot.
 func (s Snapshot) Elapsed() time.Duration {
-	return elapsed(s.Started, s.Ended, s.PausedAt, s.Held, s.Paused)
+	return elapsed(s.Started, s.Ended, s.PausedAt, s.PausedFor, s.Paused)
 }
 
 // Command is the copy-pasteable argv.
@@ -219,10 +244,19 @@ type Event struct {
 
 // Options configures a runner.
 type Options struct {
-	// FreeLanes and MeteredLanes are the two concurrency limits. Zero means
-	// the defaults: min(4, NumCPU/2) free and exactly one metered.
+	// FreeLanes, MeteredLanes and LocalLanes are the three concurrency
+	// limits. Zero means the defaults: min(4, NumCPU/2) free, exactly one
+	// metered, and DefaultLocalLanes local.
+	//
+	// Local is separate from metered because the two limits answer different
+	// questions. The metered lane bounds SPEND — one request at a time so a
+	// fan-out cannot become a fan-out bill — and one is the only defensible
+	// default for it. The local lane bounds this MACHINE, where the constraint
+	// is cores, memory and the model server's own slot count, and where the
+	// right number is whatever keeps all three busy without swapping.
 	FreeLanes    int
 	MeteredLanes int
+	LocalLanes   int
 	// LogBytes is the per-job log budget; zero means ringbuf.DefaultCap.
 	LogBytes int
 	// History is how many finished jobs are retained in memory. Zero means
@@ -244,6 +278,43 @@ type Options struct {
 
 // DefaultHistory bounds the in-memory job list.
 const DefaultHistory = 200
+
+// DefaultLocalLanes is how many jobs run at once against a model on this
+// machine.
+//
+// Two, not one, because a graphify run is two phases with two different
+// bottlenecks: a cpu_count-wide AST pass that touches the model server not at
+// all, and a semantic pass that is nothing but requests to it. One job at a
+// time leaves the model idle for every AST phase in the sweep; a second job
+// fills exactly those gaps. Beyond two the gaps are already covered and the
+// added jobs mostly contend for memory, which is why this is a default and a
+// setting rather than a derived maximum.
+//
+// Two, not more, also because it is a default and defaults have to be safe on
+// the smallest machine that runs this board — every extra lane is another
+// graphify process holding another corpus in RAM.
+const DefaultLocalLanes = 2
+
+// lane is which of the three concurrency limits a job counts against. It is
+// derived rather than stored so that a Job built by hand — the retry path, a
+// test — cannot land in a lane that disagrees with its own cost.
+type lane int
+
+const (
+	laneFree lane = iota
+	laneMetered
+	laneLocal
+)
+
+func laneOf(cost gfy.Cost, local bool) lane {
+	switch {
+	case cost != gfy.Metered:
+		return laneFree
+	case local:
+		return laneLocal
+	}
+	return laneMetered
+}
 
 // DefaultKillGrace is how long a subprocess has to exit on its own after
 // SIGTERM. graphify flushes graph.json on the way out, and killing it mid-write
@@ -269,6 +340,12 @@ type Runner struct {
 	wake   chan struct{}
 	closed atomic.Bool
 	wg     sync.WaitGroup
+	// emitMu makes "is it closed?" and "send on it" one indivisible step.
+	// Every emit holds it for reading, Close holds it for writing around the
+	// close itself, so the channel cannot be closed between an emit's check
+	// and its send. wg covers only loop(); the per-job goroutines are not in
+	// it and outlive Close, which is exactly who this guards against.
+	emitMu sync.RWMutex
 }
 
 // New starts a runner. Close stops it.
@@ -280,6 +357,9 @@ func New(opts Options) *Runner {
 	// caller passing 0 is a caller that did not think about it.
 	if opts.MeteredLanes <= 0 {
 		opts.MeteredLanes = 1
+	}
+	if opts.LocalLanes <= 0 {
+		opts.LocalLanes = DefaultLocalLanes
 	}
 	if opts.History <= 0 {
 		opts.History = DefaultHistory
@@ -317,7 +397,7 @@ func (r *Runner) Events() <-chan Event { return r.events }
 // SetLanes changes the concurrency limits live, from the settings dialog.
 // Lowering a limit never kills a running job — it only stops the next one from
 // starting.
-func (r *Runner) SetLanes(free, metered int) {
+func (r *Runner) SetLanes(free, metered, local int) {
 	r.mu.Lock()
 	if free > 0 {
 		r.opts.FreeLanes = free
@@ -325,15 +405,18 @@ func (r *Runner) SetLanes(free, metered int) {
 	if metered > 0 {
 		r.opts.MeteredLanes = metered
 	}
+	if local > 0 {
+		r.opts.LocalLanes = local
+	}
 	r.mu.Unlock()
 	r.kick()
 }
 
 // Lanes reports the current limits.
-func (r *Runner) Lanes() (free, metered int) {
+func (r *Runner) Lanes() (free, metered, local int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.opts.FreeLanes, r.opts.MeteredLanes
+	return r.opts.FreeLanes, r.opts.MeteredLanes, r.opts.LocalLanes
 }
 
 // Submit queues a job and returns it. The caller has already built and shown
@@ -375,13 +458,26 @@ func (r *Runner) SubmitCmd(kind, repo, label string, p gfy.Params, env gfy.Env) 
 		Repo:  repo,
 		Label: label,
 		Cost:  gfy.CostOf(kind),
+		// Which lane this takes is decided here, from the backend the argv was
+		// built for, rather than read back out of the argv later. The two can
+		// only disagree if somebody rewrites one of them.
+		Local: gfy.IsLocalBackend(p.Backend),
 		Argv:  argv,
 		// ClaudeCLIEnv is what makes a Claude Code install that is not on the
 		// session PATH — the usual shape of a .desktop launch — reachable by
 		// graphify, which launches the CLI by its bare name. ClaudeAccountEnv
 		// then picks which login it runs as, for the backend and for the
-		// installer alike.
-		Env: gfy.ClaudeAccountEnv(gfy.ClaudeCLIEnv(gfy.JobEnv(env), p.Backend), p.ClaudeDir),
+		// installer alike. LocalEnv is the same shape for the other end of the
+		// range: it unlocks graphify's ollama concurrency clamp, without which
+		// the --max-concurrency already in the argv is discarded and a
+		// multi-slot local server is driven one chunk at a time.
+		//
+		// All three belong here rather than at the call sites: ggraphify-job
+		// submits through this function too, and an overlay applied in the GUI
+		// only is an overlay a headless sweep runs without.
+		Env: gfy.ClaudeAccountEnv(
+			gfy.ClaudeCLIEnv(gfy.LocalEnv(gfy.JobEnv(env), p.Backend), p.Backend),
+			p.ClaudeDir),
 		Dir: dir,
 		Out: p.Out,
 	}
@@ -399,6 +495,137 @@ func (r *Runner) precheck() func(*Job) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.opts.Precheck
+}
+
+// Restore puts jobs from a previous session back into the runner: the ones
+// that had finished into the history, the ones that had not into the queue.
+//
+// It is deliberately not Submit in a loop. Submit is the path a click takes,
+// and a click means somebody asked for this now; Restore is the path a
+// restart takes, and what it reconstructs is a queue nobody has looked at
+// yet. So it bypasses Precheck — every one of these jobs passed it when it
+// was first submitted, and re-running a check against a repository that has
+// changed since would silently drop work rather than let it fail visibly —
+// and it honours Held, which is how a restored metered job waits for the
+// click that a restored AST update does not need.
+//
+// Jobs are taken oldest first, so the ids they are given ascend in the order
+// the previous session created them. No events are emitted: the UI calls this
+// while it is still building itself, before anything is draining the channel,
+// and it reloads its views from Snapshot once Restore returns.
+func (r *Runner) Restore(js []*Job) int {
+	n := 0
+	r.mu.Lock()
+	for _, j := range js {
+		if j == nil {
+			continue
+		}
+		if j.Log == nil {
+			j.Log = ringbuf.New(r.opts.LogBytes)
+		}
+		if j.done == nil {
+			j.done = make(chan struct{})
+		}
+		r.nextID++
+		j.ID = r.nextID
+		n++
+		if j.Status.Done() {
+			j.finish()
+			// retire prepends, so feeding the history oldest-first leaves it
+			// newest-first, which is the order every reader assumes.
+			r.retire(j)
+			continue
+		}
+		// Anything that was not finished is queued, the jobs that were mid-
+		// flight included: their process group died with the last session, so
+		// "running" is not a state this one can inherit.
+		j.Status = Queued
+		j.Started = time.Time{}
+		j.Ended = time.Time{}
+		r.queue = append(r.queue, j)
+	}
+	r.mu.Unlock()
+	r.kick()
+	return n
+}
+
+// Release lets a held job be dispatched. It reports whether it changed
+// anything, so a caller can tell "started it" from "it was never held".
+func (r *Runner) Release(id uint64) bool {
+	r.mu.Lock()
+	var snap Snapshot
+	found := false
+	for _, j := range r.queue {
+		if j.ID != id || !j.Held {
+			continue
+		}
+		j.Held = false
+		snap = snapshot(j)
+		found = true
+		break
+	}
+	r.mu.Unlock()
+	if !found {
+		return false
+	}
+	r.emit(Event{Job: snap})
+	r.kick()
+	return true
+}
+
+// ReleaseAll lets every held job go at once and returns how many that was.
+func (r *Runner) ReleaseAll() int {
+	r.mu.Lock()
+	var snaps []Snapshot
+	for _, j := range r.queue {
+		if !j.Held {
+			continue
+		}
+		j.Held = false
+		snaps = append(snaps, snapshot(j))
+	}
+	r.mu.Unlock()
+	for _, s := range snaps {
+		r.emit(Event{Job: s})
+	}
+	if len(snaps) > 0 {
+		r.kick()
+	}
+	return len(snaps)
+}
+
+// HeldCount is how many queued jobs are waiting for a click, for the button
+// that offers to give them one.
+func (r *Runner) HeldCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, j := range r.queue {
+		if j.Held {
+			n++
+		}
+	}
+	return n
+}
+
+// ParseStatus turns a Status back from its String form, which is what the
+// sidecar stores. The second result is false for anything it does not
+// recognise, so a hand-edited or future-versioned state file degrades to "we
+// do not know what this was" rather than to Queued, which would re-run it.
+func ParseStatus(s string) (Status, bool) {
+	switch s {
+	case "queued":
+		return Queued, true
+	case "running":
+		return Running, true
+	case "ok":
+		return Succeeded, true
+	case "failed":
+		return Failed, true
+	case "canceled":
+		return Canceled, true
+	}
+	return Queued, false
 }
 
 // Cancel signals a job. A queued job is dropped; a running one has its process
@@ -420,12 +647,21 @@ func (r *Runner) Cancel(id uint64) bool {
 		return true
 	}
 	j := r.running[id]
+	// Copy the cancel out under the lock. Reading j.cancel after releasing it
+	// races run()'s assignment, and the stale answer it can return is nil —
+	// which would make this report a cancellation it never performed and leave
+	// the process group running. dispatch now installs the cancel before the
+	// job is in r.running, so a job found here always has one.
+	var cancel context.CancelFunc
+	if j != nil {
+		cancel = j.cancel
+	}
 	r.mu.Unlock()
 	if j == nil {
 		return false
 	}
-	if j.cancel != nil {
-		j.cancel()
+	if cancel != nil {
+		cancel()
 	}
 	return true
 }
@@ -548,7 +784,14 @@ func (r *Runner) Close() {
 	r.CancelAll()
 	r.kick()
 	r.wg.Wait()
+	// closed is already true, so every emit that acquires the read lock from
+	// here on returns without sending. Taking the write lock waits out the
+	// ones that had already passed that check and were about to send — the
+	// window that otherwise closes this channel underneath a live send and
+	// panics the whole application on quit.
+	r.emitMu.Lock()
 	close(r.events)
+	r.emitMu.Unlock()
 }
 
 func (r *Runner) kick() {
@@ -563,6 +806,11 @@ func (r *Runner) kick() {
 // ring buffer), and dropping a transition is recovered by the UI's periodic
 // reconciliation against Snapshot.
 func (r *Runner) emit(ev Event) {
+	// Read-locked, so any number of jobs emit concurrently as before and only
+	// Close is exclusive. The check has to happen inside the lock: outside it
+	// it is a stale answer by the time the send runs.
+	r.emitMu.RLock()
+	defer r.emitMu.RUnlock()
 	if r.closed.Load() {
 		return
 	}
@@ -606,6 +854,13 @@ func (r *Runner) dispatch() {
 		}
 		j.Status = Running
 		j.Started = time.Now()
+		// The cancel is installed here, under the same lock that publishes the
+		// job into r.running, so there is no instant in which a job is
+		// cancellable-looking but not actually cancellable. Creating it inside
+		// run() left exactly that gap: dispatch had already published the job
+		// and Cancel could find it with a nil cancel and do nothing.
+		ctx, cancel := context.WithCancel(context.Background())
+		j.cancel = cancel
 		r.running[j.ID] = j
 		if gfy.Known[j.Kind].Mutates && j.Repo != "" {
 			r.busyRepo[j.Repo] = j.ID
@@ -614,7 +869,7 @@ func (r *Runner) dispatch() {
 		r.mu.Unlock()
 
 		r.emit(Event{Job: snap})
-		go r.run(j)
+		go r.run(j, ctx, cancel)
 	}
 }
 
@@ -627,20 +882,20 @@ func (r *Runner) pick() *Job {
 	if r.closed.Load() {
 		return nil
 	}
-	free, metered := 0, 0
+	var busy [3]int
 	for _, j := range r.running {
-		if j.Cost == gfy.Metered {
-			metered++
-		} else {
-			free++
-		}
+		busy[laneOf(j.Cost, j.Local)]++
 	}
+	limit := [3]int{r.opts.FreeLanes, r.opts.MeteredLanes, r.opts.LocalLanes}
 	for i, j := range r.queue {
-		if j.Cost == gfy.Metered {
-			if metered >= r.opts.MeteredLanes {
-				continue
-			}
-		} else if free >= r.opts.FreeLanes {
+		// A held job holds nothing: it is skipped where it stands and the
+		// queue behind it runs, which is what makes a restored sweep of 128
+		// free updates start immediately while the metered ones wait for a
+		// click.
+		if j.Held {
+			continue
+		}
+		if l := laneOf(j.Cost, j.Local); busy[l] >= limit[l] {
 			continue
 		}
 		if gfy.Known[j.Kind].Mutates && j.Repo != "" {
@@ -655,11 +910,9 @@ func (r *Runner) pick() *Job {
 }
 
 // run executes one job to completion.
-func (r *Runner) run(j *Job) {
-	ctx, cancel := context.WithCancel(context.Background())
-	r.mu.Lock()
-	j.cancel = cancel
-	r.mu.Unlock()
+// The context and its cancel are made by dispatch, not here, so that a job is
+// never visible in r.running without the means to stop it.
+func (r *Runner) run(j *Job, ctx context.Context, cancel context.CancelFunc) {
 	defer cancel()
 
 	j.Log.WriteString("$ " + j.Command() + "\n")
@@ -792,9 +1045,11 @@ func (r *Runner) retire(j *Job) {
 func snapshot(j *Job) Snapshot {
 	s := Snapshot{
 		ID: j.ID, Kind: j.Kind, Repo: j.Repo, Label: j.Label, Cost: j.Cost,
-		Argv: j.Argv, Status: j.Status, Exit: j.Exit,
+		Local: j.Local,
+		Argv:  j.Argv, Dir: j.Dir, Out: j.Out,
+		Status: j.Status, Held: j.Held, Exit: j.Exit,
 		Queued: j.Queued, Started: j.Started, Ended: j.Ended, Log: j.Log,
-		Paused: j.paused, PausedAt: j.pausedAt, Held: j.pausedFor,
+		Paused: j.paused, PausedAt: j.pausedAt, PausedFor: j.pausedFor,
 	}
 	if j.Err != nil {
 		s.Err = j.Err.Error()

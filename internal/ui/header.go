@@ -11,6 +11,13 @@ import (
 	"github.com/dns/ggraphify/internal/graphstate"
 )
 
+// filterGap is the one chip that is not a graph state. It selects the join the
+// board could not otherwise express — repositories an agent actually worked in
+// that have no graph to have answered with — and sits beside "All" because it
+// is the chip with something to do behind it, where the state chips merely
+// describe.
+const filterGap = "used-no-graph"
+
 // filterChips are the state filters across the top, in the order they appear.
 // "all" is the empty filter rather than a state of its own.
 var filterChips = []struct {
@@ -18,6 +25,7 @@ var filterChips = []struct {
 	label string
 }{
 	{"", "All"},
+	{filterGap, "Used ✕"},
 	{graphstate.StateNone.String(), "No graph"},
 	{graphstate.StateStale.String(), "Stale"},
 	{graphstate.StateRaw.String(), "Unlabeled"},
@@ -72,9 +80,10 @@ func (a *App) buildHeader() gtk.Widgetter {
 	// confirm dialog exists to prevent.
 	localAll := gtk.NewButtonFromIconName("computer-symbolic")
 	localAll.AddCSSClass("flat")
-	localAll.SetTooltipText("Force a full LLM extraction on EVERY repository on the board " +
-		"(Ctrl+L) — runs on the local model: no API key and no bill, but days of this machine, " +
-		"and it redoes rows that are already healthy. Ctrl+H is the free, surgical alternative.")
+	localAll.SetTooltipText("Force a full LLM extraction on every repository CURRENTLY LISTED " +
+		"(Ctrl+L) — narrow the folder filter to narrow the sweep. Runs on the local model: no " +
+		"API key and no bill, but hours of this machine, and it redoes rows that are already " +
+		"healthy. Ctrl+H is the free, surgical alternative.")
 	localAll.ConnectClicked(func() { a.actExtractLocalAll() })
 	header.PackStart(localAll)
 

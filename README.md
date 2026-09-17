@@ -39,9 +39,11 @@ rather than remembered.
 
 3. **Extraction costs money and minutes, so the UI makes that impossible to trigger by
    accident.** AST work is *free* and fans out across four lanes. LLM-backed work is
-   *metered*, runs one at a time, and is gated behind a confirm that names the backend,
-   the model and the repository count. A batch of three or more additionally requires the
-   count to be typed.
+   *metered* and is gated behind a confirm that names the backend, the model and the
+   repository count; a batch of three or more additionally requires the count to be typed.
+   Against a billed backend it also runs strictly one job at a time. Against a model on
+   this machine it does not — there is no bill to serialize, so it gets its own lane and
+   its own limit.
 
 ## What a row tells you
 
@@ -53,7 +55,7 @@ rather than remembered.
 | Branch | branch and short SHA; `≠` when the graph was built at a different commit |
 | Graph | `2047n / 4835e` |
 | Graft | the *other* index: `● 951n`, plus `~12 −3` when the tree has moved under it |
-| Used | whether an agent actually *read* either index here: a week of daily calls as a sparkline, and the count |
+| Used | whether an agent actually *read* either index here: a week of daily calls as a sparkline, and the count. A red **✕** means the row was used and has no graph to have answered with |
 | Comm. | community count, or "83 unnamed" when the LLM labelling pass has not run |
 | Drift | `+12 ~30 −3` added / changed / removed versus `manifest.json`, or `needs-extract` |
 | Built | how long ago `graph.json` was written |
@@ -125,7 +127,7 @@ they are answerable.
 The split is not a label on a button; it is a property of the command, declared in
 `internal/gfy` and enforced by the job runner.
 
-| Free — fans out over four lanes | Metered — one at a time, always confirmed |
+| Free — fans out over four lanes | Metered — always confirmed; one at a time when billed |
 | --- | --- |
 | `update` (AST only, no API key) | `extract` (full AST + semantic LLM) |
 | `cluster-only --no-label` | `label` (names communities with an LLM) |
@@ -147,7 +149,10 @@ confirm.
 "Metered" means *an LLM runs*, not *an API key is charged*: with no key set and Claude Code
 installed, the metered column runs through that CLI and is billed to its plan, and against a
 **local model** it is billed to nobody at all — the confirm dialog says which of the three it
-is rather than warning about a bill that will never arrive. See
+is rather than warning about a bill that will never arrive. The confirm is the same in all
+three cases; the *lane* is not. A billed backend takes the metered lane and runs one job at
+a time, because that lane bounds spend. A local one takes its own lane, because there is no
+spend to bound and the limit is this machine instead. See
 [Backends](#backends-no-api-key-required) and [Local models](#local-models-no-key-no-bill).
 
 ## Preconditions
@@ -220,6 +225,49 @@ Three properties make it safe to give one button that much reach:
 `ggraphify-scan -issues` prints the same verdict without a display, and `-unhealthy`
 filters to the rows the button would act on.
 
+## Automatic fixes — the same button, without the click
+
+**On by default.** On every scan the board asks, for each repository it can touch, whether
+`internal/heal` has a plan for it — and if it does, it runs it. Same plan, same commands,
+same order, same one-chain-per-repository. The only thing removed is the click.
+
+That is a large amount of reach to hand to a loop nobody is watching, so it is bounded by
+four rules rather than by hope:
+
+1. **It does not spend money.** The steps that need an LLM run against a model on **this
+   machine**, and `autofix.Policy.Spends()` is false whenever one is in play. If no local
+   server answers, the loop falls back to the *free* plan — AST rebuild, clustering, report
+   — and leaves the semantic half undone rather than reaching for the billed backend. The
+   one switch that changes that (**Allow metered fixes**) is off, marked, and says what it
+   turns on.
+2. **It gives up.** A repository whose defects survive the fix is retried a bounded number
+   of times — with the cooldown growing on each failure — and then left alone, with one
+   line in the log saying so. A repository whose defects *change* gets a fresh count, so a
+   three-stage repair is never mistaken for a loop. Fixing one by hand clears the give-up.
+3. **It respects the flags that already mean this.** A repository excluded from batch
+   actions (`X`) is never touched, and neither is one with a job already running — the
+   user's, or one of the loop's own.
+4. **It is bounded in width.** Two repositories in flight by default; the job runner's
+   lanes still apply underneath, so the loop cannot become a way to run twelve extractions
+   at once.
+
+Which model it uses is resolved per tick, not stored: when the board's backend is already
+local, its own model setting is the preference; when the backend is `claude-cli` or an API,
+the model setting names a model the local server has never heard of, so `gfy.AutoLocalModel`
+asks for graphify's default instead and, failing that, the first **non-embedding** model the
+server actually serves. An embedding-only server is a refusal rather than a bad guess — an
+extraction sent to `nomic-embed-text` is a 400 per chunk of every repository.
+
+Everything is under **Settings → Jobs → Automatic fixes**: the master switch, the local
+model switch, the metered switch, how many repositories at once, the cooldown, and how many
+attempts before it gives up. Changing any of them clears the loop's memory, so a setting
+changed to unblock a repository actually unblocks it. The diagnostics page (`Ctrl+D`) prints
+the whole resolved policy — including which model the LLM steps would go to right now — in
+one line.
+
+The decision itself is `internal/autofix`: a pure function of the rows plus a memory of what
+has been tried, with no filesystem, no subprocess and no GTK, for the same reason `heal` is.
+
 ## Keys
 
 Press `?` in the app, or run `ggraphify -h`. The help overlay and `-h` are generated from
@@ -233,7 +281,7 @@ F s        folder filter   c  Re-cluster (free)      G          global graph
 g          top             E  Extract (METERED)      v Space A  batch select
 r          rescan          l  Label (METERED)        X          exclude from batch
 Enter      open detail     e w  export html / wiki
-t          colour scheme   W  watch on/off           U          usage dashboard
+t          colour scheme   W  watch on/off           U y        usage dashboard, copy it
                                                       ,  ?       settings, help
 Ctrl+F/B   page down / up  x  cancel this row's job   b  L       bottom panel, its log
 ```
@@ -256,6 +304,34 @@ The same information is in the status line at the bottom, and the **jobs view** 
 the list icon in the header) is the whole picture: every job across every repository,
 queued, running or finished, with its live log, its exit status and its exact command line.
 
+### The queue survives a restart
+
+Closing the board does not throw the queue away. What was queued, what was in flight and
+what had finished are all written to the sidecar on every transition, and read back on the
+next launch — a sweep over 128 checkouts is hours of work, and quitting, rebooting or
+losing the session in the middle of one should not mean starting it again.
+
+Two rules decide what comes back *running*:
+
+- **A job that was in flight returns held, not running.** Its process group died with the
+  last session and its output directory is in whatever state graphify left it, so the board
+  shows the work as outstanding rather than silently repeating it. Its log says so, in the
+  log itself.
+- **Free work restarts itself; work that costs something waits.** AST updates, clustering
+  and exports resume on their own — that is what the previous session already decided, and
+  being wrong about it costs nothing. A metered job is an LLM bill and a local one is hours
+  of this machine; both come back **held**, which is the same gate the confirm dialog is.
+
+A held job sits in the queue without being dispatched, and it does not block the queue
+behind it: a restored sweep of 128 free updates starts immediately while the metered ones
+wait. **Start** in the jobs view runs the selected one; **Start all held** runs the lot.
+The board says how many are waiting the moment it opens, and the status line keeps saying
+it — `12 queued (4 held)`.
+
+Restored jobs keep the tail of their log, so a failure you reopen the board to read still
+says why it failed. A job whose checkout has since been deleted is dropped rather than
+queued to fail at every launch.
+
 ## Who actually uses the indexes
 
 Every column to the left of **Used** answers *does this repository have an index, and how
@@ -263,6 +339,21 @@ stale is it*. None of them answers the question that decides whether building on
 worth anything: **does an agent ever read it.** A fresh graph nothing has opened in three
 months is a cost with no return; a repository queried forty times this week with no graph
 at all is the next extraction.
+
+That second case is the one the board used to be able to show but not to *state*. Both
+halves were already on screen — the sparkline in **Used**, the dot in the state column —
+but reading them together meant tracking two columns across ninety rows, and a repository
+with three uses and no graph sits nowhere near the top of either. So the conjunction is
+marked where the usage is: a used row with no graph (or a broken one, which has never
+answered a query either) renders its count with a red **✕**, and the tooltip says how many
+queries fell through to raw source.
+
+The **Used ✕** chip in the filter bar — first after **All**, and in the `f` cycle — narrows
+the board to exactly those rows. It is the one chip that is not a graph state, because no
+single state can express a join between what the rollup saw and what the checkout has.
+`ggraphify-scan -gap` prints the same set without a display, over the same seven-day window
+(`-gap-days` changes it). An empty result is the answer you want: every repository anyone
+worked in had an index to answer them with.
 
 `U` — or the monitor icon in the header — replaces the whole window with the usage
 dashboard: not a dialog over the board, a second page of it. Rows, detail pane and bottom
@@ -347,6 +438,30 @@ with the board's own tick.
 
 `ggraphify-scan -usage` prints the same rollup — recommendations included — without a
 display.
+
+### Handing the window to an agent
+
+The dashboard can show that graft's pointer was injected into six hundred sessions and
+reached for in a hundred and fifty. It cannot say whether that is bad. The thing qualified
+to judge it is an agent, so the copy icon in the toolbar — or `y` on the page — puts the
+whole window on the clipboard as a **markdown briefing** written to be pasted into a Claude
+Code session: the headline, the two hook-to-use ratios, the per-directory table with
+injections beside uses, the directories that were handed an index and ran nothing, the daily
+series, and the questions worth answering from it. It ends by naming what the data cannot
+see — a session in a directory where neither tool is installed leaves no trace at all, so a
+repository's absence is never evidence it was skipped.
+
+`ggraphify-scan -usage -markdown` prints the identical text, rendered by the same function
+in `internal/usage`, for piping into a file or into `wl-copy`.
+
+Both read the board the same way, which is load-bearing rather than tidy. `ggraphify-scan`
+resolves **out-name and out-base from the stored settings**, exactly as the window does — a
+stored preference outranks the built-in default, an explicit flag outranks both. A scan that
+skipped that step looked for `graphify-out/` inside each checkout, found nothing on a board
+configured with an out-base, and reported every graphed repository as having no graph at
+all — turning the recommendation list into a page of metered extractions that were already
+done. `resolveOut` and `(*ui.App).outLocation` are the two halves of that rule and must not
+drift apart.
 
 ## The bottom panel
 
@@ -481,7 +596,8 @@ pinned it, rather than silently disagreeing with what the board is doing.
 ## It never writes inside a repository
 
 ggraphify's own state is a sidecar under `$XDG_DATA_HOME/ggraphify/` — settings, per-repo
-overrides, window geometry, column widths, and a bounded job history. The single exception
+overrides, window geometry, column widths, and the job list — the queue and a bounded run
+history, with the tail of each job's log. The single exception
 is an explicit, confirmed `hook install` or platform install, and that write is graphify's
 own, never on a batch path.
 
@@ -631,8 +747,8 @@ confirm dialog now separates the three, and each names its fix:
 
 The local backend changes what a fan-out means, so it gets a button the metered
 backends deliberately do not have. **Ctrl+L**, or the `computer-symbolic` button beside the
-free sweep, **forces a full LLM extraction on every repository on the board**, against the
-local model.
+free sweep, **forces a full LLM extraction on every repository currently listed**, against
+the local model.
 
 That sweep is the single most expensive thing this application could do against an API key,
 which is exactly why no button offers it there. Against a model on this machine it costs
@@ -649,6 +765,16 @@ pay to extract becomes the obvious thing to want. Three things keep it honest:
 - **Two exclusions survive**, and both are your own instruction rather than a judgement
   about state: rows flagged `⊘` to stay out of batch actions, and rows with a job already in
   flight.
+- **The listing is the scope.** It sweeps `visibleRows` — what the folder filter, the state
+  filter and the search box currently admit — not every checkout on the machine. That is
+  what makes something this heavy usable: narrow the board to one folder and the sweep is
+  that folder, with the count in the confirm to prove it. With no filter set the listing is
+  the whole board, so "everything" is one `Esc` away.
+
+Once it is running, **Stop all** in the jobs view (`J`) cancels the entire queue in one
+click. It carries the count of what it would stop, and it is the one destructive control
+here with no confirm in front of it — stopping is the recoverable direction, and every job
+it kills can simply be run again.
 - **The backend is pinned, not auto-detected.** An exported `GEMINI_API_KEY` cannot turn a
   sweep you asked to run locally into a bill — the pinned name is in the argv the confirm
   dialog prints.
@@ -663,18 +789,109 @@ A **pull is not run for you.** It is gigabytes over your network, and a button t
 one with no progress and no cancel would be worse than the terminal it replaced; the board
 copies the exact command instead.
 
-Three things worth knowing:
+Five things worth knowing:
 
-- **Concurrency is 1.** graphify forces it for `ollama` the same way it does for
-  `claude-cli`, and for the same reason. The metered lane setting does not lift it.
+- **Local LLM work has its own lane.** The metered lane bounds *spend* — one request at a
+  time, so a fan-out over 128 checkouts cannot become a fan-out bill — and one is the only
+  defensible default for it. Against a model on this machine there is no bill to
+  parallelize, and the limit is cores and memory instead, so those jobs count against a
+  separate **Local model lanes** limit (Settings ▸ Jobs ▸ Concurrency, default 2, up to 8).
+  Raising it never lifts the metered lane, and the jobs strip says which of the three a
+  queued job is waiting on.
+
+  Two is the default because a graphify run alternates between a `cpu_count`-wide AST pass
+  that touches the model server not at all and a semantic pass that is nothing but requests
+  to it. One job at a time leaves the model idle for every AST phase in a sweep; a second
+  job fills exactly those gaps.
+
+  The request timeout scales with the lane count. With several jobs sharing the server they
+  share its slots too, and a chunk can sit in the server's queue behind other jobs' work
+  before it is dispatched — a wait the OpenAI SDK's timeout covers as well as the
+  generation. A flat 1800 seconds would make the extra lanes a source of killed chunks,
+  dropped files and a run failed on the shrink guard: the exact failure the raised timeout
+  exists to prevent, re-introduced by the setting meant to make things faster.
+
+- **Concurrency within one job is the server's slot count, not 1 and not the metered lane.** graphify
+  clamps `max_concurrency` back to 1 for `ollama` unless `GRAPHIFY_OLLAMA_PARALLEL=1` is
+  exported, so a `--max-concurrency` flag on its own is silently discarded — the run looks
+  parallel in the argv and in the log, and is not. The board sets the flag and the variable
+  together, or neither, sized to what the server actually serves.
+
+  How many that is, is not on the wire: `/api/ps` reports the per-slot context and nothing
+  about the slot count. So it is read off the manager of the process that is serving —
+  `systemctl show ollama.service --property=Environment`, the per-user unit first and the
+  system one second, because a unit's `Environment=` is what the running server was actually
+  given and a variable in your shell is only what a server started *from here* would get.
+  For a server on another host, where none of that is on this disk, set
+  `GGRAPHIFY_OLLAMA_SLOTS` — nothing here could discover it.
+
+  A server that serves one at a time stays clamped. Unlocking it there would hand graphify's
+  default of four chunks to a server that can hold one, which is the VRAM-pressure failure
+  the clamp was written for.
+
+- **The slot count and the context length are one setting.** ollama **divides**
+  `OLLAMA_CONTEXT_LENGTH` across `OLLAMA_NUM_PARALLEL` slots: two slots and a 32768 context
+  is two 16384 slots, not two 32768 ones. Raising the slot count alone halves every chunk
+  the board is then allowed to send, while appearing to double throughput. The board's
+  advice row names both, and a server it starts itself gets both — plus
+  `OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_KV_CACHE_TYPE=q8_0`, which roughly halve what a
+  slot's K/V cache costs and are what make the second slot affordable, `OLLAMA_KEEP_ALIVE=30m`
+  to span the gap between one repository's graphify process and the next one's, and
+  `OLLAMA_MAX_LOADED_MODELS=1` so a second model cannot evict the first mid-sweep. Every one
+  of them is a default: a value already in the environment is one you chose, and wins.
+
+  The slot count it derives is `NumCPU/4`, capped at 4 and further capped by half of
+  `MemAvailable` at roughly a gigabyte a slot. Deliberately modest — using the whole machine
+  means every part of it doing useful work at once, not the model oversubscribed while the
+  `cpu_count`-wide AST phase waits behind it.
 - **The variables are ollama's own**, not graphify's: `OLLAMA_HOST`, `OLLAMA_BASE_URL`,
   `OLLAMA_MODEL`. graphify reads them unprefixed so a machine already configured for ollama
   needs no second configuration. `GRAPHIFY_OLLAMA_MODEL` and `GRAPHIFY_OLLAMA_HOST` do not
   exist in graphify 0.9.58 — earlier builds of this board offered them in the overlay
   editor, where setting either silently did nothing.
-- **`GRAPHIFY_OLLAMA_NUM_CTX` matters more than it looks.** ollama defaults `num_ctx` to
-  2048 and *silently truncates* a longer prompt, which turns into empty extractions rather
-  than an error. graphify derives a value; the overlay editor is where to override it.
+- **The context slot is set on the SERVER, and `GRAPHIFY_OLLAMA_NUM_CTX` does not reach
+  it.** graphify derives a `num_ctx` per request and sends it in `extra_body.options` — but
+  that is ollama's *OpenAI-compatible* endpoint, which does not read `options`. The server
+  keeps whatever slot it was started with: 4096 tokens unless `OLLAMA_CONTEXT_LENGTH` said
+  otherwise, however large the model's own trained context is. llama.cpp then truncates an
+  oversized prompt **from the front** with `n_keep=4`:
+
+  ```
+  msg="truncating input prompt" limit=2050 prompt=7394 keep=4 new=2050
+  ```
+
+  The four tokens kept are the head of graphify's system prompt. Everything that asked for
+  JSON, and the schema to answer with, is gone before the model sees anything — so it
+  describes the file in prose instead. graphify reads that as invalid JSON, calls the chunk
+  hollow, retries into the same truncation twice more, gives up, and finishes with zero
+  semantic nodes; its shrink guard then refuses to overwrite the older, larger graph and the
+  run exits non-zero. Hours of a CPU-bound model, and nothing written.
+
+  So the board does the only thing a client can: it measures the slot (ollama's native
+  `/api/ps`, which `/v1/models` has no equivalent of) and **sizes every chunk to fit it**,
+  passing `--token-budget` on the command line where the confirm dialog shows it. A slot it
+  could not measure — a server with nothing loaded, or one that is not ollama — leaves
+  graphify's own default alone rather than guessing. A server the board starts itself gets
+  `OLLAMA_CONTEXT_LENGTH=32768`; a stock 4096 one still runs, and the settings row says so
+  and names the fix.
+
+  The cap is not a guarantee, and the settings row says that too. It bounds a chunk the
+  packer *builds*, but a **single file larger than the cap cannot be split any further** —
+  graphify sends it whole, and on a 4096-token slot that is most files over about 2 KB. The
+  prompt is truncated from the front exactly as above, the chunk comes back as prose or
+  runs past its deadline, and those files are simply absent from the graph:
+
+  ```
+  [graphify] single-file chunk .../SKILL.md timed out and cannot be split further
+  [graphify] WARNING: 1/3 dispatched file(s) produced no nodes and are absent from the graph
+  ```
+
+  So a narrow slot is something to widen before a sweep, not a slower road to the same
+  graph. What the board can do from the client side it does: alongside the budget it passes
+  `--api-timeout 1800`, because graphify allows a request 600 seconds and a CPU-bound 7B at
+  a few tokens a second needs longer than that for one full reply — a request killed on the
+  deadline costs the file it was extracting, and enough of those fail the run on the shrink
+  guard.
 
 One consequence of the system-wide unit worth knowing before you switch to it: it runs as
 the `ollama` user with `OLLAMA_MODELS=/var/lib/ollama`, which is **not** the `~/.ollama` a
@@ -719,8 +936,10 @@ ggraphify-scan -json -state stale    # …or as JSON, filtered
 ggraphify-scan -roots ~/git -no-drift
 ggraphify-scan -out-base ~/.cache/graphify       # graphs kept outside the checkouts
 ggraphify-scan -issues -unhealthy                # what Fix would act on, and why
+ggraphify-scan -gap                              # used, and no graph to have answered with
 ggraphify-scan -usage                            # who actually ran graphify and graft
 ggraphify-scan -usage -usage-days 7 -json        # …last week, as JSON
+ggraphify-scan -usage -markdown                  # …as the briefing to paste into an agent
 
 ggraphify-job -list                              # every command this build knows
 ggraphify-job -kind update -repo ~/git/svc -n    # print the argv, run nothing

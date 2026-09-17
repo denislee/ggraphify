@@ -295,29 +295,40 @@ func (d *dockPane) dockEntries() []dockEntry {
 type laneUse struct {
 	freeBusy, freeLanes       int
 	meteredBusy, meteredLanes int
+	localBusy, localLanes     int
 }
 
 func (l laneUse) String() string {
-	return fmt.Sprintf("free %d/%d · metered %d/%d",
-		l.freeBusy, l.freeLanes, l.meteredBusy, l.meteredLanes)
+	return fmt.Sprintf("free %d/%d · metered %d/%d · local %d/%d",
+		l.freeBusy, l.freeLanes, l.meteredBusy, l.meteredLanes,
+		l.localBusy, l.localLanes)
 }
 
-// full reports whether the lane a job of this cost would take is saturated.
-func (l laneUse) full(c gfy.Cost) bool {
-	if c == gfy.Metered {
-		return l.meteredBusy >= l.meteredLanes
+// full reports whether the lane a job of this cost and locality would take is
+// saturated. Both arguments matter: a metered job against a model on this
+// machine waits on the local lane, not the metered one, and saying otherwise
+// would have the strip blame the setting that is not holding it up.
+func (l laneUse) full(c gfy.Cost, local bool) bool {
+	switch {
+	case c != gfy.Metered:
+		return l.freeBusy >= l.freeLanes
+	case local:
+		return l.localBusy >= l.localLanes
 	}
-	return l.freeBusy >= l.freeLanes
+	return l.meteredBusy >= l.meteredLanes
 }
 
 func (d *dockPane) laneUse(running []jobs.Snapshot) laneUse {
 	l := laneUse{}
-	l.freeLanes, l.meteredLanes = d.a.runner.Lanes()
+	l.freeLanes, l.meteredLanes, l.localLanes = d.a.runner.Lanes()
 	for _, s := range running {
-		if s.Cost == gfy.Metered {
-			l.meteredBusy++
-		} else {
+		switch {
+		case s.Cost != gfy.Metered:
 			l.freeBusy++
+		case s.Local:
+			l.localBusy++
+		default:
+			l.meteredBusy++
 		}
 	}
 	return l
@@ -329,22 +340,32 @@ func (d *dockPane) laneUse(running []jobs.Snapshot) laneUse {
 // next dispatch — and a strip that shows "queued" for all three is the reason
 // somebody goes looking for a hung job that is not hung.
 func (d *dockPane) waitReason(s jobs.Snapshot, l laneUse) string {
+	// Before any lane arithmetic: a held job is not waiting for a lane, it is
+	// waiting for a person. Saying "waiting for a metered lane" about a
+	// restored job that nothing will ever dispatch would be a lie the dock
+	// tells every tick.
+	if s.Held {
+		return "held — start it from Jobs"
+	}
 	if s.Repo != "" {
 		if id, held := d.a.runner.Busy(s.Repo); held && id != s.ID {
 			return "waiting for job " + gfy.Itoa(int(id)) + " on the same repository"
 		}
 	}
-	if l.full(s.Cost) {
-		return "waiting for a " + laneName(s.Cost) + " lane"
+	if l.full(s.Cost, s.Local) {
+		return "waiting for a " + laneName(s.Cost, s.Local) + " lane"
 	}
 	return "starting"
 }
 
-func laneName(c gfy.Cost) string {
-	if c == gfy.Metered {
-		return "metered"
+func laneName(c gfy.Cost, local bool) string {
+	switch {
+	case c != gfy.Metered:
+		return "free"
+	case local:
+		return "local model"
 	}
-	return "free"
+	return "metered"
 }
 
 // outcomeNote breaks the finished group down by how it ended, which is the
@@ -674,7 +695,7 @@ func dockRowTooltip(e dockEntry) string {
 	text, _ := dockStatus(e)
 	var b strings.Builder
 	b.WriteString(s.Label + "\n")
-	b.WriteString("job " + gfy.Itoa(int(s.ID)) + " · " + s.Kind + " · " + laneName(s.Cost) + " lane\n")
+	b.WriteString("job " + gfy.Itoa(int(s.ID)) + " · " + s.Kind + " · " + laneName(s.Cost, s.Local) + " lane\n")
 	if s.Repo != "" {
 		b.WriteString(s.Repo + "\n")
 	}

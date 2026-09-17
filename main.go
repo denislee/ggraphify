@@ -97,6 +97,10 @@ func main() {
 	applog.Infof("ggraphify %s starting — %s", version, store.DefaultPath())
 
 	st := store.Open(store.DefaultPath())
+	// The command line's say in where knowledge lives, handed to the store
+	// before anything reads a row or launches a job. Both the board's scan and
+	// every job's GRAPHIFY_OUT resolve through it, so they cannot disagree.
+	st.SetOutOverride(*outName, setFlags["out-name"], *outBase, setFlags["out-base"])
 
 	opts := ui.Options{
 		Store:      st,

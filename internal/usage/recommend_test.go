@@ -125,3 +125,32 @@ func TestRecommendLimits(t *testing.T) {
 		t.Fatalf("recs = %d, want 2", len(recs))
 	}
 }
+
+// The board's Used column, its filter and the scan command all ask the same
+// question and must get the same answer, so the predicate is shared rather
+// than re-derived in each. Broken is absent: a graphify-out/ that cannot be
+// read has never answered a query.
+func TestUsedWithoutGraph(t *testing.T) {
+	row := func(st graphstate.State) board.Row {
+		var r board.Row
+		r.Graph.State = st
+		return r
+	}
+	cases := []struct {
+		name  string
+		state graphstate.State
+		uses  int
+		want  bool
+	}{
+		{"used, no graph", graphstate.StateNone, 4, true},
+		{"used, broken graph", graphstate.StateBroken, 4, true},
+		{"used, fresh graph", graphstate.StateFresh, 4, false},
+		{"used, stale graph", graphstate.StateStale, 4, false},
+		{"unused, no graph", graphstate.StateNone, 0, false},
+	}
+	for _, c := range cases {
+		if got := UsedWithoutGraph(row(c.state), c.uses); got != c.want {
+			t.Errorf("%s: UsedWithoutGraph = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

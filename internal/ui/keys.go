@@ -25,7 +25,7 @@ var keyBindings = []keyBinding{
 	{"Enter", "Open the most useful detail page for this row", "Moving"},
 	{"Ctrl+F / Ctrl+B", "Page down / page up", "Moving"},
 	{"/", "Filter repositories", "Moving"},
-	{"f", "Cycle the state filter", "Moving"},
+	{"f", "Cycle the state filter, including Used ✕ — used, with no graph", "Moving"},
 	{"F", "Cycle the folder filter", "Moving"},
 	{"s", "Show only this repository's folder", "Moving"},
 	{"Esc", "Clear the search / leave select mode / clear the folder filter", "Moving"},
@@ -35,7 +35,7 @@ var keyBindings = []keyBinding{
 	{"H", "Fix, free steps only — no API key, no LLM call", "Building"},
 	{"Ctrl+H", "Fix, free steps only, on every repository on the board", "Building"},
 	{"Ctrl+G", "Sync the graft index for every repository in the selected folder", "Building"},
-	{"Ctrl+L", "Force a full LLM extraction on every repository, on the local model", "Building"},
+	{"Ctrl+L", "Force a full LLM extraction on every listed repository, on the local model", "Building"},
 	{"u", "Update — AST re-extraction, free", "Building"},
 	{"c", "Re-cluster, keeping placeholder names, free", "Building"},
 	{"E", "Extract — full LLM extraction, METERED", "Building"},
@@ -53,6 +53,7 @@ var keyBindings = []keyBinding{
 	{"q", "Query console", "Pages"},
 	{"J", "All jobs, across every repository", "Pages"},
 	{"U", "Usage tab: what agents actually ran, every repository", "Pages"},
+	{"y", "Usage tab: copy the window as a markdown briefing for an agent", "Pages"},
 	{"G", "Cross-repo global graph", "Pages"},
 
 	{"v", "Select mode, for batch actions", "Batch"},
@@ -140,6 +141,8 @@ func (a *App) dispatchKey(keyval uint) bool {
 			a.showHelp()
 		case gdk.KEY_J:
 			a.showJobs()
+		case gdk.KEY_y:
+			a.usagePane.copyReport()
 		default:
 			return false
 		}

@@ -102,17 +102,99 @@ func (a *App) refreshUsage() {
 }
 
 // publishUsage recomputes the per-row window and repaints. Main thread.
+//
+// Usage lives BESIDE the rows rather than in them — it is keyed by path in a
+// map this type owns, not carried on board.Row — so nothing the model knows
+// about changes when the rollup lands. That is why a repaint is not enough:
+// GTK's factory binds a cell's text once and QueueDraw redraws pixels without
+// re-running the bind, so the Used column kept whatever it was bound with.
+// On a cold start that is the empty map the first refresh publishes before the
+// first scan has produced any rows at all, and the column stayed blank until
+// an unrelated rescan happened to rebind it.
+//
+// Three things are stale at once and each is told separately: the Used cell's
+// text, the Used ✕ filter — which selects on usage and would otherwise keep a
+// row it should now drop — and the usage sort key.
 func (a *App) publishUsage(repos []string) {
 	uses := a.usage.RepoUses(repos, usage.Window{Days: usageColumnDays})
+
 	a.mu.Lock()
+	changed := !sameUses(a.usageUses, uses)
 	a.usageUses = uses
 	a.mu.Unlock()
+
+	// Only when it actually moved. The live watch republishes every couple of
+	// seconds, and a full re-filter and re-sort of three hundred rows on every
+	// tick would shuffle the board under someone reading it.
+	if changed {
+		// Three separate staleness problems, and each needs its own signal.
+		//
+		// The TEXT is repainted cell by cell rather than by invalidating the
+		// model. GTK does not re-bind a cell whose item did not itself change,
+		// so neither a filter nor a sorter signal refreshes it — and
+		// items-changed over the whole range, which would, is the same thing
+		// a splice emits: it drops the scroll position and the selection. On
+		// a live watch republishing every couple of seconds that would yank
+		// the board out from under whoever is reading it. There are about as
+		// many realised cells as visible rows, so doing it directly is both
+		// cheaper and quieter.
+		a.repaintUsageCells()
+		// The FILTER, because the Used ✕ chip selects on usage: a row that
+		// just earned its first use has to appear, and one whose usage aged
+		// out of the window has to go.
+		if a.cfilt != nil && a.filterID == filterGap {
+			a.cfilt.Changed(gtk.FilterChangeDifferent)
+		}
+		// The SORT KEY, but only when the board is actually sorted by it —
+		// every Changed costs a full re-sort.
+		if col, _ := a.currentSort(); col == "usage" {
+			if s := a.sorters["usage"]; s != nil {
+				s.Changed(gtk.SorterChangeDifferent)
+			}
+		}
+	}
 	if a.view != nil {
 		a.view.QueueDraw()
 	}
 	if a.onUsagePage() && a.usagePane != nil {
 		a.usagePane.reload()
 	}
+}
+
+// repaintUsageCells re-renders the Used column's realised cells in place,
+// for the rows they are currently bound to. Main thread only.
+func (a *App) repaintUsageCells() {
+	for _, c := range a.usageCells {
+		if c == nil || c.row == nil || c.label == nil {
+			continue
+		}
+		u := a.usageFor(c.row.Path)
+		gap := a.usageGap(c.row)
+		text, class := usageCell(u, gap)
+		if c.text != text {
+			c.label.SetText(text)
+			c.text = text
+		}
+		setClass(c.label, &c.class, class)
+	}
+}
+
+// sameUses reports whether two windows of per-repository usage would render
+// and filter identically. Only the fields the board reads are compared: the
+// per-tool totals and the mark's input. The daily series is not — it is drawn
+// from the same counts, and a series that moved without a total moving is a
+// day boundary passing, which no cell renders differently.
+func sameUses(old, next map[string]usage.RepoUse) bool {
+	if len(old) != len(next) {
+		return false
+	}
+	for path, n := range next {
+		o, ok := old[path]
+		if !ok || o.Graphify != n.Graphify || o.Graft != n.Graft {
+			return false
+		}
+	}
+	return true
 }
 
 // usageAccounts is every Claude Code login on this machine, because usage is
@@ -160,11 +242,20 @@ func (a *App) usageFor(path string) usage.RepoUse {
 // The two tools are not split here — the Graph and Graft columns already say
 // which indexes exist, and what this column adds is whether anything reads
 // them. The tooltip carries the split.
-func usageCell(u usage.RepoUse) (string, string) {
+func usageCell(u usage.RepoUse, gap bool) (string, string) {
 	if u.Total() == 0 {
 		return "", "st-none"
 	}
-	return sparkline(u.Series) + " " + fmt.Sprint(u.Total()), ""
+	cell := sparkline(u.Series) + " " + fmt.Sprint(u.Total())
+	if gap {
+		// The conjunction the board could not previously state. Both halves
+		// were already on screen — the sparkline here, the state dot in the
+		// first column — but reading them together meant tracking two columns
+		// across ninety rows, so the one combination that is always wrong is
+		// marked where the usage is.
+		return cell + " ✕", "st-broken"
+	}
+	return cell, ""
 }
 
 // sparkline draws a series as block characters, scaled to its own maximum.
@@ -199,7 +290,7 @@ func sparkline(series []int) string {
 }
 
 // usageTooltip is the long form behind the column.
-func usageTooltip(r *board.Row, u usage.RepoUse) string {
+func usageTooltip(r *board.Row, u usage.RepoUse, gap bool) string {
 	if u.Total() == 0 {
 		return "No agent used graphify or graft on this repository in the last " +
 			fmt.Sprint(usageColumnDays) + " days"
@@ -208,9 +299,19 @@ func usageTooltip(r *board.Row, u usage.RepoUse) string {
 	fmt.Fprintf(&b, "%s — last %d days\n", r.Name, usageColumnDays)
 	fmt.Fprintf(&b, "graphify %d · graft %d\n", u.Graphify, u.Graft)
 	if !u.Last.IsZero() {
-		fmt.Fprintf(&b, "last used %s", board.Age(u.Last))
+		fmt.Fprintf(&b, "last used %s\n", board.Age(u.Last))
+	}
+	if gap {
+		fmt.Fprintf(&b, "\n✕  used %d times with %s — every one of those queries fell "+
+			"through to raw source. Extract is what closes it.", u.Total(), stateWord(r.Graph.State))
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// usageGap is the board's side of usage.UsedWithoutGraph, over the same window
+// the Used column draws.
+func (a *App) usageGap(r *board.Row) bool {
+	return usage.UsedWithoutGraph(*r, a.usageFor(r.Path).Total())
 }
 
 // usageWeight sorts the column: most-used first, then by recency, so the
@@ -332,6 +433,12 @@ func (a *App) newUsagePane() *usagePane {
 		p.reload()
 	})
 
+	copyBtn := gtk.NewButtonFromIconName("edit-copy-symbolic")
+	copyBtn.AddCSSClass("flat")
+	copyBtn.SetTooltipText("Copy this window as markdown — the briefing to paste into a Claude Code " +
+		"session to be told where the two indexes are being left on the table")
+	copyBtn.ConnectClicked(func() { p.copyReport() })
+
 	refresh := gtk.NewButtonFromIconName("view-refresh-symbolic")
 	refresh.AddCSSClass("flat")
 	refresh.SetTooltipText("Re-read the transcripts now")
@@ -345,6 +452,7 @@ func (a *App) newUsagePane() *usagePane {
 	bar.Append(p.spin)
 	bar.Append(p.liveBtn)
 	bar.Append(p.windows)
+	bar.Append(copyBtn)
 	bar.Append(refresh)
 
 	// A flow box rather than a row: the detail pane is half of a window the
@@ -627,6 +735,45 @@ func (p *usagePane) recButton(r usage.Rec) *gtk.Button {
 		p.a.run(string(r.Action), []board.Row{*row}, nil)
 	})
 	return b
+}
+
+// copyReport puts the whole window on the clipboard as markdown.
+//
+// The dashboard can show that graft was offered to two hundred sessions and
+// reached for in nine; it cannot say whether that is bad. The thing qualified
+// to judge it is an agent, so the button produces the artefact worth handing
+// to one — the same text `ggraphify-scan -usage -markdown` prints, rendered by
+// internal/usage so the two can never drift.
+func (p *usagePane) copyReport() {
+	if p == nil || p.a.usage == nil {
+		return
+	}
+	repo := p.repo()
+	s := p.a.usage.Summarize(usage.Window{Days: p.days, Repo: repo})
+	when, scanned := p.a.usage.LastUpdate()
+	rows := p.a.allRows()
+	text := usage.Report(s, usage.Recommend(rows, s, 0), usage.ReportOptions{
+		Scope:      repo,
+		Version:    p.a.opts.Version,
+		Accounts:   p.a.usageAccounts(),
+		LastUpdate: when,
+		Scanned:    scanned,
+		Repos:      repoPaths(rows),
+		Recents:    p.a.usage.Recents(repo, 20),
+	})
+	p.a.win.Clipboard().SetText(text)
+	p.a.toastf("copied %s of usage — paste it to an agent and ask where the indexes are being missed",
+		board.Bytes(int64(len(text))))
+}
+
+// repoPaths is the board's checkout list, which the report uses to keep its
+// told-and-never-used section to directories a person can act on.
+func repoPaths(rows []board.Row) []string {
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Path)
+	}
+	return out
 }
 
 // footText is the honest small print: what the numbers are not, what the money

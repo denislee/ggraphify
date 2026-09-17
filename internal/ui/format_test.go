@@ -259,3 +259,43 @@ func TestGraftExposureNote(t *testing.T) {
 		})
 	}
 }
+
+// The Job column sorts by how much attention a row wants. The bug it guards
+// against: a row with NO job weighed less than a finished one, so a board
+// sorted by this column put its blank cells in the middle — between the queued
+// jobs and the finished ones — which reads as no sort at all on a board where
+// most rows have never run anything.
+func TestJobWeightOrdersByAttention(t *testing.T) {
+	a := &App{jobByRepo: map[string]*jobs.Snapshot{}}
+	row := func(path string, s *jobs.Snapshot) *board.Row {
+		if s != nil {
+			a.jobByRepo[path] = s
+		}
+		return &board.Row{Path: path}
+	}
+	order := []*board.Row{
+		row("/failed", &jobs.Snapshot{Status: jobs.Failed}),
+		row("/running", &jobs.Snapshot{Status: jobs.Running}),
+		row("/held", &jobs.Snapshot{Status: jobs.Queued, Held: true}),
+		row("/queued", &jobs.Snapshot{Status: jobs.Queued}),
+		row("/ok", &jobs.Snapshot{Status: jobs.Succeeded}),
+		row("/none", nil),
+	}
+	for i := 1; i < len(order); i++ {
+		prev, cur := jobWeight(a, order[i-1]), jobWeight(a, order[i])
+		if prev >= cur {
+			t.Errorf("%s (%d) must sort above %s (%d)",
+				order[i-1].Path, prev, order[i].Path, cur)
+		}
+	}
+	// A cancelled job is finished, not outstanding: it belongs with the ones
+	// that ran, never above the queue.
+	cancelled := row("/cancelled", &jobs.Snapshot{Status: jobs.Canceled})
+	if jobWeight(a, cancelled) <= jobWeight(a, order[3]) {
+		t.Error("a cancelled job must not sort above a queued one")
+	}
+	// And still above a row that has no job at all.
+	if jobWeight(a, cancelled) >= jobWeight(a, order[5]) {
+		t.Error("a cancelled job must sort above a row with no job")
+	}
+}

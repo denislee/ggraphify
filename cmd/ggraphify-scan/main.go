@@ -38,27 +38,54 @@ func main() {
 		hidden    = flag.Bool("hidden", false, "board checkouts inside dot-named directories too")
 		groups    = flag.Bool("groups", false, "list the folders the rows fall into, with counts, and exit")
 		unhealthy = flag.Bool("unhealthy", false, "only rows with something wrong — what the board's Fix button would act on")
+		gap       = flag.Bool("gap", false, "only rows an agent used that have no graphify graph to have answered with — the board's Used ✕ chip")
+		gapDays   = flag.Int("gap-days", 7, "the window -gap judges usage over, in days")
 		issues    = flag.Bool("issues", false, "add a column naming each row's issues (no-graph, drift, unnamed, no-report…)")
 		rawDrift  = flag.Bool("raw-drift", false, "ignore the board's settled-drift baselines and show the unadjudicated walk")
 		usageMode = flag.Bool("usage", false, "report which agents actually ran graphify and graft, instead of the board")
 		usageDays = flag.Int("usage-days", 30, "the window -usage reports over, in days")
+		usageMD   = flag.Bool("markdown", false, "with -usage: emit the markdown briefing meant to be pasted into an agent")
 	)
 	flag.Parse()
 
-	opts := board.Options{Depth: *depth, SkipDrift: *skipDrift, OutName: *outName, OutBase: *outBase, ShowHidden: *hidden}
+	// flag.Visit walks only what the command line actually said, which is the
+	// difference this command needs: a stored preference outranks a built-in
+	// default but never outranks an explicit flag.
+	setFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+
+	// The stored settings, read the same way the board reads them. Without
+	// this the two disagree about the one thing that decides whether a
+	// repository HAS a graph: a board configured with an out-base keeps every
+	// graph under one directory, and a scan that defaulted to the in-checkout
+	// graphify-out/ would report each of those repositories as ungraphed.
+	// That is not a cosmetic difference — it is the whole `-usage`
+	// recommendation list inverted.
+	st := store.Open(store.DefaultPath())
+	set := st.Settings()
+	outNameV, outBaseV := resolveOut(set, setFlags, *outName, *outBase)
+
+	opts := board.Options{Depth: *depth, SkipDrift: *skipDrift, OutName: outNameV, OutBase: outBaseV, ShowHidden: *hidden}
+	if !setFlags["depth"] && set.Depth > 0 {
+		opts.Depth = set.Depth
+	}
+	if !setFlags["hidden"] {
+		opts.ShowHidden = set.ShowHidden
+	}
 	if *roots != "" {
 		for _, r := range strings.Split(*roots, ",") {
 			if r = strings.TrimSpace(r); r != "" {
 				opts.Roots = append(opts.Roots, r)
 			}
 		}
+	} else if len(set.Roots) > 0 {
+		opts.Roots = set.Roots
 	}
 
 	// The same baselines the GUI reads, so the two agree about what is stale.
 	// A settled path is drift a successful graphify run looked at and declined
 	// to graph; --raw-drift is how you see what that is hiding.
 	if !*rawDrift {
-		st := store.Open(store.DefaultPath())
 		opts.Baseline = st.DriftBaseline
 	}
 
@@ -75,7 +102,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "ggraphify-scan:", err)
 			os.Exit(1)
 		}
-		printUsage(rows, *usageDays, *asJSON)
+		printUsage(rows, *usageDays, *asJSON, *usageMD)
 		return
 	}
 
@@ -113,6 +140,20 @@ func main() {
 	}
 	if *unhealthy {
 		rows = filter(rows, func(r board.Row) bool { return !r.Graph.Healthy() })
+	}
+	if *gap {
+		// The same join the board's Used ✕ chip makes, over the same window:
+		// the rollup says who worked where, the rows say what there was to
+		// answer them with, and this is where the two disagree.
+		x := usage.Load(usage.DefaultPath(store.DefaultDir()))
+		paths := make([]string, 0, len(rows))
+		for _, r := range rows {
+			paths = append(paths, r.Path)
+		}
+		uses := x.RepoUses(paths, usage.Window{Days: *gapDays})
+		rows = filter(rows, func(r board.Row) bool {
+			return usage.UsedWithoutGraph(r, uses[r.Path].Total())
+		})
 	}
 	if *graphed {
 		rows = filter(rows, func(r board.Row) bool { return r.Graph.State != graphstate.StateNone })
@@ -172,9 +213,25 @@ func main() {
 	fmt.Println("(* on COMM means the communities have placeholder names — run `label`)")
 }
 
+// resolveOut applies the board's own precedence to where graphify knowledge
+// lives: a stored preference beats the built-in default, and an explicit flag
+// beats both. It mirrors (*ui.App).outLocation, and the two must not drift —
+// if they do, this command reports a graphed repository as ungraphed and the
+// -usage recommendations invert.
+func resolveOut(set store.Settings, flags map[string]bool, name, base string) (string, string) {
+	outName, outBase := set.OutName, set.OutBase
+	if flags["out-name"] {
+		outName = name
+	}
+	if flags["out-base"] {
+		outBase = base
+	}
+	return outName, outBase
+}
+
 // printUsage is the headless twin of the board's Usage column and its U
 // dashboard: the same rollup, the same window, printed.
-func printUsage(rows []board.Row, days int, asJSON bool) {
+func printUsage(rows []board.Row, days int, asJSON, asMarkdown bool) {
 	home, _ := os.UserHomeDir()
 	var accounts []usage.Account
 	for _, c := range gfy.ClaudeAccounts("") {
@@ -198,9 +255,22 @@ func printUsage(rows []board.Row, days int, asJSON bool) {
 		fmt.Fprintln(os.Stderr, "ggraphify-scan: saving the rollup:", err)
 	}
 	took := time.Since(started).Round(time.Millisecond)
-	_, scanned := x.LastUpdate()
+	updated, scanned := x.LastUpdate()
 
 	s := x.Summarize(usage.Window{Days: days})
+	if asMarkdown {
+		// The same text the GUI's Copy button puts on the clipboard, so a
+		// headless machine — or a pipe into wl-copy — is not a second format
+		// to keep in step with the first.
+		fmt.Print(usage.Report(s, usage.Recommend(rows, s, 0), usage.ReportOptions{
+			Accounts:   accounts,
+			LastUpdate: updated,
+			Scanned:    scanned,
+			Repos:      repos,
+			Recents:    x.Recents("", 20),
+		}))
+		return
+	}
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")

@@ -10,6 +10,7 @@ import (
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
 	"github.com/dns/ggraphify/internal/applog"
+	"github.com/dns/ggraphify/internal/autofix"
 	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/gfy"
 	"github.com/dns/ggraphify/internal/store"
@@ -198,7 +199,7 @@ func (a *App) diagnostics() string {
 	set := a.opts.Store.Settings()
 	c := board.Summarize(a.allRows())
 	queued, running := a.runner.Active()
-	free, metered := a.runner.Lanes()
+	free, metered, localLanes := a.runner.Lanes()
 	outName, outBase := a.outLocation()
 
 	var b strings.Builder
@@ -228,10 +229,11 @@ func (a *App) diagnostics() string {
 	line("roots", strings.Join(a.opts.Roots, ", ")+sprintf("  (depth %d)", a.opts.Depth))
 	line("graph storage", describeOut(outName, outBase))
 	line("backend", describeBackend(set))
-	line("lanes", sprintf("%d free / %d metered", free, metered))
+	line("lanes", sprintf("%d free / %d metered / %d local", free, metered, localLanes))
 	line("board", sprintf("%d repos, %d graphed, %d fresh, %d stale, %d unlabeled, %d broken, %d behind HEAD",
 		c.Repos, c.Graphed, c.Fresh, c.Stale, c.Raw, c.Broken, c.Behind))
 	line("queue", sprintf("%d running, %d queued", running, queued))
+	line("auto-fix", a.describeAutoFix(set))
 
 	b.WriteString("\n## Claude Code integration\n\n```\n")
 	b.WriteString(gfy.InspectClaudeIn(a.version, set.ClaudeAccount).Report())
@@ -262,6 +264,45 @@ func (a *App) diagnostics() string {
 	b.WriteString(applog.Default.Text())
 	b.WriteString("```\n")
 	return b.String()
+}
+
+// describeAutoFix is the unattended loop in one line: whether it runs, what it
+// is allowed to spend, and — the part a bug report needs — where its LLM steps
+// actually go on THIS machine, which is a question about a probe rather than
+// about a setting.
+func (a *App) describeAutoFix(set store.Settings) string {
+	if !set.AutoFix() {
+		return "off"
+	}
+	s := "on"
+	if a.autofix != nil {
+		s += sprintf(", %d in flight", a.autofix.Running())
+	}
+	s += sprintf(", max %d, cooldown %ds, %d attempts",
+		autoFixOr(set.AutoFixMax, autofix.DefaultMax),
+		autoFixOr(set.AutoFixCooldown, int(autofix.DefaultCooldown/time.Second)),
+		autoFixOr(set.AutoFixAttempts, autofix.DefaultAttempts))
+	switch {
+	case !set.AutoFixLocal():
+		s += "; local model off"
+	default:
+		eff := gfy.EffectiveBackend(set.Backend)
+		backend, preferred := eff, set.Model
+		if !gfy.IsLocalBackend(eff) {
+			backend, preferred = gfy.OllamaBackend, ""
+		}
+		if m, ok, why := gfy.AutoLocalModel(backend, preferred); ok {
+			s += "; LLM steps on " + backend + "/" + m
+		} else {
+			s += "; no local model (" + why + ")"
+		}
+	}
+	if set.AutoFixMetered {
+		s += "; METERED fixes allowed"
+	} else {
+		s += "; never spends"
+	}
+	return s
 }
 
 func describeOut(name, base string) string {
@@ -297,6 +338,15 @@ func describeBackend(set store.Settings) string {
 	// unable to tell which model answered.
 	if gfy.IsLocalBackend(eff) {
 		name += ", LOCAL at " + gfy.LocalBaseURL(eff) + " (free)"
+		// The slot count belongs in a diagnostic report for the same reason
+		// the endpoint does: it is the first thing to check when somebody
+		// reports that a local run took all night.
+		if p := gfy.ProbeLocal(eff); p.Slots > 0 {
+			name += ", " + gfy.Itoa(p.Slots) + " request slot(s)"
+			if n := gfy.LocalConcurrency(eff); n > 1 {
+				name += ", " + gfy.Itoa(n) + " chunks in flight"
+			}
+		}
 		if ok, why := gfy.LocalReady(eff, set.Model); !ok {
 			return name + " — NOT READY: " + why
 		}

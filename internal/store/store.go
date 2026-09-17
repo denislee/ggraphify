@@ -1,5 +1,6 @@
 // Package store is ggraphify's sidecar state: settings, per-repo overrides,
-// window geometry and a bounded job history, under $XDG_DATA_HOME/ggraphify/.
+// window geometry and the job list — the queue and a bounded run history —
+// under $XDG_DATA_HOME/ggraphify/.
 //
 // The rule this package exists to enforce is that ggraphify never writes
 // inside a repository. Everything it remembers about a checkout lives here,
@@ -66,10 +67,36 @@ type Settings struct {
 
 	FreeLanes    int `json:"free_lanes"`
 	MeteredLanes int `json:"metered_lanes"`
+	// LocalLanes is the metered lane's counterpart for a model on this
+	// machine, where the limit is cores and memory rather than spend.
+	LocalLanes int `json:"local_lanes"`
 
 	// ConfirmBatchAt is how many repositories a batch may cover before the
 	// confirm dialog demands the count be typed rather than merely clicked.
 	ConfirmBatchAt int `json:"confirm_batch_at"`
+
+	// The auto-fix loop: the board takes unhealthy repositories to a healthy
+	// graph on its own, on the same tick that scans them, running the same
+	// plan the Fix button would have run.
+	//
+	// The two switches that matter are stored as *off* flags, so the zero
+	// value — a state file written before auto-fix existed — reads back as
+	// the default rather than as a choice nobody made, and the default for
+	// both is on. AutoFixMetered is the other way round for the same reason:
+	// its safe value is its zero one, and a loop that bills a card without a
+	// click is the one thing here nobody could undo.
+	NoAutoFix      bool `json:"no_auto_fix,omitempty"`
+	NoAutoFixLocal bool `json:"no_auto_fix_local,omitempty"`
+	AutoFixMetered bool `json:"auto_fix_metered,omitempty"`
+
+	// AutoFixMax is how many repositories the loop keeps in flight,
+	// AutoFixCooldown the minimum seconds before it attempts the same one
+	// again, and AutoFixAttempts how many times the same set of defects may
+	// be attacked before the repository is left alone. Zero means the
+	// autofix package's own default for each.
+	AutoFixMax      int `json:"auto_fix_max,omitempty"`
+	AutoFixCooldown int `json:"auto_fix_cooldown_seconds,omitempty"`
+	AutoFixAttempts int `json:"auto_fix_attempts,omitempty"`
 
 	// Overlay is the GRAPHIFY_* environment applied to every job.
 	Overlay map[string]string `json:"overlay"`
@@ -104,6 +131,18 @@ type Settings struct {
 	SortDesc bool   `json:"sort_desc"`
 }
 
+// AutoFix reports whether the auto-fix loop runs at all, and AutoFixLocal
+// whether it may use a model on this machine for the LLM steps. Both are
+// stored inverted so that "not written down" means "on"; these two readers are
+// the only place that inversion is spelled out.
+func (s Settings) AutoFix() bool { return !s.NoAutoFix }
+
+// AutoFixLocal is what makes the loop worth having on by default: against a
+// model on this machine the full extraction and the community naming cost
+// nothing, so the loop can finish a repository rather than stopping at the
+// free half of it.
+func (s Settings) AutoFixLocal() bool { return !s.NoAutoFixLocal }
+
 // RepoOverride is the per-repository half of the settings: what this one
 // checkout does differently from the board's defaults.
 type RepoOverride struct {
@@ -136,9 +175,67 @@ type Geometry struct {
 	Maximized bool `json:"maximized"`
 }
 
-// HistoryEntry is one finished job, as it survives a restart. The log itself
-// is not persisted — it is bounded but still large, and what is worth keeping
-// a week later is what ran, against what, and how it ended.
+// JobEntry is one job as it survives a restart — the queue and the run log in
+// a single list, because from the sidecar's point of view they are the same
+// thing seen at different moments, and a board that reopened its history but
+// forgot its queue would be a board that quietly dropped work.
+//
+// The log travels with it, as a tail rather than the whole ring buffer. A
+// restored failure whose log was thrown away is a row that says "failed" and
+// nothing about why, which is exactly the row somebody reopens the board to
+// read; MaxLogTail is what keeps that answer from turning the sidecar into a
+// log file.
+//
+// Env is deliberately absent. It is rebuilt on restore from the overlay and
+// the backend named in the argv, the same way the Retry button rebuilds it —
+// so this file keeps holding variable names and never a credential's value,
+// which is the rule the package doc states.
+type JobEntry struct {
+	Kind    string    `json:"kind"`
+	Repo    string    `json:"repo"`
+	Label   string    `json:"label,omitempty"`
+	Argv    []string  `json:"argv"`
+	Cost    string    `json:"cost"`
+	Local   bool      `json:"local,omitempty"`
+	Dir     string    `json:"dir,omitempty"`
+	Out     string    `json:"out,omitempty"`
+	Status  string    `json:"status"`
+	Held    bool      `json:"held,omitempty"`
+	Exit    int       `json:"exit"`
+	Queued  time.Time `json:"queued,omitempty"`
+	Started time.Time `json:"started"`
+	Ended   time.Time `json:"ended,omitempty"`
+	Error   string    `json:"error,omitempty"`
+	Log     string    `json:"log,omitempty"`
+}
+
+// Done reports whether this entry describes a job the next session does NOT
+// owe any work for. Only "queued" and "running" are outstanding; everything
+// else, a status this version does not recognise included, is treated as
+// finished. The asymmetry is deliberate — misreading a finished job as
+// outstanding would run it a second time, and running a job twice is the one
+// mistake this file exists to avoid.
+func (e JobEntry) Done() bool {
+	switch e.Status {
+	case "queued", "running":
+		return false
+	}
+	return true
+}
+
+// Duration is how long the job ran, in seconds.
+func (e JobEntry) Duration() float64 {
+	// Ended before Started covers both of the cases that are not a duration:
+	// a job that never ran, and one that had not ended when this was written.
+	if e.Ended.Before(e.Started) {
+		return 0
+	}
+	return e.Ended.Sub(e.Started).Seconds()
+}
+
+// HistoryEntry is one finished job as the detail pane and the diagnostics page
+// read it: a projection of JobEntry, kept because those two readers want the
+// run log and nothing else from the list.
 type HistoryEntry struct {
 	Kind     string    `json:"kind"`
 	Repo     string    `json:"repo"`
@@ -151,8 +248,14 @@ type HistoryEntry struct {
 	Error    string    `json:"error,omitempty"`
 }
 
-// MaxHistory bounds the persisted job history.
+// MaxHistory bounds the finished jobs the sidecar keeps. Jobs that have not
+// finished are never dropped by it: a queue is not a log, and trimming the
+// oldest entry of a queue means losing work somebody asked for.
 const MaxHistory = 200
+
+// MaxLogTail is how much of a job's log is written to the sidecar. It is the
+// end of the log, which is where a traceback and an exit message are.
+const MaxLogTail = 8 << 10
 
 type state struct {
 	Version   int                     `json:"version"`
@@ -163,7 +266,11 @@ type state struct {
 	ColOrder  []string                `json:"col_order"`
 	ColHidden []string                `json:"col_hidden"`
 	Selected  string                  `json:"selected"`
-	History   []HistoryEntry          `json:"history"`
+	// Jobs is the queue and the run log, newest first. History is the shape
+	// the same list had before jobs survived a restart; it is read once, on
+	// load, and never written again.
+	Jobs    []JobEntry     `json:"jobs,omitempty"`
+	History []HistoryEntry `json:"history,omitempty"`
 	// Baselines is the drift each repository's last successful graphify run
 	// left behind — paths graphify has looked at and declined to graph. It
 	// lives here rather than in graphify-out/ because this package's one rule
@@ -179,8 +286,52 @@ type Store struct {
 	mu sync.RWMutex
 	s  state
 
+	// The command line's say in where graphify knowledge lives, held in
+	// memory and never persisted: a flag is this launch's opinion, not a
+	// preference the user set. See SetOutOverride for why it lives here
+	// rather than in the UI.
+	outName, outBase       string
+	outNameSet, outBaseSet bool
+
 	timer   *time.Timer
 	saveErr error
+}
+
+// SetOutOverride records what the command line said about where graphify
+// knowledge lives, so that OutSpec — and therefore every job's GRAPHIFY_OUT —
+// resolves it the same way the board's scan does.
+//
+// It exists because the two used to disagree. The scan applied flag precedence
+// in the UI while OutSpec read the stored settings alone, so `ggraphify
+// -out-base /somewhere` made the board READ from /somewhere and every job it
+// launched WRITE to the stored base — or, with nothing stored, into the
+// checkout. A board that reads one directory and writes another reports every
+// repository as ungraphed however many times it extracts them.
+//
+// The flags are not persisted. A launch flag must not quietly become a saved
+// preference that outlives the launch.
+func (s *Store) SetOutOverride(name string, nameSet bool, base string, baseSet bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.outName, s.outNameSet = name, nameSet
+	s.outBase, s.outBaseSet = base, baseSet
+}
+
+// OutLocation is the one resolver for where knowledge lives: a stored
+// preference outranks the built-in default, and an explicit flag outranks
+// both. Everything that needs the answer — the scan, OutSpec, the job overlay,
+// the diagnostics report — goes through here.
+func (s *Store) OutLocation() (name, base string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	name, base = s.s.Settings.OutName, s.s.Settings.OutBase
+	if s.outNameSet {
+		name = s.outName
+	}
+	if s.outBaseSet {
+		base = s.outBase
+	}
+	return name, base
 }
 
 // DefaultDir is $XDG_DATA_HOME/ggraphify, or ~/.local/share/ggraphify.
@@ -206,6 +357,7 @@ func Defaults() Settings {
 		Scheme:         "system",
 		FreeLanes:      0, // 0 → the runner's own min(4, NumCPU/2)
 		MeteredLanes:   1,
+		LocalLanes:     0, // 0 → the runner's own jobs.DefaultLocalLanes
 		ConfirmBatchAt: 3,
 		Overlay:        map[string]string{},
 		LogBytes:       0,
@@ -261,6 +413,25 @@ func Open(path string) *Store {
 	if loaded.Columns == nil {
 		loaded.Columns = map[string]int{}
 	}
+	// A file written before jobs survived a restart carries its finished runs
+	// under "history". Fold them into the one list and stop writing the old
+	// key, so the two can never disagree about what ran.
+	if len(loaded.Jobs) == 0 && len(loaded.History) > 0 {
+		for _, h := range loaded.History {
+			loaded.Jobs = append(loaded.Jobs, JobEntry{
+				// A history entry never carried a label — the old list was
+				// rendered from the kind and the argv. Rebuild it, or the
+				// folded-in rows arrive on the board with no name at all.
+				Kind: h.Kind, Repo: h.Repo, Label: gfy.JobLabel(h.Kind, h.Repo),
+				Argv: h.Argv, Cost: h.Cost,
+				Status: h.Status, Exit: h.Exit, Started: h.Started,
+				Ended: h.Started.Add(time.Duration(h.Duration * float64(time.Second))),
+				Error: h.Error,
+			})
+		}
+	}
+	loaded.History = nil
+	loaded.Jobs = trimJobs(loaded.Jobs)
 	loaded.Version = Version
 	st.s = loaded
 	return st
@@ -396,22 +567,58 @@ func (s *Store) SetSelected(p string) {
 	s.schedule()
 }
 
-// History is the persisted job log, newest first.
+// Jobs is everything the previous session knew about, newest first: what was
+// queued, what was in flight, what had finished.
+func (s *Store) Jobs() []JobEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]JobEntry(nil), s.s.Jobs...)
+}
+
+// SetJobs replaces the list. The runner owns the queue, so the board writes it
+// whole on every transition rather than trying to keep a second copy of it in
+// step one edit at a time.
+func (s *Store) SetJobs(list []JobEntry) {
+	s.mu.Lock()
+	s.s.Jobs = trimJobs(list)
+	s.mu.Unlock()
+	s.schedule()
+}
+
+// trimJobs bounds the finished jobs at MaxHistory and keeps every unfinished
+// one, wherever in the list it sits.
+func trimJobs(list []JobEntry) []JobEntry {
+	out := make([]JobEntry, 0, len(list))
+	done := 0
+	for _, e := range list {
+		if e.Done() {
+			if done >= MaxHistory {
+				continue
+			}
+			done++
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// History is the persisted job log, newest first — the finished entries of
+// Jobs, in the shape the detail pane and the diagnostics page read.
 func (s *Store) History() []HistoryEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return append([]HistoryEntry(nil), s.s.History...)
-}
-
-// AddHistory records a finished job.
-func (s *Store) AddHistory(e HistoryEntry) {
-	s.mu.Lock()
-	s.s.History = append([]HistoryEntry{e}, s.s.History...)
-	if len(s.s.History) > MaxHistory {
-		s.s.History = s.s.History[:MaxHistory]
+	out := make([]HistoryEntry, 0, len(s.s.Jobs))
+	for _, e := range s.s.Jobs {
+		if !e.Done() {
+			continue
+		}
+		out = append(out, HistoryEntry{
+			Kind: e.Kind, Repo: e.Repo, Argv: e.Argv, Cost: e.Cost,
+			Status: e.Status, Exit: e.Exit, Started: e.Started,
+			Duration: e.Duration(), Error: e.Error,
+		})
 	}
-	s.mu.Unlock()
-	s.schedule()
+	return out
 }
 
 // DriftBaseline is the adjudicated drift for one repository, or a zero
@@ -466,10 +673,10 @@ func (s *Store) SetScheme(v string) {
 // The board resolves rows through it and every job is launched pointing at the
 // same directory.
 func (s *Store) OutSpec(repo string) discover.OutSpec {
-	set := s.Settings()
+	name, base := s.OutLocation()
 	return discover.OutSpec{
-		Name: set.OutName,
-		Base: set.OutBase,
+		Name: name,
+		Base: base,
 		Repo: s.Override(repo).Out,
 	}
 }

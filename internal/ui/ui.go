@@ -29,6 +29,7 @@ import (
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
 	"github.com/dns/ggraphify/internal/applog"
+	"github.com/dns/ggraphify/internal/autofix"
 	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/discover"
 	"github.com/dns/ggraphify/internal/gfy"
@@ -144,6 +145,14 @@ type App struct {
 	activityKey  string
 
 	cols map[string]*gtk.ColumnViewColumn
+	// sorters is each sortable column's comparator, by column id, so a sort
+	// key that changed outside the model can be invalidated. See resortJobs.
+	sorters map[string]*gtk.CustomSorter
+
+	// usageCells is the Used column's realised cells, by list-item pointer.
+	// Every other column renders from the row itself, so a rebind is the only
+	// way its text can be stale; usage lives beside the row and arrives later.
+	usageCells map[uintptr]*rowCell
 
 	// The detail half.
 	detail   *detailPane
@@ -235,11 +244,19 @@ type App struct {
 	usageGuard bool
 	filterBar  *gtk.Box
 
-	runner  *jobs.Runner
-	cache   discover.Cache
-	graphs  graphstate.Cache
-	grafts  graftstate.Cache
-	version gfy.Version
+	runner *jobs.Runner
+	// autofix is the unattended repair loop's memory: which repositories it
+	// has already tried, how that went, and which ones it has given up on.
+	// The decisions live in internal/autofix; autofix.go in this package is
+	// what turns them into chains. autofixBusy guards the one goroutine it is
+	// allowed to have in flight, since the loop probes the local model server
+	// and must not do that on the main thread.
+	autofix     *autofix.Engine
+	autofixBusy bool
+	cache       discover.Cache
+	graphs      graphstate.Cache
+	grafts      graftstate.Cache
+	version     gfy.Version
 
 	// selectMode is the batch-action mode. `Space` adds a row to selected;
 	// an action taken in this mode applies to all of them, behind a confirm
@@ -285,11 +302,13 @@ func New(opts Options) *App {
 		jobByRepo: map[string]*jobs.Snapshot{},
 		jobIDs:    map[string]uint64{},
 		cols:      map[string]*gtk.ColumnViewColumn{},
+		sorters:   map[string]*gtk.CustomSorter{},
 		chips:     map[string]*gtk.ToggleButton{},
 		setCols:   map[string]*adw.SwitchRow{},
 		dockRows:  map[string]*adw.SwitchRow{},
 		selected:  map[string]bool{},
 		usageUses: map[string]usage.RepoUse{},
+		autofix:   autofix.New(),
 	}
 }
 
@@ -299,6 +318,10 @@ func (a *App) Run(args []string) int {
 	a.app.ConnectActivate(func() { a.activate() })
 	code := a.app.Run(args)
 	if a.runner != nil {
+		// The queue is written down BEFORE Close, which cancels it: the next
+		// session is owed the jobs somebody queued, not a list of jobs
+		// cancelled by the act of quitting.
+		a.persistJobs()
 		// A watcher started from the board is a child of the board and must
 		// not outlive it. Close cancels everything still in flight and waits
 		// for the process groups to go.
@@ -320,9 +343,15 @@ func (a *App) activate() {
 	a.runner = jobs.New(jobs.Options{
 		FreeLanes:    set.FreeLanes,
 		MeteredLanes: set.MeteredLanes,
+		LocalLanes:   set.LocalLanes,
 		LogBytes:     set.LogBytes,
 		Precheck:     jobs.RequireGraph,
 	})
+	// Before the pump, because Restore deliberately emits nothing: the views
+	// below are built from Snapshot, which already has the restored jobs in
+	// it, and an event storm into a channel nobody is draining yet would be
+	// dropped anyway.
+	restored, held := a.restoreJobs()
 	go a.pumpJobs()
 
 	a.win = adw.NewApplicationWindow(&a.app.Application)
@@ -408,6 +437,7 @@ func (a *App) activate() {
 	})
 
 	a.win.SetVisible(true)
+	a.announceRestored(restored, held)
 	a.applyDockSettings()
 	a.restoreFilter()
 	a.refresh(true)
@@ -488,16 +518,12 @@ func (a *App) tick() {
 // outLocation is where the board looks for every repository's graph: the
 // command line when it said, else the stored preference, else blank — which
 // leaves graphify's own default and $GRAPHIFY_OUT_NAME in charge.
+// outLocation delegates to the store, which is the single resolver: the board
+// must read from the directory its jobs write to, and two copies of this rule
+// is exactly how they came apart. The flags reach the store through
+// SetOutOverride at startup.
 func (a *App) outLocation() (name, base string) {
-	set := a.opts.Store.Settings()
-	name, base = set.OutName, set.OutBase
-	if a.opts.SetFlags["out-name"] {
-		name = a.opts.OutName
-	}
-	if a.opts.SetFlags["out-base"] {
-		base = a.opts.OutBase
-	}
-	return name, base
+	return a.opts.Store.OutLocation()
 }
 
 // refresh scans in a goroutine and folds the result in on the main thread.
@@ -617,6 +643,11 @@ func (a *App) setRows(rows []board.Row) {
 	a.view.QueueDraw()
 	a.refreshStatus()
 	a.detail.reload()
+
+	// The scan that just landed is the freshest picture of every repository
+	// there is, which makes this — and not a timer of its own — the right
+	// moment to ask whether any of them should be repaired. See autofix.go.
+	a.autoFixTick()
 }
 
 // rowFor resolves a model object back to its row.
@@ -686,7 +717,7 @@ func (a *App) refreshStatus() {
 	a.refreshActivity()
 	c := board.Summarize(a.allRows())
 	queued, running := a.runner.Active()
-	free, metered := a.runner.Lanes()
+	free, metered, localLanes := a.runner.Lanes()
 
 	var b strings.Builder
 	b.WriteString(plural(c.Repos, "repo", "repos"))
@@ -731,12 +762,22 @@ func (a *App) refreshStatus() {
 		if queued > 0 {
 			b.WriteString(", ")
 			b.WriteString(plural(queued, "queued", "queued"))
+			// A held job is queued but will never start on its own, and a
+			// status bar that counted it as queued would leave somebody
+			// waiting all afternoon for work that is waiting for them.
+			if held := a.runner.HeldCount(); held > 0 {
+				b.WriteString(" (")
+				b.WriteString(gfy.Itoa(held))
+				b.WriteString(" held)")
+			}
 		}
 		b.WriteString(" (")
 		b.WriteString(gfy.Itoa(free))
 		b.WriteString(" free / ")
 		b.WriteString(gfy.Itoa(metered))
-		b.WriteString(" metered lanes)")
+		b.WriteString(" metered / ")
+		b.WriteString(gfy.Itoa(localLanes))
+		b.WriteString(" local lanes)")
 	}
 	if a.groupID != "" {
 		// The counters above are the whole board on purpose — "3 stale" means
@@ -862,6 +903,7 @@ func (a *App) onJobEvent(ev jobs.Event) {
 			a.toastf("%s resumed", s.Label)
 		}
 		a.view.QueueDraw()
+		a.resortJobs()
 		a.refreshStatus()
 		a.detail.reloadJobs()
 		if a.dock != nil {
@@ -873,13 +915,11 @@ func (a *App) onJobEvent(ev jobs.Event) {
 		return
 	}
 
-	if s.Status.Done() && a.opts.Store != nil {
-		a.opts.Store.AddHistory(store.HistoryEntry{
-			Kind: s.Kind, Repo: s.Repo, Argv: s.Argv, Cost: s.Cost.String(),
-			Status: s.Status.String(), Exit: s.Exit, Started: s.Started,
-			Duration: s.Elapsed().Seconds(), Error: s.Err,
-		})
-	}
+	// Every lifecycle transition rewrites the sidecar's job list — a
+	// submission, a start, a completion. It is one debounced write of a
+	// bounded list, and it is what makes the queue survive a crash rather
+	// than only a clean quit, where the handler in Run would have caught it.
+	a.persistJobs()
 	switch s.Status {
 	case jobs.Running:
 		applog.Infof("job %d started: %s", s.ID, s.Command())
@@ -936,6 +976,7 @@ func (a *App) onJobEvent(ev jobs.Event) {
 		a.toastf("%s cancelled", s.Label)
 	}
 	a.view.QueueDraw()
+	a.resortJobs()
 	a.refreshStatus()
 	a.detail.reloadJobs()
 	if a.dock != nil {

@@ -215,6 +215,9 @@ func jobCell(s *jobs.Snapshot) (text, class string) {
 	}
 	switch s.Status {
 	case jobs.Queued:
+		if s.Held {
+			return "held " + s.Kind, "st-stale"
+		}
 		return "queued " + s.Kind, "st-none"
 	case jobs.Running:
 		if s.Paused {

@@ -114,9 +114,11 @@ func TestEmptyOverrideIsRemoved(t *testing.T) {
 
 func TestHistoryIsBounded(t *testing.T) {
 	s, _ := tempStore(t)
+	var list []JobEntry
 	for i := 0; i < MaxHistory+50; i++ {
-		s.AddHistory(HistoryEntry{Kind: "update", Repo: "/r", Started: time.Now()})
+		list = append(list, JobEntry{Kind: "update", Repo: "/r", Status: "ok", Started: time.Now()})
 	}
+	s.SetJobs(list)
 	if n := len(s.History()); n != MaxHistory {
 		t.Fatalf("history has %d entries, want %d", n, MaxHistory)
 	}
@@ -124,10 +126,82 @@ func TestHistoryIsBounded(t *testing.T) {
 
 func TestHistoryIsNewestFirst(t *testing.T) {
 	s, _ := tempStore(t)
-	s.AddHistory(HistoryEntry{Kind: "first"})
-	s.AddHistory(HistoryEntry{Kind: "second"})
+	s.SetJobs([]JobEntry{{Kind: "second", Status: "ok"}, {Kind: "first", Status: "ok"}})
 	if s.History()[0].Kind != "second" {
 		t.Fatal("history is not newest-first")
+	}
+}
+
+// The bound is on what has FINISHED. A queue is not a log: dropping its oldest
+// entry means losing work somebody asked for, so an outstanding job survives
+// however far down the list it sits.
+func TestQueuedJobsAreNeverTrimmed(t *testing.T) {
+	s, _ := tempStore(t)
+	list := []JobEntry{{Kind: "extract", Repo: "/r", Status: "queued", Held: true}}
+	for i := 0; i < MaxHistory+50; i++ {
+		list = append(list, JobEntry{Kind: "update", Repo: "/r", Status: "ok"})
+	}
+	s.SetJobs(list)
+	got := s.Jobs()
+	if n := len(got); n != MaxHistory+1 {
+		t.Fatalf("kept %d entries, want %d", n, MaxHistory+1)
+	}
+	if got[0].Status != "queued" || !got[0].Held {
+		t.Fatalf("the queued job did not survive: %+v", got[0])
+	}
+}
+
+// The queue and the run log survive the process they were made in.
+func TestJobsRoundTripThroughTheFile(t *testing.T) {
+	s, path := tempStore(t)
+	s.SetJobs([]JobEntry{
+		{Kind: "extract", Repo: "/r", Label: "Extract · r", Cost: "metered",
+			Status: "queued", Held: true, Argv: []string{"graphify", "extract"}, Dir: "/r"},
+		{Kind: "update", Repo: "/r", Status: "failed", Exit: 2,
+			Error: "boom", Log: "traceback\n", Argv: []string{"graphify", "update"}},
+	})
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	got := Open(path).Jobs()
+	if len(got) != 2 {
+		t.Fatalf("reloaded %d jobs, want 2", len(got))
+	}
+	if got[0].Status != "queued" || !got[0].Held || got[0].Dir != "/r" {
+		t.Fatalf("the queued job came back wrong: %+v", got[0])
+	}
+	if got[1].Log != "traceback\n" || got[1].Exit != 2 {
+		t.Fatalf("the failed job lost its log or its exit code: %+v", got[1])
+	}
+}
+
+// A file written before jobs survived a restart keeps its run log.
+func TestLegacyHistoryIsMigrated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	legacy := `{"version":1,"history":[{"kind":"update","repo":"/r","status":"ok","exit":0,"duration_seconds":12}]}`
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := Open(path)
+	jobs := s.Jobs()
+	if len(jobs) != 1 || jobs[0].Kind != "update" || jobs[0].Status != "ok" {
+		t.Fatalf("legacy history did not migrate: %+v", jobs)
+	}
+	if h := s.History(); len(h) != 1 || h[0].Duration != 12 {
+		t.Fatalf("the migrated duration was lost: %+v", h)
+	}
+	// And it is written back under the new key only, so the two lists can
+	// never disagree about what ran.
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"history"`) {
+		t.Fatal("the legacy history key was written back")
 	}
 }
 
@@ -305,5 +379,141 @@ func TestDriftBaselineRoundTrip(t *testing.T) {
 	}
 	if got := Open(path).DriftBaseline("/repo/a"); len(got.Added) != 0 || len(got.Removed) != 0 {
 		t.Fatalf("an empty baseline was stored rather than deleted: %+v", got)
+	}
+}
+
+// Auto-fix is on by default, and — the part that actually matters — a state
+// file written before it existed reads back as on rather than as a deliberate
+// "no". That is the whole reason the two switches are stored inverted, and it
+// is the one property of the encoding worth a test.
+func TestAutoFixDefaultsOnForAStateFileThatPredatesIt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"settings":{"depth":3}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	set := Open(path).Settings()
+	if !set.AutoFix() {
+		t.Error("auto-fix should be on for a state file that never heard of it")
+	}
+	if !set.AutoFixLocal() {
+		t.Error("the local-model half should be on too — it is what makes the loop free")
+	}
+	if set.AutoFixMetered {
+		t.Error("spending must never be on by default")
+	}
+	if !Defaults().AutoFix() || Defaults().AutoFixMetered {
+		t.Error("Defaults() disagrees with the zero value, which is the one thing it may not do")
+	}
+}
+
+// Turning it off survives a round trip: the inversion has to work in both
+// directions or "off" quietly becomes "on" at the next launch.
+func TestAutoFixOffRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	st := Open(path)
+	s := st.Settings()
+	s.NoAutoFix = true
+	s.AutoFixMax = 5
+	st.SetSettings(s)
+	if err := st.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := Open(path).Settings()
+	if got.AutoFix() {
+		t.Error("auto-fix came back on after being turned off")
+	}
+	if got.AutoFixMax != 5 {
+		t.Errorf("AutoFixMax = %d, want 5", got.AutoFixMax)
+	}
+}
+
+// A migrated history entry never carried a label, and the board draws a job
+// by its label: without one it arrives as a nameless row.
+func TestMigratedHistoryGetsALabel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	legacy := `{"version":1,"history":[{"kind":"update","repo":"/src/nexus","status":"ok","exit":0,"duration_seconds":12}]}`
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	jobs := Open(path).Jobs()
+	if len(jobs) != 1 {
+		t.Fatalf("migrated %d jobs, want 1", len(jobs))
+	}
+	if jobs[0].Label == "" {
+		t.Fatal("the migrated job has no label — it draws as a blank row")
+	}
+	if !strings.Contains(jobs[0].Label, "nexus") {
+		t.Fatalf("label %q does not name the checkout it ran against", jobs[0].Label)
+	}
+}
+
+// The negative control: an entry that DOES carry a label keeps its own, rather
+// than having the rebuilt one written over it.
+func TestRecordedJobLabelIsNotRewritten(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	saved := `{"version":1,"jobs":[{"kind":"update","repo":"/src/nexus","label":"Fix 2/7 · nexus","argv":["graphify"],"status":"ok"}]}`
+	if err := os.WriteFile(path, []byte(saved), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	jobs := Open(path).Jobs()
+	if len(jobs) != 1 || jobs[0].Label != "Fix 2/7 · nexus" {
+		t.Fatalf("a recorded label was not kept: %+v", jobs)
+	}
+}
+
+// The board must read from the directory its jobs write to. These used to be
+// two resolvers — the UI applied flag precedence to the scan, OutSpec read the
+// stored settings alone — so `-out-base` made the board read one place and
+// every job it launched write another. A run under that split reported 27
+// graphed repositories as ungraphed and re-extracted them into their own
+// checkouts.
+func TestOutLocationIsTheOnlyResolver(t *testing.T) {
+	s, _ := tempStore(t)
+	set := s.Settings()
+	set.OutBase = "/stored/knowledge"
+	s.SetSettings(set)
+
+	// No flag: the stored preference wins over the built-in default.
+	if _, base := s.OutLocation(); base != "/stored/knowledge" {
+		t.Errorf("base = %q, want the stored one", base)
+	}
+
+	// A flag outranks it — and OutSpec, which is what every job's
+	// GRAPHIFY_OUT is built from, must agree.
+	s.SetOutOverride("", false, "/flag/knowledge", true)
+	_, base := s.OutLocation()
+	if base != "/flag/knowledge" {
+		t.Errorf("base = %q, want the flag", base)
+	}
+	if spec := s.OutSpec("/repo/x"); spec.Base != base {
+		t.Errorf("OutSpec.Base = %q but OutLocation says %q — the read and write "+
+			"locations have come apart again", spec.Base, base)
+	}
+
+	// The job's environment is the thing that actually writes, so it is
+	// asserted directly rather than inferred from the spec.
+	if got := s.Overlay("/repo/x")["GRAPHIFY_OUT"]; got == "" ||
+		!strings.HasPrefix(got, "/flag/knowledge") {
+		t.Errorf("GRAPHIFY_OUT = %q, want it under the flag's base", got)
+	}
+
+	// An explicitly-empty flag is a choice: it means the checkout's own
+	// directory, and must not fall back to the stored value.
+	s.SetOutOverride("", false, "", true)
+	if _, base := s.OutLocation(); base != "" {
+		t.Errorf("base = %q, want empty — the flag said so", base)
+	}
+
+	// Nothing about the flags is persisted: a launch option must not become a
+	// saved preference that outlives the launch.
+	if got := s.Settings().OutBase; got != "/stored/knowledge" {
+		t.Errorf("stored OutBase = %q — a flag leaked into the settings", got)
 	}
 }

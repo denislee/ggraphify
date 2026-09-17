@@ -23,8 +23,10 @@ import (
 //
 // It also carries the one piece of good news the rest of the settings page
 // cannot give: against a local model the metered commands are not metered.
-// The lane still serializes them, because a local model is slow and graphify
-// forces one request at a time for ollama, but the bill is zero.
+// They are still slow — the metered lane runs one at a time, and a run is
+// bounded by how many requests the server answers at once — but the bill is
+// zero, and the slot count is on the server row so that the second of those
+// two is a number the user can change rather than a fact they must accept.
 
 func (a *App) settingsLocal() *adw.PreferencesGroup {
 	g := adw.NewPreferencesGroup()
@@ -165,6 +167,37 @@ func (a *App) fillLocalLLM(ollama, compat gfy.LocalProbe, model string) {
 			sub += ", binary at " + bin
 		}
 		sub += ". Requests are free and never leave this machine."
+		// The context slot, whenever a model is loaded and it could be
+		// measured. It belongs on this row rather than in a tooltip because it
+		// is the one property of a local server that decides whether an
+		// extraction produces a graph or produces prose.
+		if ollama.Ctx > 0 {
+			sub += " Serving " + ollama.CtxModel + " in a " + gfy.Itoa(ollama.Ctx) +
+				"-token context"
+			if ollama.CtxMax > 0 {
+				sub += " of a possible " + gfy.Itoa(ollama.CtxMax)
+			}
+			sub += "."
+		}
+		// And how many of those requests it takes at once, which is the
+		// difference between an extraction that uses this machine and one that
+		// uses a corner of it. It sits next to the context slot because the
+		// two are one setting in practice: ollama divides the configured
+		// context across the slots.
+		if ollama.Slots > 0 {
+			sub += " Answering " + plural(ollama.Slots, "request", "requests") +
+				" at a time (" + ollama.SlotsWhy + ")"
+			if n := gfy.LocalConcurrency(gfy.OllamaBackend); n > 1 {
+				sub += ", so the board sends " + gfy.Itoa(n) + " chunks at once"
+			}
+			sub += "."
+		}
+		if adv := ollama.ContextAdvice(); adv != "" {
+			sub += " ⚠ " + adv
+		}
+		if adv := ollama.ThroughputAdvice(); adv != "" {
+			sub += " ⚡ " + adv
+		}
 		a.localServerRow.SetSubtitle(escapeMarkup(sub))
 		a.localStartBtn.SetVisible(false)
 	case bin != "":
@@ -262,8 +295,8 @@ func (a *App) startOllama() {
 	}()
 }
 
-// The board-wide local extraction: force a full LLM extraction, against the
-// model on this machine, on every repository the board knows about.
+// The local extraction sweep: force a full LLM extraction, against the model on
+// this machine, on every repository currently listed on the board.
 //
 // It exists because the local backend changes what a fan-out over a hundred
 // checkouts *means*. Against an API key this is the single most expensive
@@ -280,6 +313,13 @@ func (a *App) startOllama() {
 // local backend charges nothing for it. The free Fix sweep (Ctrl+H) plans the
 // minimum command each row actually needs and remains the right first choice;
 // this one is for "redo everything, I do not care what it costs in time".
+//
+// What bounds it is the board's own listing. It takes visibleRows — what the
+// folder filter, the state filter and the search box currently admit, in sort
+// order — and not every checkout on the machine. That is what makes a sweep
+// this heavy usable at all: narrow the board to one folder and the sweep is
+// that folder, with the count in the confirm to prove it. With no filter set
+// the listing IS the whole board, so "everything" remains one Esc away.
 //
 // Two exclusions survive, and both are the user's own instruction rather than
 // a judgement about state:
@@ -312,9 +352,15 @@ func (a *App) actExtractLocalAll() {
 		return
 	}
 
+	listed := a.visibleRows()
+	if len(listed) == 0 {
+		a.toast("nothing is listed — clear the filter first")
+		return
+	}
+
 	var rows []board.Row
 	var running, excluded int
-	for _, r := range a.allRows() {
+	for _, r := range listed {
 		// One read of the job table per row: jobFor takes the lock, and asking
 		// it twice in one switch would both cost double and let the answer
 		// change between the two arms.
@@ -329,12 +375,27 @@ func (a *App) actExtractLocalAll() {
 		}
 	}
 	if len(rows) == 0 {
-		a.toastf("nothing to extract: %d running, %d kept out of batches", running, excluded)
+		a.toastf("nothing to extract in %s: %d running, %d kept out of batches",
+			a.sweepScopeName(), running, excluded)
 		return
 	}
 
-	applog.Infof("local sweep: forced extract on all %d repositories (%d running, %d excluded) — backend %s, model %s",
-		len(rows), running, excluded, backend, gfy.LocalModel(backend, model))
+	applog.Infof("local sweep over %s: forced extract on %d of %d listed repositories (%d running, %d excluded) — backend %s, model %s",
+		a.sweepScopeName(), len(rows), len(listed), running, excluded, backend, gfy.LocalModel(backend, model))
+	// Worth one line in the log at the top of a sweep that will run for hours:
+	// a stock 4096-token slot is why every chunk of the last one came back as
+	// prose, and the number the board is about to cap chunks at is the reason
+	// this one will not. The cap bounds a chunk the packer builds and not a
+	// file it cannot split, so on a narrow slot the advice below is a warning
+	// about files that will go missing, not about speed.
+	if p := gfy.ProbeLocal(backend); p.Ctx > 0 {
+		applog.Infof("local sweep chunk budget: %d-token context slot on %s, --token-budget %d",
+			p.Ctx, p.CtxModel, gfy.LocalTokenBudget(backend))
+		if adv := p.ContextAdvice(); adv != "" {
+			applog.Infof("local sweep: %s", adv)
+			a.toast("narrow context slot — files larger than the chunk cap will be dropped; see the log")
+		}
+	}
 
 	a.run("extract", rows, func(p *gfy.Params) {
 		p.Backend = backend
@@ -346,4 +407,16 @@ func (a *App) actExtractLocalAll() {
 		// overwrite a graph.json whose rebuild came out smaller.
 		p.Force = true
 	})
+}
+
+// sweepScopeName says what the sweep is currently bounded to, for the log and
+// the toasts. The folder filter is the one people set deliberately and the one
+// they forget, so it is named; a search or state filter narrowing the listing
+// further is reported as "the current listing" rather than quoted back, since
+// the confirm dialog lists the repositories by name anyway.
+func (a *App) sweepScopeName() string {
+	if a.groupID == "" {
+		return "the whole board"
+	}
+	return board.Tilde(a.groupID)
 }

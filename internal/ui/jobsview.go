@@ -24,6 +24,17 @@ type jobsView struct {
 	rows    []jobs.Snapshot
 	sel     uint64
 	lastGen uint64
+	// stopAll is held because its label carries the count of what it would
+	// stop. A button that says "Stop all" over an empty queue and a button
+	// that says it over 290 running jobs are different promises, and the
+	// second is the one somebody is looking for in a hurry.
+	stopAll *gtk.Button
+	// start releases held jobs — the queue a restart brought back, waiting
+	// for the click it never got. Two buttons rather than one because the two
+	// answers are different questions: "run this one" is the row you are
+	// looking at, and "run the lot" is the sweep you started yesterday.
+	start    *gtk.Button
+	startAll *gtk.Button
 	// bars is the progress bar of each listed job, by job id. The list is
 	// rebuilt on a transition, so the tick needs a handle on the widgets it
 	// repaints between rebuilds.
@@ -76,6 +87,18 @@ func (a *App) showJobs() {
 			a.togglePause(v.sel)
 		}
 	})
+	v.start = gtk.NewButtonWithLabel("Start")
+	v.start.AddCSSClass("suggested-action")
+	v.start.SetTooltipText("Run this job now. It was restored from a previous session and " +
+		"is being held because it costs something — an LLM bill, or hours of this machine.")
+	v.start.ConnectClicked(func() {
+		s := v.selected()
+		if s == nil || !a.runner.Release(s.ID) {
+			return
+		}
+		a.toastf("started %s", s.Label)
+		v.reload()
+	})
 	retry := gtk.NewButtonWithLabel("Retry")
 	retry.AddCSSClass("flat")
 	retry.ConnectClicked(func() { v.retry() })
@@ -95,6 +118,7 @@ func (a *App) showJobs() {
 	bar.SetMarginBottom(8)
 	v.head.SetHExpand(true)
 	bar.Append(v.head)
+	bar.Append(v.start)
 	bar.Append(copyCmd)
 	bar.Append(retry)
 	bar.Append(v.pause)
@@ -122,10 +146,37 @@ func (a *App) showJobs() {
 	paned.SetVExpand(true)
 
 	header := adw.NewHeaderBar()
-	cancelAll := gtk.NewButtonWithLabel("Cancel all")
-	cancelAll.AddCSSClass("destructive-action")
-	cancelAll.ConnectClicked(func() { a.runner.CancelAll() })
-	header.PackEnd(cancelAll)
+	// Stop all is deliberately NOT behind a confirm, unlike every other
+	// destructive control in this application. The gates elsewhere stand
+	// between a click and work starting; this one stops work already running,
+	// which is the recoverable direction — every job it kills can simply be
+	// run again. Friction here would be friction in the one moment somebody
+	// needs it immediately, having just started a sweep over the whole board.
+	v.stopAll = gtk.NewButtonWithLabel("Stop all")
+	v.stopAll.AddCSSClass("destructive-action")
+	v.stopAll.SetTooltipText("Cancel every running and queued job, across every repository. " +
+		"Nothing is lost that cannot be re-run.")
+	v.stopAll.ConnectClicked(func() {
+		queued, running := a.runner.Active()
+		a.runner.CancelAll()
+		a.toastf("stopped %s", plural(queued+running, "job", "jobs"))
+		v.reload()
+	})
+	header.PackEnd(v.stopAll)
+
+	// Unlike Stop all, this one starts work, so it says exactly how much and
+	// disappears when the answer is none. It is the counterpart of the toast
+	// the board shows at launch: the held queue in one click.
+	v.startAll = gtk.NewButtonWithLabel("Start all held")
+	v.startAll.AddCSSClass("suggested-action")
+	v.startAll.SetTooltipText("Release every held job at once. The lane limits still apply — " +
+		"metered jobs run one at a time, as they always do.")
+	v.startAll.ConnectClicked(func() {
+		n := a.runner.ReleaseAll()
+		a.toastf("started %s", plural(n, "held job", "held jobs"))
+		v.reload()
+	})
+	header.PackEnd(v.startAll)
 
 	toolbar := adw.NewToolbarView()
 	toolbar.AddTopBar(header)
@@ -179,6 +230,42 @@ func (v *jobsView) reload() {
 		v.list.SelectRow(v.list.RowAtIndex(0))
 	}
 	v.showSelected()
+	v.refreshStopAll()
+	v.refreshStart()
+}
+
+// refreshStart keeps both start buttons on the actual queue: the per-job one is
+// visible only when the selected job is one that can be started, and the
+// header one names how many are waiting and hides itself when none are.
+func (v *jobsView) refreshStart() {
+	if v.start != nil {
+		s := v.selected()
+		v.start.SetVisible(s != nil && s.Status == jobs.Queued && s.Held)
+	}
+	if v.startAll == nil {
+		return
+	}
+	n := v.a.runner.HeldCount()
+	v.startAll.SetVisible(n > 0)
+	v.startAll.SetLabel("Start all held (" + gfy.Itoa(n) + ")")
+}
+
+// refreshStopAll keeps the button's label and sensitivity on the actual queue:
+// it names the number it would stop, and it is insensitive when that number is
+// zero rather than being a live button that does nothing.
+func (v *jobsView) refreshStopAll() {
+	if v.stopAll == nil {
+		return
+	}
+	queued, running := v.a.runner.Active()
+	n := queued + running
+	if n == 0 {
+		v.stopAll.SetLabel("Stop all")
+		v.stopAll.SetSensitive(false)
+		return
+	}
+	v.stopAll.SetLabel("Stop all (" + gfy.Itoa(n) + ")")
+	v.stopAll.SetSensitive(true)
 }
 
 func (v *jobsView) jobRow(s jobs.Snapshot) *gtk.ListBoxRow {
@@ -232,10 +319,17 @@ func (v *jobsView) showSelected() {
 	v.head.SetText(jobHeadline(s) + "\n" + s.Command())
 	v.log.Buffer().SetText(s.Log.String())
 	v.lastGen = s.Log.Gen()
+	v.refreshStart()
 }
 
 // tick refreshes the selected job's log when it has moved, and nothing else.
 func (v *jobsView) tick() {
+	// Before the early return below: the count on Stop all has to keep up with
+	// a draining queue even when nothing is selected, which is exactly the
+	// state a finished sweep leaves the dialog in.
+	v.refreshStopAll()
+	v.refreshStart()
+
 	s := v.selected()
 	if s == nil {
 		return
@@ -266,8 +360,14 @@ func (v *jobsView) retry() {
 	v.a.runner.Submit(&jobs.Job{
 		Kind: s.Kind, Repo: s.Repo, Label: s.Label, Cost: s.Cost,
 		Argv: s.Argv,
+		// The identical argv still carries the --max-concurrency the original
+		// run was sized with, so the overlay that makes graphify honour it has
+		// to be rebuilt here too. A retry that dropped it would quietly run
+		// serially and look like the first attempt having been slow.
 		Env: gfy.ClaudeAccountEnv(
-			gfy.ClaudeCLIEnv(gfy.JobEnv(v.a.opts.Store.Overlay(s.Repo)), gfy.ArgvBackend(s.Argv)),
+			gfy.ClaudeCLIEnv(
+				gfy.LocalEnv(gfy.JobEnv(v.a.opts.Store.Overlay(s.Repo)), gfy.ArgvBackend(s.Argv)),
+				gfy.ArgvBackend(s.Argv)),
 			v.a.opts.Store.Settings().ClaudeAccount),
 		Dir: s.Repo,
 	})

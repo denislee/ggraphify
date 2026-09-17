@@ -64,6 +64,12 @@ type Summary struct {
 	Accounts []Count
 	// Repos is the busiest checkouts, by event, keyed by working directory.
 	Repos []Count
+	// RepoSplit is the same checkouts broken down by tool, and — separately —
+	// by how often each tool's hook fired there. The split is what turns
+	// "this directory is busy" into the question worth asking: an agent that
+	// was told about graft in a hundred sessions and reached for it in three
+	// is a different problem from one that was never told at all.
+	RepoSplit map[string]RepoSplit
 	// Sessions is how many distinct agent sessions touched either tool.
 	Sessions int
 
@@ -77,6 +83,19 @@ type Summary struct {
 
 	Series []DayPoint
 }
+
+// RepoSplit is one checkout's usage, by tool, with the hook injections kept
+// apart from the uses for the same reason Summary keeps them apart.
+type RepoSplit struct {
+	Graphify, Graft           int
+	GraphifyHooks, GraftHooks int
+}
+
+// Uses is both tools' real invocations, hooks excluded.
+func (r RepoSplit) Uses() int { return r.Graphify + r.Graft }
+
+// Hooks is both integrations' injections.
+func (r RepoSplit) Hooks() int { return r.GraphifyHooks + r.GraftHooks }
 
 // Mix is the share of reads that went through graft rather than straight to
 // the source, in percent, and whether there were any reads at all to divide.
@@ -98,7 +117,7 @@ func (x *Index) Summarize(w Window) Summary {
 	s := Summary{
 		From: from, To: now, Days: days,
 		ByTool: map[Tool]int{}, HookByTool: map[Tool]int{}, ByKind: map[Kind]int{},
-		Verbs: map[Tool][]Count{},
+		Verbs: map[Tool][]Count{}, RepoSplit: map[string]RepoSplit{},
 	}
 
 	verbs := map[Tool]map[string]int{Graphify: {}, Graft: {}}
@@ -125,15 +144,27 @@ func (x *Index) Summarize(w Window) Summary {
 				tool, kind, verb := splitCounter(ck)
 				verbs[tool][verb] += n
 				s.ByKind[kind] += n
+				split := s.RepoSplit[cwd]
 				if kind == Hook {
 					s.Hooks += n
 					s.HookByTool[tool] += n
+					if tool == Graft {
+						split.GraftHooks += n
+					} else {
+						split.GraphifyHooks += n
+					}
 				} else {
 					s.Events += n
 					s.ByTool[tool] += n
 					repos[cwd] += n
 					points[key].add(tool, n)
+					if tool == Graft {
+						split.Graft += n
+					} else {
+						split.Graphify += n
+					}
 				}
+				s.RepoSplit[cwd] = split
 			}
 			for acct, n := range rd.Accounts {
 				accounts[acct] += n

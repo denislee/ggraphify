@@ -179,7 +179,7 @@ func TestCancelDropsAQueuedJob(t *testing.T) {
 func TestMeteredLaneDefaultsToOne(t *testing.T) {
 	r := New(Options{MeteredLanes: 0})
 	defer r.Close()
-	if _, m := r.Lanes(); m != 1 {
+	if _, m, _ := r.Lanes(); m != 1 {
 		t.Fatalf("metered lanes = %d, want 1", m)
 	}
 }
@@ -509,7 +509,7 @@ func TestElapsedExcludesPausedTime(t *testing.T) {
 	if !r.Resume(job.ID) {
 		t.Fatal("Resume reported no change")
 	}
-	if held := snapOf(t, r, job.ID).Held; held < 500*time.Millisecond {
+	if held := snapOf(t, r, job.ID).PausedFor; held < 500*time.Millisecond {
 		t.Fatalf("Held = %s, want at least the time it was paused", held)
 	}
 
@@ -593,4 +593,172 @@ func countLines(t *testing.T, path string) int {
 		t.Fatal(err)
 	}
 	return strings.Count(string(b), "\n")
+}
+
+// The ollama concurrency unlock has to be composed by SubmitCmd, not by the
+// GUI, because ggraphify-job submits through here too. Without it graphify
+// clamps itself back to one chunk and the --max-concurrency already in the
+// argv is silently discarded — a run that looks parallel everywhere except in
+// how long it takes.
+func TestOllamaParallelUnlockReachesTheSubprocess(t *testing.T) {
+	fakeGraphify(t, `echo "PARALLEL=$GRAPHIFY_OLLAMA_PARALLEL"`)
+	t.Setenv(gfy.OllamaSlotsVar, "2")
+	t.Setenv(gfy.OllamaHostVar, "")
+	gfy.InvalidateLocalProbe()
+	t.Cleanup(gfy.InvalidateLocalProbe)
+
+	r := New(Options{})
+	defer r.Close()
+	repo := repoDir(t)
+	job, _ := r.SubmitCmd("update", repo, "Update",
+		gfy.Params{Repo: repo, Backend: gfy.OllamaBackend}, nil)
+	wait(t, r, job.ID)
+
+	if out := job.Log.String(); !strings.Contains(out, "PARALLEL=1") {
+		t.Errorf("graphify would clamp itself back to one chunk:\n%s", out)
+	}
+}
+
+// And a metered backend never sees it: the variable is meaningless there, and
+// an environment that carries settings for a backend it is not using is how a
+// confirm dialog comes to show something that will not happen.
+func TestOllamaParallelUnlockIsNotAppliedToAMeteredBackend(t *testing.T) {
+	fakeGraphify(t, `echo "PARALLEL=$GRAPHIFY_OLLAMA_PARALLEL"`)
+	t.Setenv(gfy.OllamaSlotsVar, "2")
+	gfy.InvalidateLocalProbe()
+	t.Cleanup(gfy.InvalidateLocalProbe)
+
+	r := New(Options{})
+	defer r.Close()
+	repo := repoDir(t)
+	job, _ := r.SubmitCmd("update", repo, "Update",
+		gfy.Params{Repo: repo, Backend: gfy.ClaudeCLIBackend}, nil)
+	wait(t, r, job.ID)
+
+	if out := job.Log.String(); !strings.Contains(out, "PARALLEL=\n") {
+		t.Errorf("a claude-cli job carried an ollama variable:\n%s", out)
+	}
+}
+
+// peakConcurrency runs three metered jobs of the given backend and reports how
+// many were ever in flight at once, by the same shell counter
+// TestMeteredJobsAreSerialized uses.
+func peakConcurrency(t *testing.T, opts Options, backend string) int32 {
+	t.Helper()
+	dir := t.TempDir()
+	// One file per running job, created on entry and removed on exit, so the
+	// count is the number of entries in the directory. The obvious
+	// alternative — a single counter file incremented and decremented by the
+	// shell — is a read-modify-write with no locking, and the moment jobs
+	// genuinely overlap it loses updates and goes negative. Which is the one
+	// condition this helper exists to measure, so it cannot use that.
+	fakeGraphify(t, `
+: > `+dir+`/$$
+sleep 0.4
+rm -f `+dir+`/$$
+`)
+	r := New(opts)
+	defer r.Close()
+
+	for _, repo := range []string{repoDir(t), repoDir(t), repoDir(t)} {
+		if _, err := r.SubmitCmd("extract", repo, "Extract "+repo,
+			gfy.Params{Repo: repo, Backend: backend}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Drained by polling Active rather than by wait(), which is only correct
+	// for jobs that finish in the order they were submitted: it discards every
+	// event that is not the one id it was asked for, so the moment two jobs
+	// really do run at once it throws away the completion of one of them and
+	// then blocks forever waiting for it. Which is the whole subject of this
+	// helper, so it cannot use that one.
+	var maxSeen int32
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if ents, err := os.ReadDir(dir); err == nil {
+			if v := int32(len(ents)); v > maxSeen {
+				maxSeen = v
+			}
+		}
+		if q, running := r.Active(); q == 0 && running == 0 {
+			return maxSeen
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("jobs never drained")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The whole point of the local lane: extraction against a model on this machine
+// runs several jobs at once, because there is no bill to parallelize — while
+// the identical command against a billed backend stays serialized on the very
+// same runner. Asserting only the first half would pass just as well if the
+// local lane had simply raised the metered one, which is the mistake this
+// separation exists to make impossible.
+func TestLocalJobsRunInParallelWhileMeteredStaySerialized(t *testing.T) {
+	t.Setenv(gfy.OllamaHostVar, "")
+	t.Setenv(gfy.OllamaBaseURLVar, "")
+
+	opts := Options{FreeLanes: 8, MeteredLanes: 1, LocalLanes: 3}
+	if got := peakConcurrency(t, opts, gfy.OllamaBackend); got < 2 {
+		t.Errorf("local jobs peaked at %d in flight; the local lane is not being used", got)
+	}
+	if got := peakConcurrency(t, opts, gfy.ClaudeCLIBackend); got > 1 {
+		t.Errorf("%d billed jobs ran at once — the local lane must not lift the metered one", got)
+	}
+}
+
+// And the local lane is bounded by its own setting, not unbounded: a board set
+// to two must not run three, however many local jobs are queued.
+func TestLocalLaneIsBounded(t *testing.T) {
+	t.Setenv(gfy.OllamaHostVar, "")
+	t.Setenv(gfy.OllamaBaseURLVar, "")
+
+	opts := Options{FreeLanes: 8, MeteredLanes: 1, LocalLanes: 2}
+	if got := peakConcurrency(t, opts, gfy.OllamaBackend); got > 2 {
+		t.Errorf("%d local jobs ran at once with LocalLanes=2", got)
+	}
+}
+
+// A caller that passed no local lane count gets the default, never zero —
+// which would be a lane nothing can ever enter.
+func TestLocalLaneDefaults(t *testing.T) {
+	r := New(Options{})
+	defer r.Close()
+	if _, _, l := r.Lanes(); l != DefaultLocalLanes {
+		t.Fatalf("local lanes = %d, want %d", l, DefaultLocalLanes)
+	}
+}
+
+// Close used to close the events channel while a finishing job was still
+// inside emit: emit checked r.closed and then sent, and Close could land
+// between the two. The wg covers loop() alone, so the per-job goroutines
+// outlive it. In production that is a "send on closed channel" panic on quit
+// — the whole GUI, taken down by closing the window at the instant a job
+// finished.
+func TestCloseDoesNotRaceAFinishingJobsEvent(t *testing.T) {
+	fakeGraphify(t, "")
+	for i := 0; i < 60; i++ {
+		r := New(Options{FreeLanes: 8, MeteredLanes: 1, LocalLanes: 3, History: 16})
+		for j := 0; j < 6; j++ {
+			repo := repoDir(t)
+			if _, err := r.SubmitCmd("extract", repo, "Extract "+repo,
+				gfy.Params{Repo: repo}, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// Drain, so emit takes the send path rather than the full-buffer one.
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for range r.Events() {
+			}
+		}()
+		// Close while the jobs are mid-flight: the window is exactly here.
+		time.Sleep(time.Duration(i%4) * time.Millisecond)
+		r.Close()
+		<-done
+	}
 }

@@ -115,3 +115,57 @@ func TestConcurrentWriteAndRead(t *testing.T) {
 		t.Fatalf("Len = %d", b.Len())
 	}
 }
+
+// TailBytes is the sidecar's budget: bytes, not lines. Tail(8<<10) silently
+// returned the entire buffer, which is how a bounded sidecar field stopped
+// being bounded.
+func TestTailBytesHonoursAByteBudget(t *testing.T) {
+	b := New(0)
+	for i := 0; i < 5000; i++ {
+		b.WriteString("this is a fairly ordinary log line of output\n")
+	}
+	got := b.TailBytes(8 << 10)
+	if len(got) > 8<<10 {
+		t.Errorf("TailBytes(8192) returned %d bytes, over budget", len(got))
+	}
+	if len(got) == 0 {
+		t.Fatal("TailBytes returned nothing")
+	}
+	if got[0] == '\n' || !strings.HasSuffix(got, "\n") {
+		t.Error("TailBytes must start at a line boundary and keep the final newline")
+	}
+	// It has to be the END of the log, not the start.
+	if !strings.HasPrefix(got, "this is") {
+		t.Errorf("unexpected first line %q", got[:20])
+	}
+}
+
+func TestTailBytesReturnsAllOfAShortBuffer(t *testing.T) {
+	b := New(0)
+	b.WriteString("one\ntwo\n")
+	if got := b.TailBytes(8 << 10); got != "one\ntwo\n" {
+		t.Errorf("TailBytes = %q, want the whole buffer", got)
+	}
+	if got := b.TailBytes(0); got != "" {
+		t.Errorf("TailBytes(0) = %q, want empty", got)
+	}
+}
+
+// LastLine is documented as the final NON-EMPTY line; a trailing blank line
+// used to reduce a failed job's badge to nothing.
+func TestLastLineSkipsTrailingBlankLines(t *testing.T) {
+	b := New(0)
+	b.WriteString("[graphify watch] No code files found - nothing to rebuild.\n   \n\n")
+	want := "[graphify watch] No code files found - nothing to rebuild."
+	if got := b.LastLine(); got != want {
+		t.Errorf("LastLine() = %q, want %q", got, want)
+	}
+}
+
+func TestLastLineOfAnAllBlankBufferIsEmpty(t *testing.T) {
+	b := New(0)
+	b.WriteString("  \n\t\n\n")
+	if got := b.LastLine(); got != "" {
+		t.Errorf("LastLine() = %q, want empty", got)
+	}
+}

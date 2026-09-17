@@ -87,6 +87,33 @@ func (b *Buf) String() string {
 	return sb.String()
 }
 
+// TailBytes returns at most n bytes from the end, cut at a line boundary so
+// the result never begins mid-line.
+//
+// It is Tail's counterpart for a caller with a byte budget rather than a line
+// count — the sidecar, which is sizing a JSON field and has no opinion about
+// how many lines fit in it. Passing a byte budget to Tail instead is a silent
+// no-op: 8192 lines is the whole buffer several times over.
+func (b *Buf) TailBytes(n int) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n <= 0 || len(b.buf) == 0 {
+		return ""
+	}
+	if len(b.buf) <= n {
+		return string(b.buf)
+	}
+	cut := len(b.buf) - n
+	// Advance to just past the next newline, so the tail starts at a line
+	// boundary. If the final n bytes hold no newline at all the tail is one
+	// partial enormous line; returning it verbatim is better than returning
+	// nothing, and it is already within budget.
+	if i := bytes.IndexByte(b.buf[cut:], '\n'); i >= 0 {
+		cut += i + 1
+	}
+	return string(b.buf[cut:])
+}
+
 // Tail returns at most n lines from the end. The UI's steady-state render.
 func (b *Buf) Tail(n int) string {
 	b.mu.Lock()
@@ -116,11 +143,23 @@ func (b *Buf) Tail(n int) string {
 func (b *Buf) LastLine() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// Walk back over blank and whitespace-only lines rather than stopping at
+	// the last one. A subprocess that signs off with a trailing blank line —
+	// and graphify does, on several paths — would otherwise reduce the badge
+	// to an empty string and hide the very line that says why it failed.
 	s := strings.TrimRight(string(b.buf), "\n")
-	if i := strings.LastIndexByte(s, '\n'); i >= 0 {
-		s = s[i+1:]
+	for s != "" {
+		line := s
+		if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+			line, s = s[i+1:], s[:i]
+		} else {
+			s = ""
+		}
+		if t := strings.TrimSpace(line); t != "" {
+			return t
+		}
 	}
-	return strings.TrimSpace(s)
+	return ""
 }
 
 // Gen is a counter bumped on every write. The UI's render tick compares it
