@@ -94,7 +94,7 @@ func Report(s Summary, recs []Rec, opt ReportOptions) string {
 	reportSessions(&b, opt)
 	reportRecents(&b, opt)
 	reportProvenance(&b, s, opt)
-	reportAsk(&b)
+	reportAsk(&b, opt)
 	return b.String()
 }
 
@@ -437,16 +437,35 @@ func reportProvenance(b *strings.Builder, s Summary, opt ReportOptions) {
 		fmt.Fprintf(b, "- Rollup last brought up to date %s; %d transcript(s) were new on that read.\n",
 			board.Age(opt.LastUpdate), opt.Scanned)
 	}
-	b.WriteString("- The session count includes sessions where only a hook fired, which makes it a " +
-		"fair denominator for any repository the integrations are wired into. It is **not** a count " +
-		"of all Claude Code sessions: a session in a directory with neither tool installed leaves no " +
-		"trace here at all, so a repository's absence is not evidence that it was skipped.\n\n")
+	// Two session counts appear in this report and they are counted
+	// differently. A reader who conflates them draws the opposite conclusion,
+	// so the difference is stated rather than left to be inferred.
+	b.WriteString("- **Two different session counts appear above.** The one in the headline counts only " +
+		"sessions where either tool ran *or* one of their hooks fired. It is the denominator for the " +
+		"hook-to-use ratios and for nothing else.\n")
+	if opt.SessionsTotal > 0 {
+		b.WriteString("- The count in *Every session* is every Claude Code session in the window, read " +
+			"from each account's transcripts whether or not either tool was ever mentioned in it. " +
+			"**That makes an absence from that table meaningful**: a session that ran in a directory " +
+			"is listed even when its share is zero, so a working directory missing from it had no " +
+			"sessions rather than silent ones.\n")
+		b.WriteString("- Its per-session tool-call totals are a byte scan of each transcript rather than " +
+			"a decode, which is what keeps a corpus of gigabytes affordable to read on every tick. " +
+			"The count can fall slightly short of a decoded one and never far over it: read it as a " +
+			"denominator, not as a ledger.\n")
+	} else {
+		b.WriteString("- No per-session data was collected for this report, so nothing here counts the " +
+			"sessions that used neither tool. A repository's absence is therefore not evidence that " +
+			"it was skipped: a session in a directory where neither tool is installed leaves no trace " +
+			"in these numbers at all.\n")
+	}
+	b.WriteByte('\n')
 }
 
 // reportAsk is the part that makes this a prompt rather than a dump: the
 // questions the numbers above are evidence for, spelled out so the agent
 // reading it answers the right one.
-func reportAsk(b *strings.Builder) {
+func reportAsk(b *strings.Builder, opt ReportOptions) {
 	b.WriteString("## What to do with this\n\n")
 	b.WriteString("Judge whether graphify and graft are being reached for at every opportunity, " +
 		"and say where they are not. Specifically:\n\n")
@@ -460,9 +479,22 @@ func reportAsk(b *strings.Builder) {
 	b.WriteString("5. Which of the recommendations above would pay for itself fastest, given the " +
 		"usage each repository already has?\n")
 	b.WriteString("6. Which of the failed calls were a missing index rather than a bad command " +
-		"line — and is any repository failing repeatedly for the same reason?\n\n")
-	b.WriteString("Answer from this report. Do not re-derive the numbers, and do not treat the " +
-		"absence of a repository as evidence of anything — it may simply have had no sessions.\n")
+		"line — and is any repository failing repeatedly for the same reason?\n")
+	if opt.SessionsTotal > 0 {
+		// Only askable with the session table present: before it, a session
+		// that used nothing left no row to notice.
+		b.WriteString("7. Which sessions did substantial work — a high tool-call count — with a zero " +
+			"share, and is the index they ignored one that would have answered?\n")
+	}
+	b.WriteByte('\n')
+	b.WriteString("Answer from this report. Do not re-derive the numbers.")
+	if opt.SessionsTotal > 0 {
+		b.WriteString(" A repository absent from the per-directory tables may still appear in " +
+			"*Every session*; check there before concluding nothing happened in it.\n")
+	} else {
+		b.WriteString(" Do not treat the absence of a repository as evidence of anything — it may " +
+			"simply have had no sessions.\n")
+	}
 }
 
 func kindLine(s Summary) string {

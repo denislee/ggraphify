@@ -70,11 +70,42 @@ func TestReportNamesDirectoriesToldAndNeverUsed(t *testing.T) {
 // inside a wired repository and no denominator at all outside one. A reader
 // who misses that distinction draws the opposite conclusion from the same
 // numbers, so the disclaimer is load-bearing, not decoration.
+// What the report must never do is let its session count be read as a count of
+// all sessions. Which disclaimer is correct depends on whether the per-session
+// data was collected, so both branches are checked: the wrong one is not a
+// wording nit, it tells the reader to distrust a finding that is sound — or to
+// trust one that is not.
 func TestReportRefusesToPoseAsADenominator(t *testing.T) {
 	s, now := reportFixture(t)
+
+	// Without the session table, nothing here has seen a session that used
+	// neither tool, and the report has to say so.
 	out := Report(s, nil, ReportOptions{Now: now})
-	if !strings.Contains(out, "not** a count of all Claude Code sessions") {
+	if !strings.Contains(out, "No per-session data was collected") {
 		t.Errorf("the report does not say what it cannot see:\n%s", out)
+	}
+	if !strings.Contains(out, "absence is therefore not evidence that it was skipped") {
+		t.Errorf("the report does not disclaim a repository's absence:\n%s", out)
+	}
+	if strings.Contains(out, "makes an absence from that table meaningful") {
+		t.Errorf("the report claims a coverage it does not have:\n%s", out)
+	}
+
+	// With it, every session in the window is accounted for, and the opposite
+	// caveat applies: an absence now means something.
+	out = Report(s, nil, ReportOptions{Now: now, SessionsTotal: 40, SessionsUsed: 3})
+	if !strings.Contains(out, "Two different session counts appear above") {
+		t.Errorf("the report does not distinguish its two session counts:\n%s", out)
+	}
+	if !strings.Contains(out, "makes an absence from that table meaningful") {
+		t.Errorf("the report does not say the session table is exhaustive:\n%s", out)
+	}
+	if strings.Contains(out, "No per-session data was collected") {
+		t.Errorf("the report disclaims data it was given:\n%s", out)
+	}
+	// And the byte-scan caveat travels with the number it qualifies.
+	if !strings.Contains(out, "denominator, not as a ledger") {
+		t.Errorf("the tool-call count is presented without its caveat:\n%s", out)
 	}
 }
 

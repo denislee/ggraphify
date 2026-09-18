@@ -363,15 +363,25 @@ panel go; the header and the status line stay.
 This repository | Everything          Watch live   7d 30d 90d   ⟳
 
 269 uses over 30 days, every repository
-239 graphify calls · 30 graft calls · 462 sessions · 41% reads through graft · 1.5M saved
+239 graphify calls · 30 graft calls · 517 sessions (462 used a tool) · 41% reads · 1.5M saved
 
 Every day    graphify  ▁▂▅█▃▁▁▂▄▇█▅▃▂▁▂▃▅█▆▃▂▁▄▇█▅▃▂▁
              graft     ·····························▇
 What was run graphify: query 132 · update 59 · export wiki 6 …
              graft:    ask 8 · grep 4 · skeleton 4 · build 3 …
 Where        135 ~/git/platform-nova-cli · 50 ~/tmp/ggraphify · 2 ~/git (not on the board)
+Every session  last          repository           gfy graft   of all calls account
+             Sep 14 09:38  ggraphify              2    18    37% of 53    default
+             Sep 14 09:31  required-workflows     0     0     0% of 67    default
 Latest       Sep 14 09:38  graphify  god-nodes  ggraphify  default
 ```
+
+**Every session** is one row per Claude Code session, newest first — where it ran, how
+many times it reached for each tool, and what share of everything it did that was. The
+sessions that used *neither* tool are in there too, dimmed: they are the denominator, and
+a list of only the sessions that used something cannot answer *and how many did not*. The
+second row above is the finding the section exists for — sixty-seven tool calls in a
+checkout, not one of them into an index.
 
 ### Worth doing next
 
@@ -414,7 +424,11 @@ halves:
   session id — which is where a `graphify query`, a `/graphify` skill invocation, an MCP
   call into graft's server and a hook injection all come from. **Every login on the
   machine is read**, not just the one jobs run as: which account was paying is an
-  attribute of the usage, not a filter on it.
+  attribute of the usage, not a filter on it. The same pass registers **every session it
+  walks past**, tool or no tool, with its directory, its span and how many tool calls it
+  made in total — which is the only reason the page can say how many sessions ignored both
+  indexes. That census obeys the same budget as the rest: the tool calls are counted with
+  a byte scan and exactly two lines per transcript are handed to the JSON decoder.
 - **graft's own per-session counters**, `<repo>/graft/.cache/session/<id>.json`, which
   carry what a transcript cannot cheaply reconstruct: reads that went through the index
   versus straight to the source files, the tokens that saved, and what the session was
@@ -447,9 +461,10 @@ to judge it is an agent, so the copy icon in the toolbar — or `y` on the page 
 whole window on the clipboard as a **markdown briefing** written to be pasted into a Claude
 Code session: the headline, the two hook-to-use ratios, the per-directory table with
 injections beside uses, the directories that were handed an index and ran nothing, the daily
-series, and the questions worth answering from it. It ends by naming what the data cannot
-see — a session in a directory where neither tool is installed leaves no trace at all, so a
-repository's absence is never evidence it was skipped.
+series, the per-session table, and the questions worth answering from it. It ends by naming
+what each number is and is not — including that its two session counts are counted
+differently, and that the per-session one *is* exhaustive, so a directory absent from that
+table had no sessions rather than silent ones.
 
 `ggraphify-scan -usage -markdown` prints the identical text, rendered by the same function
 in `internal/usage`, for piping into a file or into `wl-copy`.
