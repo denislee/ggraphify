@@ -217,3 +217,38 @@ func TestBaselineIsBounded(t *testing.T) {
 		t.Fatalf("baseline holds %d paths, want the cap of %d", len(b.Added), MaxBaselinePaths)
 	}
 }
+
+// `**/coverage/` is git's "in every directory, the root included" — and the
+// root is the case that matters, because that is where a Flutter checkout keeps
+// its `.pub-cache/` and its `coverage/`. The matcher used to read the leading
+// `**/` as an ordinary anchored path component, which never matched at depth
+// zero: one real repository reported 26 091 added files, every one of them
+// gitignored, which pinned the row to `stale` and made the auto-fix loop give
+// up on drift it could never clear.
+func TestDriftHonoursLeadingDoubleStar(t *testing.T) {
+	f := newFixture(t)
+	f.graphJSON(1, 0, "")
+	f.writeOut(".graphify_labels.json", `{"0":"Real"}`)
+	f.write(".gitignore", "**/coverage/\n**/.pub-cache/\n**/android/app/gen/\n")
+	f.write("a.go", "package a")
+	f.write("coverage/html/index.go", "package h")           // root: the regressed case
+	f.write("modules/x/coverage/html/index.go", "package h") // and still at depth
+	f.write(".pub-cache/hosted/pkg/lib.go", "package lib")
+	f.write("android/app/gen/g.go", "package p")     // multi-segment, at the root
+	f.write("x/y/android/app/gen/g.go", "package p") // and the same at depth
+	f.manifest(map[string]float64{"a.go": future()})
+
+	g, _ := Read(Options{Repo: f.repo})
+	if g.DriftAdded != 0 {
+		t.Fatalf("DriftAdded = %d (%v), want 0 — every one of them is gitignored",
+			g.DriftAdded, g.DriftFiles.Added)
+	}
+
+	// The rule still has to be a rule and not a blanket: a file that matches
+	// nothing counts exactly as before.
+	f.write("real.go", "package r")
+	g, _ = Read(Options{Repo: f.repo})
+	if g.DriftAdded != 1 || g.DriftFiles.Added[0] != "real.go" {
+		t.Fatalf("DriftAdded = %d %v, want [real.go]", g.DriftAdded, g.DriftFiles.Added)
+	}
+}

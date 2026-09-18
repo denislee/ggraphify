@@ -33,6 +33,12 @@ type ignoreRule struct {
 	negate   bool   // a "!" rule: a match re-admits the path
 	dirOnly  bool   // pattern ended in "/"
 	anchored bool   // pattern had an interior or leading "/": match the whole relative path
+	// anyDepth is set for a pattern that began with "**/": git matches it in
+	// every directory INCLUDING the root, so "**/coverage/" has to ignore
+	// "coverage" as well as "a/b/coverage". Treating it as an ordinary
+	// anchored pattern never matched at the root, and the whole of a
+	// gitignored `.pub-cache/` — 23 000 files — read as drift graphify forgot.
+	anyDepth bool
 }
 
 // loadGitIgnore reads repo/.gitignore. A missing or unreadable file yields an
@@ -70,6 +76,16 @@ func parseIgnoreLine(line string) (ignoreRule, bool) {
 		r.dirOnly = true
 		s = strings.TrimSuffix(s, "/")
 	}
+	if strings.HasPrefix(s, "**/") {
+		// git: "**/foo" is "foo in any directory, the root included". Strip
+		// the prefix and let anyDepth carry that meaning; what is left is
+		// matched against every suffix of the path.
+		r.anyDepth = true
+		s = strings.TrimPrefix(s, "**/")
+		for strings.HasPrefix(s, "**/") {
+			s = strings.TrimPrefix(s, "**/")
+		}
+	}
 	if strings.HasPrefix(s, "/") {
 		r.anchored = true
 		s = strings.TrimPrefix(s, "/")
@@ -105,6 +121,18 @@ func (g *gitIgnore) Match(rel string, isDir bool) bool {
 }
 
 func (r ignoreRule) match(rel string) bool {
+	if r.anyDepth {
+		// Every suffix of the path, so "**/a/b" matches "a/b" and "x/a/b",
+		// and the directory-swallowing prefix rule applies at each depth.
+		segs := strings.Split(rel, "/")
+		for i := range segs {
+			rest := strings.Join(segs[i:], "/")
+			if matchPath(r.pattern, rest) || strings.HasPrefix(rest, r.pattern+"/") {
+				return true
+			}
+		}
+		return false
+	}
 	if r.anchored {
 		if matchPath(r.pattern, rel) {
 			return true
