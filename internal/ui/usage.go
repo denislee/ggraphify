@@ -359,6 +359,7 @@ type usagePane struct {
 	verbs    *gtk.Box
 	where    gtk.Widgetter
 	whereBox *gtk.Box
+	sessions *gtk.Box
 	recent   *gtk.Box
 	foot     *gtk.Label
 }
@@ -475,6 +476,7 @@ func (a *App) newUsagePane() *usagePane {
 	p.verbs.SetHomogeneous(true)
 	p.whereBox = gtk.NewBox(gtk.OrientationVertical, 2)
 	p.where = usageSection("Where", p.whereBox)
+	p.sessions = gtk.NewBox(gtk.OrientationVertical, 2)
 	p.recent = gtk.NewBox(gtk.OrientationVertical, 2)
 
 	p.foot = gtk.NewLabel("")
@@ -512,6 +514,10 @@ func (a *App) newUsagePane() *usagePane {
 	body.Append(usageSection("Every day", p.timeline))
 	body.Append(usageSection("What was run", p.verbs))
 	body.Append(p.where)
+	// The sessions sit directly above "Latest", which is the same data one
+	// call at a time: a row here is a whole sitting, and the list under it is
+	// the individual calls those sittings were made of.
+	body.Append(usageSection("Every session", p.sessions))
 	body.Append(usageSection("Latest", p.recent))
 	body.Append(p.foot)
 
@@ -603,7 +609,16 @@ func (p *usagePane) reload() {
 	clearFlow(p.tiles)
 	p.tiles.Append(usageTile(fmt.Sprint(s.ByTool[usage.Graphify]), "graphify calls"))
 	p.tiles.Append(usageTile(fmt.Sprint(s.ByTool[usage.Graft]), "graft calls"))
-	p.tiles.Append(usageTile(fmt.Sprint(s.Sessions), "agent sessions"))
+	// The denominator the rest of the page does not have: every session the
+	// transcripts recorded, not only the ones that touched a tool. A machine
+	// where forty sittings ran and three used graft is the whole finding, and
+	// it is invisible in a count of the three.
+	total, used := p.a.usage.SessionCount(usage.Window{Days: p.days, Repo: repo})
+	if total > used {
+		p.tiles.Append(usageTile(fmt.Sprint(total), fmt.Sprintf("agent sessions — %d used a tool", used)))
+	} else {
+		p.tiles.Append(usageTile(fmt.Sprint(total), "agent sessions"))
+	}
 	if mix, ok := s.Mix(); ok {
 		p.tiles.Append(usageTile(fmt.Sprintf("%d%%", mix), "reads through graft"))
 	} else {
@@ -645,6 +660,8 @@ func (p *usagePane) reload() {
 			p.whereBox.Append(p.a.usageRepoRow(r))
 		}
 	}
+
+	p.fillSessions(repo)
 
 	clearBox(p.recent)
 	events := p.a.usage.Recents(repo, 14)
@@ -842,6 +859,8 @@ func (p *usagePane) copyReport() {
 	s := p.a.usage.Summarize(usage.Window{Days: p.days, Repo: repo})
 	when, scanned := p.a.usage.LastUpdate()
 	rows := p.a.allRows()
+	w := usage.Window{Days: p.days, Repo: repo}
+	total, used := p.a.usage.SessionCount(w)
 	text := usage.Report(s, usage.Recommend(rows, s, 0), usage.ReportOptions{
 		Scope:      repo,
 		Version:    p.a.opts.Version,
@@ -851,6 +870,11 @@ func (p *usagePane) copyReport() {
 		Repos:      repoPaths(rows),
 		Recents:    p.a.usage.Recents(repo, 20),
 		Blocked:    usage.Blockages(rows, s, 0),
+		// A longer list than the pane shows: the report is read by an agent,
+		// which has no scrollbar to get tired of.
+		Sessions:      p.a.usage.SessionRolls(w, 40),
+		SessionsTotal: total,
+		SessionsUsed:  used,
 	})
 	p.a.win.Clipboard().SetText(text)
 	p.a.toastf("copied %s of usage — paste it to an agent and ask where the indexes are being missed",
@@ -1103,6 +1127,111 @@ func (a *App) ownerRow(cwd string) *board.Row {
 		}
 	}
 	return best
+}
+
+// usageSessions is how many sessions the list shows. It is longer than the
+// call list beside it because a session is a coarser thing: fourteen calls can
+// be one sitting, and fourteen sittings are a fortnight of work.
+const usageSessions = 16
+
+// fillSessions repaints the per-session list: every Claude Code session in the
+// window, newest activity first, with how many times it reached for each tool.
+//
+// Sessions that used neither are shown, dimmed, rather than filtered out. They
+// are the denominator — a list of only the sessions that used something cannot
+// answer "and how many did not".
+func (p *usagePane) fillSessions(repo string) {
+	rolls := p.a.usage.SessionRolls(usage.Window{Days: p.days, Repo: repo}, usageSessions)
+
+	clearBox(p.sessions)
+	if len(rolls) == 0 {
+		if repo == "" {
+			p.sessions.Append(dimLabel("No Claude Code session in this window. The list is read from the transcripts of every account on this machine."))
+		} else {
+			p.sessions.Append(dimLabel("No session has run in this repository in this window."))
+		}
+		return
+	}
+	p.sessions.Append(sessionHeader())
+	for _, r := range rolls {
+		p.sessions.Append(usageSessionRow(r))
+	}
+}
+
+// sessionHeader names the columns. It is built here rather than with dimLabel
+// because that one wraps, and a wrapped header over fixed-width columns lines
+// up with nothing.
+func sessionHeader() gtk.Widgetter {
+	l := gtk.NewLabel(fmt.Sprintf("%-12s  %-18s %5s %5s  %13s %s",
+		"last", "repository", "gfy", "graft", "of all calls", "account"))
+	l.SetXAlign(0)
+	l.AddCSSClass("argv")
+	l.AddCSSClass("dim")
+	return l
+}
+
+// usageSessionRow is one session: when it was last active, where it ran, how
+// many times it reached for each tool, and what share of everything it did that
+// was.
+//
+// The share is the column worth having. Two graft calls is a number; two out of
+// four hundred tool calls is a session that worked around the index, and two out
+// of six is one that lived in it.
+func usageSessionRow(r usage.SessionRoll) gtk.Widgetter {
+	where := filepath.Base(r.Repo)
+	if where == "." || where == "" {
+		where = "—"
+	}
+	share := "    —"
+	if pct, ok := r.Share(); ok {
+		share = fmt.Sprintf("%3d%%", pct)
+	}
+	l := gtk.NewLabel(fmt.Sprintf("%-12s  %-18s %5d %5d  %5s of %-5d %s",
+		r.Last.Local().Format("Jan 2 15:04"), ellipsis(where, 18),
+		r.ByTool(usage.Graphify), r.ByTool(usage.Graft),
+		share, r.Tools, ellipsis(r.Account, 12)))
+	l.SetXAlign(0)
+	l.AddCSSClass("argv")
+	if r.Idle() {
+		// It used neither tool. Dimmed rather than dropped: it still counts
+		// against every share on this page.
+		l.AddCSSClass("dim")
+	}
+	if r.Failed() > 0 {
+		l.AddCSSClass("st-broken")
+	}
+	l.SetTooltipText(sessionTip(r))
+	return l
+}
+
+func sessionTip(r usage.SessionRoll) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "session %s\n%s", r.Session, r.Repo)
+	if r.Branch != "" {
+		fmt.Fprintf(&b, "\non %s", r.Branch)
+	}
+	if !r.Start.IsZero() {
+		fmt.Fprintf(&b, "\n%s → %s", r.Start.Local().Format("Jan 2 15:04"), r.Last.Local().Format("15:04"))
+	}
+	fmt.Fprintf(&b, "\n%d tool calls, %d into an index", r.Tools, r.Uses())
+	if h := r.Hooks(); h > 0 {
+		// An integration that fired and was never acted on is the case this
+		// line exists to name.
+		fmt.Fprintf(&b, "\n%d hook injections", h)
+	}
+	if f := r.Failed(); f > 0 {
+		fmt.Fprintf(&b, "\n%d call(s) came back with nothing", f)
+	}
+	if mix, ok := r.Mix(); ok {
+		fmt.Fprintf(&b, "\n%d%% of reads went through graft", mix)
+	}
+	if r.SavedTokens > 0 {
+		fmt.Fprintf(&b, "\n%s tokens saved", shortCount(r.SavedTokens))
+	}
+	if r.CostMicros > 0 {
+		fmt.Fprintf(&b, "\nbilled $%.2f for input", r.CostUSD())
+	}
+	return b.String()
 }
 
 func usageEventRow(e usage.Event) gtk.Widgetter {

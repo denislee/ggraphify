@@ -44,6 +44,16 @@ type ReportOptions struct {
 	Repos []string
 	// Recents is the tail of the event log, newest first. Optional.
 	Recents []Event
+	// Sessions is the per-session rollup, newest activity first — SessionRolls.
+	// Optional. It is passed in rather than derived because Summary is a
+	// per-day rollup and has no session dimension left in it.
+	Sessions []SessionRoll
+	// SessionsTotal and SessionsUsed are Index.SessionCount over the same
+	// window: every session in it, and how many reached for either tool. They
+	// are the pair Sessions is a sample of, so a truncated list still reports
+	// an honest denominator.
+	SessionsTotal int
+	SessionsUsed  int
 	// Blocked is where calls actually failed, worst first — Blockages. It is
 	// passed in rather than derived because it needs the board's rows, which
 	// this package's renderer deliberately does not read.
@@ -81,6 +91,7 @@ func Report(s Summary, recs []Rec, opt ReportOptions) string {
 	reportVerbs(&b, s)
 	reportAccounts(&b, s)
 	reportTimeline(&b, s)
+	reportSessions(&b, opt)
 	reportRecents(&b, opt)
 	reportProvenance(&b, s, opt)
 	reportAsk(&b)
@@ -345,6 +356,51 @@ func reportTimeline(b *strings.Builder, s Summary) {
 	}
 	b.WriteString("```\n\n")
 	fmt.Fprintf(b, "%d of %d days saw neither tool run.\n\n", quiet, s.Days)
+}
+
+// reportSessions is the per-session table: one row per Claude Code session,
+// including the ones that used neither tool.
+//
+// Those rows are the point of the section. Every other number in this report is
+// a count of uses, and a count of uses cannot distinguish a machine where three
+// sessions ran and all three used graft from one where forty ran and three did.
+func reportSessions(b *strings.Builder, opt ReportOptions) {
+	if opt.SessionsTotal == 0 && len(opt.Sessions) == 0 {
+		return
+	}
+	b.WriteString("## Every session\n\n")
+	if opt.SessionsTotal > 0 {
+		fmt.Fprintf(b, "%d Claude Code sessions ran in this window; **%d of them reached for either tool**",
+			opt.SessionsTotal, opt.SessionsUsed)
+		if idle := opt.SessionsTotal - opt.SessionsUsed; idle > 0 {
+			fmt.Fprintf(b, ", and %d did not", idle)
+		}
+		b.WriteString(".\n\n")
+	}
+	if len(opt.Sessions) == 0 {
+		return
+	}
+	b.WriteString("| last active | repository | branch | graphify | graft | tool calls | share | account |\n")
+	b.WriteString("| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |\n")
+	for _, r := range opt.Sessions {
+		share := "—"
+		if pct, ok := r.Share(); ok {
+			share = fmt.Sprintf("%d%%", pct)
+		}
+		branch := r.Branch
+		if branch == "" {
+			branch = "—"
+		}
+		fmt.Fprintf(b, "| %s | %s | %s | %d | %d | %d | %s | %s |\n",
+			r.Last.Format("01-02 15:04"), board.Tilde(r.Repo), branch,
+			r.ByTool(Graphify), r.ByTool(Graft), r.Tools, share, r.Account)
+	}
+	if len(opt.Sessions) < opt.SessionsTotal {
+		fmt.Fprintf(b, "\n(%d most recent of %d.)\n", len(opt.Sessions), opt.SessionsTotal)
+	}
+	b.WriteString("\n**share** is what fraction of everything that session did went into an index. " +
+		"The tool-call count is a byte scan of the transcript rather than a decode, so it can fall " +
+		"slightly short; treat it as a denominator, not a ledger.\n\n")
 }
 
 func reportRecents(b *strings.Builder, opt ReportOptions) {

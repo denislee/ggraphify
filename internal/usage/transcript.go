@@ -24,6 +24,13 @@ type FileState struct {
 	Size   int64 `json:"size"`
 	ModNS  int64 `json:"mod_ns"`
 	Offset int64 `json:"offset"`
+	// Tools is how many tool calls this file has contributed to its session's
+	// denominator so far. It is kept per FILE rather than only in the session
+	// roll so that a transcript re-read from the start — rotated, rewritten —
+	// can be folded as a correction instead of counted twice. A doubled
+	// denominator is not a slightly-off number; it halves every share derived
+	// from it.
+	Tools int `json:"tools,omitempty"`
 }
 
 // hookAttachment is the attachment type Claude Code uses for whatever a hook
@@ -70,6 +77,23 @@ type block struct {
 	Content   json.RawMessage `json:"content"`
 }
 
+// sessionScan is what one pass over one transcript learnt about the session
+// the file belongs to, whether or not either tool was ever mentioned in it: the
+// metadata to label it by, and how many tool calls it made in total.
+//
+// It is emitted once per pass, not once per line, and it is the half that makes
+// the session list an adoption view — a sitting that used neither tool produces
+// no Event at all and would otherwise be invisible.
+type sessionScan struct {
+	Session string
+	Account string
+	Repo    string
+	Branch  string
+	Start   time.Time
+	Last    time.Time
+	Tools   int
+}
+
 // scanTranscript parses one transcript from off, appending what it finds to
 // events, and returns the offset to resume from next time.
 //
@@ -77,21 +101,34 @@ type block struct {
 // decoder is involved. That test is what makes the corpus affordable: on a
 // working machine fewer than one line in two hundred survives it, and the
 // decoder — by far the expensive part — runs only on those.
-func scanTranscript(ctx context.Context, path, account string, off int64, since time.Time, pend *pendingSet, emit func(Event), emitR func(string, Fail)) (int64, error) {
+//
+// The session-level pass obeys the same budget. It counts tool calls with a
+// byte scan, and decodes exactly two lines per pass — the first and last that
+// carry a timestamp — to learn where and when the session ran. Nothing here
+// widens what the decoder sees.
+//
+// The returned sessionScan describes THIS pass only: its Tools is what these
+// lines held, not the file's total, so the caller can fold it as a delta.
+func scanTranscript(ctx context.Context, path, account string, off int64, since time.Time, pend *pendingSet, emit func(Event), emitR func(string, Fail)) (int64, sessionScan, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return off, err
+		return off, sessionScan{}, err
 	}
 	defer f.Close()
 	if off > 0 {
 		if _, err := f.Seek(off, io.SeekStart); err != nil {
-			return 0, err
+			return 0, sessionScan{}, err
 		}
 	}
 
 	r := bufio.NewReaderSize(f, 256<<10)
 	pos := off
 	n := 0
+	// The first and last timestamped lines of THIS pass. bufio.ReadBytes
+	// returns a fresh slice per call, so holding on to two of them costs
+	// nothing beyond the two lines themselves.
+	var firstTS, lastTS []byte
+	tools := 0
 	for {
 		line, err := r.ReadBytes('\n')
 		if len(line) > 0 && line[len(line)-1] != '\n' {
@@ -102,7 +139,14 @@ func scanTranscript(ctx context.Context, path, account string, off int64, since 
 		if len(line) > 0 {
 			pos += int64(len(line))
 			if n++; n%512 == 0 && ctx.Err() != nil {
-				return pos, ctx.Err()
+				return pos, sessionOf(path, account, firstTS, lastTS, tools), ctx.Err()
+			}
+			tools += countToolUses(line)
+			if bytes.Contains(line, needleTimestamp) {
+				if firstTS == nil {
+					firstTS = line
+				}
+				lastTS = line
 			}
 			// Two ways a line is worth decoding: it names one of the tools,
 			// or it is the answer to a call that is still outstanding. The
@@ -118,13 +162,70 @@ func scanTranscript(ctx context.Context, path, account string, off int64, since 
 			break
 		}
 	}
-	return pos, nil
+	return pos, sessionOf(path, account, firstTS, lastTS, tools), nil
 }
+
+// sessionOf assembles the pass's session record.
+//
+// The session id comes from the record when one could be decoded and from the
+// file name otherwise — Claude Code names each transcript after the session it
+// holds. The record is preferred because it is the key every Event carries, and
+// the two halves only join if they agree.
+func sessionOf(path, account string, firstTS, lastTS []byte, tools int) sessionScan {
+	sc := sessionScan{
+		Session: strings.TrimSuffix(filepath.Base(path), ".jsonl"),
+		Account: account,
+		Tools:   tools,
+	}
+	if first, ok := decodeRecord(firstTS); ok {
+		sc.Start = first.Timestamp
+		if first.SessionID != "" {
+			sc.Session = first.SessionID
+		}
+	}
+	last, ok := decodeRecord(lastTS)
+	if !ok {
+		return sc
+	}
+	sc.Last = last.Timestamp
+	if last.SessionID != "" {
+		sc.Session = last.SessionID
+	}
+	if last.Cwd != "" {
+		sc.Repo = filepath.Clean(last.Cwd)
+	}
+	sc.Branch = last.GitBranch
+	return sc
+}
+
+func decodeRecord(line []byte) (record, bool) {
+	var rec record
+	if len(line) == 0 {
+		return rec, false
+	}
+	if err := json.Unmarshal(line, &rec); err != nil || rec.Timestamp.IsZero() {
+		return rec, false
+	}
+	return rec, true
+}
+
+// countToolUses counts the tool calls on one line without decoding it.
+//
+// It is a byte count of the block marker, which makes it an approximation in
+// exactly one direction: a marker quoted inside a tool's own output is escaped
+// in the JSON and does not match, so the count can fall short of a decoded one
+// and never runs ahead of it by much. That is the right trade for a denominator
+// — it is read on EVERY line of a corpus measured in gigabytes, and decoding
+// them all to make it exact would cost more than everything else this package
+// does put together. SessionRoll.Share clamps for the residual.
+func countToolUses(line []byte) int { return bytes.Count(line, needleToolUse) }
 
 var (
 	needleGraphify   = []byte("graphify")
 	needleGraft      = []byte("graft")
 	needleToolResult = []byte(`"tool_result"`)
+	needleToolUse    = []byte(`"type":"tool_use"`)
+	needleTimestamp  = []byte(`"timestamp":"`)
 )
 
 func mentions(line []byte) bool {

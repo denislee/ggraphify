@@ -14,7 +14,7 @@ import (
 // Version is the rollup file's schema version. A file written by a newer
 // board is discarded rather than half-read: the whole thing can be rebuilt
 // from the transcripts in one pass, so there is nothing to salvage.
-const Version = 2
+const Version = 3
 
 // Retain is how much history the rollup keeps. Three months is long enough to
 // see a habit form and short enough that the file stays a few hundred
@@ -43,9 +43,14 @@ type Index struct {
 	// Owners maps a session id to the account whose transcript carried it,
 	// so graft's own counter files — which do not name an account — can be
 	// attributed to the login that paid for them.
-	Owners    map[string]string `json:"owners"`
-	Recent    []Event           `json:"recent"`
-	UpdatedAt time.Time         `json:"updated_at"`
+	Owners map[string]string `json:"owners"`
+	// Sessions is the per-session rollup, by session id — see session.go. It
+	// is keyed globally rather than under a day because a sitting spans
+	// midnight and splitting one in half would make every derived share wrong
+	// on both sides of it.
+	Sessions  map[string]*SessionRoll `json:"sessions"`
+	Recent    []Event                 `json:"recent"`
+	UpdatedAt time.Time               `json:"updated_at"`
 	// Scanned is how many transcripts the last update actually opened, as
 	// opposed to skipped on a stat. It is shown in the UI because "this
 	// number did not move" and "nothing was read" are different answers.
@@ -105,6 +110,7 @@ func New() *Index {
 		GraftFiles: map[string]SessionState{},
 		Days:       map[string]*Day{},
 		Owners:     map[string]string{},
+		Sessions:   map[string]*SessionRoll{},
 		Pending:    map[string]pendingCall{},
 	}
 }
@@ -140,6 +146,9 @@ func Load(path string) *Index {
 	}
 	if in.Owners != nil {
 		x.Owners = in.Owners
+	}
+	if in.Sessions != nil {
+		x.Sessions = in.Sessions
 	}
 	if in.Pending != nil {
 		x.Pending = in.Pending
@@ -181,14 +190,15 @@ func (x *Index) MarshalJSON() ([]byte, error) {
 		GraftFiles map[string]SessionState `json:"graft_files"`
 		Days       map[string]*Day         `json:"days"`
 		Owners     map[string]string       `json:"owners"`
+		Sessions   map[string]*SessionRoll `json:"sessions"`
 		Pending    map[string]pendingCall  `json:"pending"`
 		Recent     []Event                 `json:"recent"`
 		UpdatedAt  time.Time               `json:"updated_at"`
 	}
 	return json.Marshal(alias{
 		Ver: Version, Files: x.Files, GraftFiles: x.GraftFiles,
-		Days: x.Days, Owners: x.Owners, Pending: x.Pending,
-		Recent: x.Recent, UpdatedAt: x.UpdatedAt,
+		Days: x.Days, Owners: x.Owners, Sessions: x.Sessions,
+		Pending: x.Pending, Recent: x.Recent, UpdatedAt: x.UpdatedAt,
 	})
 }
 
@@ -225,6 +235,7 @@ func (x *Index) Update(ctx context.Context, opts Options) error {
 		events   []Event
 		fails    []failure
 		deltas   []delta
+		scans    []sessionScan
 		scanned  int
 		nextF    = map[string]FileState{}
 		nextG    = map[string]SessionState{}
@@ -270,11 +281,21 @@ func (x *Index) Update(ctx context.Context, opts Options) error {
 				off = 0
 			}
 			scanned++
-			end, err := scanTranscript(ctx, p, acct.Name, off, since, pend, emitE, emitR)
+			end, sc, err := scanTranscript(ctx, p, acct.Name, off, since, pend, emitE, emitR)
 			if err != nil && ctx.Err() != nil {
 				return err
 			}
-			nextF[p] = FileState{Size: fi.Size(), ModNS: fi.ModTime().UnixNano(), Offset: end}
+			if off == 0 && st.Tools > 0 {
+				// Re-read from the start: this pass counted the whole file, so
+				// what the old one contributed has to come back off. The result
+				// is the new file's count, not the sum of both.
+				sc.Tools -= st.Tools
+			}
+			scans = append(scans, sc)
+			nextF[p] = FileState{
+				Size: fi.Size(), ModNS: fi.ModTime().UnixNano(), Offset: end,
+				Tools: st.Tools + sc.Tools,
+			}
 		}
 	}
 
@@ -296,6 +317,13 @@ func (x *Index) Update(ctx context.Context, opts Options) error {
 		graftFiles[k] = v
 	}
 	x.GraftFiles = graftFiles
+	// The session registry is folded before the events, so a roll already
+	// knows its working directory and its start by the time a call is counted
+	// into it. It also covers the sessions no event will ever name — the ones
+	// that used neither tool, which are the denominator.
+	for _, sc := range scans {
+		x.addScan(sc)
+	}
 	for _, e := range events {
 		x.add(e)
 	}
@@ -330,6 +358,23 @@ func (x *Index) add(e Event) {
 		if e.Account != "" {
 			x.Owners[e.Session] = e.Account
 		}
+		r := x.session(e.Session)
+		r.Counts[counterKey(e.Tool, e.Kind, e.Verb)]++
+		if r.Account == "" {
+			r.Account = e.Account
+		}
+		if r.Repo == "" {
+			r.Repo = e.Repo
+		}
+		if r.Branch == "" {
+			r.Branch = e.Branch
+		}
+		if r.Start.IsZero() || e.At.Before(r.Start) {
+			r.Start = e.At
+		}
+		if e.At.After(r.Last) {
+			r.Last = e.At
+		}
 	}
 	// Hooks fire on their own, dozens of times a session; putting them in the
 	// activity list would bury every command an agent actually ran.
@@ -352,7 +397,15 @@ func (x *Index) addFail(f failure) {
 	if rd.Fails == nil {
 		rd.Fails = map[string]int{}
 	}
-	rd.Fails[failKey(e.Tool, f.Reason, e.Verb)]++
+	key := failKey(e.Tool, f.Reason, e.Verb)
+	rd.Fails[key]++
+	if e.Session != "" {
+		r := x.session(e.Session)
+		if r.Fails == nil {
+			r.Fails = map[string]int{}
+		}
+		r.Fails[key]++
+	}
 	if e.ID == "" {
 		return
 	}
@@ -373,9 +426,86 @@ func (x *Index) addDelta(d delta) {
 	rd.SavedTokens += d.Saved
 	rd.CostMicros += d.Cost
 	rd.BilledTokens += d.Billed
-	if d.Session != "" && !contains(rd.Sessions, d.Session) {
+	if d.Session == "" {
+		return
+	}
+	if !contains(rd.Sessions, d.Session) {
 		rd.Sessions = append(rd.Sessions, d.Session)
 	}
+	r := x.session(d.Session)
+	r.GraftReads += d.Reads
+	r.SourceReads += d.Source
+	r.Nudges += d.Nudges
+	r.SavedTokens += d.Saved
+	r.CostMicros += d.Cost
+	r.BilledTokens += d.Billed
+	if r.Repo == "" {
+		r.Repo = d.Repo
+	}
+	// graft's counter files name no account. Owners is the join that fixes
+	// that, and it is the only thing it is for.
+	if r.Account == "" {
+		r.Account = x.Owners[d.Session]
+	}
+	if r.Start.IsZero() || d.At.Before(r.Start) {
+		r.Start = d.At
+	}
+	if d.At.After(r.Last) {
+		r.Last = d.At
+	}
+}
+
+// addScan folds one transcript pass's view of its session in: the metadata
+// every session has whether or not it ever reached for either tool, and the
+// total tool-call count that makes the per-session shares mean anything.
+// Caller holds the lock.
+func (x *Index) addScan(sc sessionScan) {
+	if sc.Session == "" {
+		return
+	}
+	r := x.session(sc.Session)
+	if sc.Account != "" {
+		r.Account = sc.Account
+		x.Owners[sc.Session] = sc.Account
+	}
+	// The newest line wins for the mutable pair: a session that changed
+	// directory or switched branch mid-sitting is reported as where it ended
+	// up, which is what the board can still match against a row.
+	if sc.Repo != "" {
+		r.Repo = sc.Repo
+	}
+	if sc.Branch != "" {
+		r.Branch = sc.Branch
+	}
+	if !sc.Start.IsZero() && (r.Start.IsZero() || sc.Start.Before(r.Start)) {
+		r.Start = sc.Start
+	}
+	if sc.Last.After(r.Last) {
+		r.Last = sc.Last
+	}
+	if r.Tools += sc.Tools; r.Tools < 0 {
+		// Only reachable through the rotation correction above, and only if the
+		// replacement file is shorter than what the old one contributed. A
+		// negative denominator is worse than a low one.
+		r.Tools = 0
+	}
+}
+
+// session returns the roll for one session id, creating it if this is the
+// first thing ever seen from it. Caller holds the lock.
+func (x *Index) session(id string) *SessionRoll {
+	if x.Sessions == nil {
+		x.Sessions = map[string]*SessionRoll{}
+	}
+	r := x.Sessions[id]
+	if r == nil {
+		r = &SessionRoll{Session: id, Counts: map[string]int{}}
+		x.Sessions[id] = r
+	}
+	if r.Counts == nil {
+		r.Counts = map[string]int{}
+	}
+	return r
 }
 
 func (x *Index) repoDay(day, repo string) *RepoDay {
@@ -410,6 +540,14 @@ func (x *Index) prune(since time.Time) {
 			delete(x.Days, day)
 		}
 	}
+	// A session is dropped on its last line of activity, not on the day it
+	// started: a sitting that ran across the edge of the window still has
+	// counters inside it.
+	for id, r := range x.Sessions {
+		if r == nil || r.Last.Before(since) {
+			delete(x.Sessions, id)
+		}
+	}
 	live := map[string]bool{}
 	for _, d := range x.Days {
 		for _, rd := range d.Repos {
@@ -417,6 +555,9 @@ func (x *Index) prune(since time.Time) {
 				live[s] = true
 			}
 		}
+	}
+	for id := range x.Sessions {
+		live[id] = true
 	}
 	for s := range x.Owners {
 		if !live[s] {

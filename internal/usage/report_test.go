@@ -116,3 +116,52 @@ func TestReportKeepsUnboardedDirectoriesOutOfTheSilentList(t *testing.T) {
 		t.Errorf("without a row list every directory should still be listed:\n%s", raw)
 	}
 }
+
+// The sessions section has to carry the denominator in prose as well as in the
+// table, because the table is truncated on a busy machine and the ratio is the
+// part a reader acts on.
+func TestReportSessionsCarryTheDenominator(t *testing.T) {
+	s, now := reportFixture(t)
+	rolls := []SessionRoll{{
+		Session: "s1", Account: "default",
+		Repo: "/home/u/git/busy", Branch: "main",
+		Start: now.Add(-time.Hour), Last: now,
+		Tools:  40,
+		Counts: map[string]int{counterKey(Graft, CLI, "ask"): 4},
+	}, {
+		// The session that used nothing, with plenty of work in it. This row is
+		// the reason the section exists.
+		Session: "s2", Account: "default",
+		Repo: "/home/u/git/ignored", Branch: "main",
+		Start: now.Add(-2 * time.Hour), Last: now.Add(-time.Hour),
+		Tools:  67,
+		Counts: map[string]int{},
+	}}
+	out := Report(s, nil, ReportOptions{
+		Now: now, Sessions: rolls, SessionsTotal: 293, SessionsUsed: 104,
+	})
+
+	for _, want := range []string{
+		"## Every session",
+		"293 Claude Code sessions ran in this window; **104 of them reached for either tool**, and 189 did not.",
+		// s1: four graft calls out of forty tool calls. The path is not
+		// shortened because the fixture's home is not this machine's.
+		"| /home/u/git/busy | main | 0 | 4 | 40 | 10% |",
+		// s2 is present with a zero share rather than filtered out.
+		"| /home/u/git/ignored | main | 0 | 0 | 67 | 0% |",
+		"(2 most recent of 293.)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("sessions section is missing %q\n---\n%s", want, out)
+		}
+	}
+}
+
+// With no session data passed in, the section is absent rather than empty: the
+// report is also rendered by callers that never collected it.
+func TestReportOmitsSessionsWhenNotProvided(t *testing.T) {
+	s, now := reportFixture(t)
+	if out := Report(s, nil, ReportOptions{Now: now}); strings.Contains(out, "## Every session") {
+		t.Errorf("sessions section rendered with nothing to put in it:\n%s", out)
+	}
+}
