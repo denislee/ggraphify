@@ -283,6 +283,50 @@ func TestOversizeGraphIsNotParsed(t *testing.T) {
 	}
 }
 
+// An oversize graph is Raw and STAYS Raw, even with every community named.
+//
+// The real row this comes from is ~/tmp, itself a checkout holding a hundred
+// others: 373 MB of graph.json past the ceiling, labels written, and the board
+// called it fresh with 0 nodes and 0 links. Labels are not a licence to vouch
+// for counters nobody read.
+func TestOversizeGraphIsNeverFresh(t *testing.T) {
+	f := newFixture(t)
+	f.graphJSON(3, 3, "abc")
+	f.writeOut(".graphify_labels.json", `{"0":"Real Name"}`)
+	p := filepath.Join(f.out, "graph.json")
+	if err := os.Truncate(p, MaxGraphBytes+1); err != nil {
+		t.Skipf("cannot create a sparse oversize file here: %v", err)
+	}
+	g, _ := Read(Options{Repo: f.repo, SkipDrift: true})
+	if g.State != StateRaw {
+		t.Fatalf("State = %v, want raw — an unparsed graph must not read as fresh", g.State)
+	}
+	if g.Err == "" {
+		t.Error("the row must still say why the counters are missing")
+	}
+}
+
+// Drift does not launder the verdict either: the stale branch of the switch
+// sits below the sticky one, and an unparsed graph under a moved tree is still
+// first of all unparsed.
+func TestOversizeGraphOutranksDrift(t *testing.T) {
+	f := newFixture(t)
+	f.graphJSON(3, 3, "abc")
+	f.writeOut(".graphify_labels.json", `{"0":"Real Name"}`)
+	f.writeOut("needs_update", "")
+	p := filepath.Join(f.out, "graph.json")
+	if err := os.Truncate(p, MaxGraphBytes+1); err != nil {
+		t.Skipf("cannot create a sparse oversize file here: %v", err)
+	}
+	g, _ := Read(Options{Repo: f.repo, SkipDrift: true})
+	if g.State != StateRaw {
+		t.Fatalf("State = %v, want raw", g.State)
+	}
+	if !g.Drift() {
+		t.Error("the pending re-extraction must still be reported on the row")
+	}
+}
+
 func TestStateRoundTrip(t *testing.T) {
 	for _, s := range []State{StateNone, StateRaw, StateStale, StateFresh, StateBroken, StateRunning} {
 		got, ok := ParseState(s.String())
@@ -510,5 +554,30 @@ func TestLabelsFileOutranksTheAnalysisFile(t *testing.T) {
 	g, _ := Read(Options{Repo: f.repo})
 	if g.Communities != 1 || !g.Labeled {
 		t.Fatalf("Communities = %d, Labeled = %v; want 1, true", g.Communities, g.Labeled)
+	}
+}
+
+// Behind compares by prefix on purpose: graphify has written built_at_commit
+// both short and full, and a full-vs-short comparison by equality would report
+// every repository on the board as behind its own HEAD — a signal that fires
+// for everything is one nobody can act on.
+func TestBehindComparesByPrefix(t *testing.T) {
+	cases := []struct {
+		name       string
+		built, hea string
+		want       bool
+	}{
+		{"same full", "ba36616e1f", "ba36616e1f", false},
+		{"short built, full head", "ba36616", "ba36616e1f2c3d4e5f60718293a4b5c6d7e8f900", false},
+		{"full built, short head", "ba36616e1f2c3d4e5f60718293a4b5c6d7e8f900", "ba36616", false},
+		{"different", "ba36616e", "1b39655a", true},
+		{"no head", "ba36616e", "", false},
+		{"no built commit", "", "ba36616e", false},
+	}
+	for _, c := range cases {
+		g := Graph{BuiltCommit: c.built, HeadCommit: c.hea}
+		if got := g.Behind(); got != c.want {
+			t.Errorf("%s: Behind() = %v, want %v", c.name, got, c.want)
+		}
 	}
 }

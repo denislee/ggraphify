@@ -30,6 +30,7 @@ import (
 
 	"github.com/dns/ggraphify/internal/applog"
 	"github.com/dns/ggraphify/internal/discover"
+	"github.com/dns/ggraphify/internal/gfy"
 	"github.com/dns/ggraphify/internal/open"
 	"github.com/dns/ggraphify/internal/store"
 	"github.com/dns/ggraphify/internal/ui"
@@ -94,6 +95,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	// gfy sends this as the User-Agent of the one thing it talks to directly:
+	// the OpenCode Go proxy's requests to the gateway, which asks a client to
+	// name itself rather than arrive as a generic SDK.
+	gfy.AppVersion = version
 	applog.Infof("ggraphify %s starting — %s", version, store.DefaultPath())
 
 	st := store.Open(store.DefaultPath())

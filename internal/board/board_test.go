@@ -245,3 +245,35 @@ func TestScanOverrideOutIsResolved(t *testing.T) {
 		t.Errorf("Out = %q, want %q", rows[0].Graph.Out, want)
 	}
 }
+
+// The state half of the same question: a graph built at a commit that is no
+// longer HEAD is stale on the board, not fresh, even though every file it was
+// built from is untouched. That word is what the status bar counts, what the
+// filter chip selects and what makes the row eligible for the auto-fix loop —
+// a row that reported "fresh" here was a graph nothing would ever update.
+func TestBehindHeadIsStaleAndCarriesTheIssue(t *testing.T) {
+	root := t.TempDir()
+	dir := mkrepo(t, root, "moved", "1111111111111111111111111111111111111111")
+	withGraph(t, dir, "9999999999999999999999999999999999999999")
+
+	rows, _ := Scan(Options{Roots: []string{root}})
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows", len(rows))
+	}
+	g := rows[0].Graph
+	if g.State != graphstate.StateStale {
+		t.Errorf("state = %v, want stale", g.State)
+	}
+	found := false
+	for _, i := range g.Issues() {
+		if i.Code == graphstate.IssueBehind {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("issues = %q, want one of them to be %q", g.IssueSummary(), graphstate.IssueBehind)
+	}
+	if c := Summarize(rows); c.Stale != 1 || c.Behind != 1 || c.Fresh != 0 {
+		t.Errorf("counts = %+v, want 1 stale / 1 behind / 0 fresh", c)
+	}
+}

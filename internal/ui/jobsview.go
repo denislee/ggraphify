@@ -365,9 +365,11 @@ func (v *jobsView) retry() {
 		// to be rebuilt here too. A retry that dropped it would quietly run
 		// serially and look like the first attempt having been slow.
 		Env: gfy.ClaudeAccountEnv(
-			gfy.ClaudeCLIEnv(
-				gfy.LocalEnv(gfy.JobEnv(v.a.opts.Store.Overlay(s.Repo)), gfy.ArgvBackend(s.Argv)),
-				gfy.ArgvBackend(s.Argv)),
+			gfy.ClaudeCLIModelEnv(
+				gfy.ClaudeCLIEnv(
+					gfy.LocalEnv(gfy.JobEnv(v.a.opts.Store.Overlay(s.Repo)), gfy.ArgvBackend(s.Argv)),
+					gfy.ArgvBackend(s.Argv)),
+				gfy.ArgvBackend(s.Argv), gfy.ArgvModel(s.Argv)),
 			v.a.opts.Store.Settings().ClaudeAccount),
 		Dir: s.Repo,
 	})

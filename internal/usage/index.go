@@ -14,7 +14,7 @@ import (
 // Version is the rollup file's schema version. A file written by a newer
 // board is discarded rather than half-read: the whole thing can be rebuilt
 // from the transcripts in one pass, so there is nothing to salvage.
-const Version = 1
+const Version = 2
 
 // Retain is how much history the rollup keeps. Three months is long enough to
 // see a habit form and short enough that the file stays a few hundred
@@ -36,6 +36,10 @@ type Index struct {
 	Files      map[string]FileState    `json:"files"`
 	GraftFiles map[string]SessionState `json:"graft_files"`
 	Days       map[string]*Day         `json:"days"`
+	// Pending is the calls whose result has not been read yet, by tool_use
+	// id. It is persisted because a call and its answer are routinely written
+	// to the transcript in different scans — see failure.go.
+	Pending map[string]pendingCall `json:"pending"`
 	// Owners maps a session id to the account whose transcript carried it,
 	// so graft's own counter files — which do not name an account — can be
 	// attributed to the login that paid for them.
@@ -59,6 +63,13 @@ type RepoDay struct {
 	Counts   map[string]int `json:"counts"`
 	Accounts map[string]int `json:"accounts"`
 	Sessions []string       `json:"sessions"`
+	// Fails is the subset of those calls that came back unusable, keyed by
+	// tool/reason/verb — see failKey. It is a separate map rather than a
+	// variant of Counts because a failure is learnt AFTER the call it belongs
+	// to has already been counted: the result arrives in a later line, often
+	// in a later scan, and a total that had to be moved between buckets at
+	// that point could not be folded incrementally at all.
+	Fails map[string]int `json:"fails,omitempty"`
 
 	// The graft counter half. These come from graft's own per-session files
 	// and are never derived from transcripts, so they are not double counted.
@@ -94,12 +105,20 @@ func New() *Index {
 		GraftFiles: map[string]SessionState{},
 		Days:       map[string]*Day{},
 		Owners:     map[string]string{},
+		Pending:    map[string]pendingCall{},
 	}
 }
 
-// Load reads a rollup from disk. A missing, unreadable or future-versioned
-// file yields an empty index and no error: this is a derived cache, and the
-// only cost of losing it is one slow scan.
+// Load reads a rollup from disk. A missing, unreadable or differently
+// versioned file yields an empty index and no error: this is a derived cache,
+// and the only cost of losing it is one slow scan.
+//
+// An OLDER file is discarded as well as a newer one, which is the one place
+// this package pays for a schema change. A v1 rollup carries the offsets that
+// say every transcript has already been read, and no failures at all — so
+// keeping it would leave every repository looking like it had never had a call
+// come back empty until the next time an agent happened to use it. One cold
+// pass over the corpus is the cheaper wrong answer to avoid.
 func Load(path string) *Index {
 	x := New()
 	b, err := os.ReadFile(path)
@@ -107,7 +126,7 @@ func Load(path string) *Index {
 		return x
 	}
 	var in Index
-	if err := json.Unmarshal(b, &in); err != nil || in.Ver > Version {
+	if err := json.Unmarshal(b, &in); err != nil || in.Ver != Version {
 		return x
 	}
 	if in.Files != nil {
@@ -121,6 +140,9 @@ func Load(path string) *Index {
 	}
 	if in.Owners != nil {
 		x.Owners = in.Owners
+	}
+	if in.Pending != nil {
+		x.Pending = in.Pending
 	}
 	x.Recent = in.Recent
 	x.UpdatedAt = in.UpdatedAt
@@ -159,12 +181,14 @@ func (x *Index) MarshalJSON() ([]byte, error) {
 		GraftFiles map[string]SessionState `json:"graft_files"`
 		Days       map[string]*Day         `json:"days"`
 		Owners     map[string]string       `json:"owners"`
+		Pending    map[string]pendingCall  `json:"pending"`
 		Recent     []Event                 `json:"recent"`
 		UpdatedAt  time.Time               `json:"updated_at"`
 	}
 	return json.Marshal(alias{
 		Ver: Version, Files: x.Files, GraftFiles: x.GraftFiles,
-		Days: x.Days, Owners: x.Owners, Recent: x.Recent, UpdatedAt: x.UpdatedAt,
+		Days: x.Days, Owners: x.Owners, Pending: x.Pending,
+		Recent: x.Recent, UpdatedAt: x.UpdatedAt,
 	})
 }
 
@@ -191,17 +215,33 @@ func (x *Index) Update(ctx context.Context, opts Options) error {
 	for k, v := range x.GraftFiles {
 		graftFiles[k] = v
 	}
+	// The calls still waiting on a result, carried over from the last scan.
+	// Anything older than the TTL is dropped here rather than re-persisted: a
+	// session that was interrupted mid-call never produces the answer.
+	pend := newPendingSet(x.Pending, now.Add(-pendingTTL))
 	x.mu.Unlock()
 
 	var (
 		events   []Event
+		fails    []failure
 		deltas   []delta
 		scanned  int
 		nextF    = map[string]FileState{}
 		nextG    = map[string]SessionState{}
-		emitE    = func(e Event) { events = append(events, e) }
+		emitE    = func(e Event) { events = append(events, e); pend.add(e, now) }
 		emitD    = func(d delta) { deltas = append(deltas, d) }
 		keepSess = func(p string, s SessionState) { nextG[p] = s }
+		// A result resolves the call it answers: a failing one is recorded,
+		// a successful one simply stops being waited on.
+		emitR = func(id string, f Fail) {
+			e, ok := pend.take(id)
+			if !ok {
+				return
+			}
+			if f != FailNone {
+				fails = append(fails, failure{Event: e, Reason: f})
+			}
+		}
 	)
 
 	for _, acct := range opts.Accounts {
@@ -230,7 +270,7 @@ func (x *Index) Update(ctx context.Context, opts Options) error {
 				off = 0
 			}
 			scanned++
-			end, err := scanTranscript(ctx, p, acct.Name, off, since, emitE)
+			end, err := scanTranscript(ctx, p, acct.Name, off, since, pend, emitE, emitR)
 			if err != nil && ctx.Err() != nil {
 				return err
 			}
@@ -259,9 +299,17 @@ func (x *Index) Update(ctx context.Context, opts Options) error {
 	for _, e := range events {
 		x.add(e)
 	}
+	// Failures are folded after the calls, never instead of them: a call that
+	// failed is still a call an agent chose to make, and the moment it stops
+	// being counted as one the "used with no index" gap this package exists to
+	// find disappears from the totals.
+	for _, f := range fails {
+		x.addFail(f)
+	}
 	for _, d := range deltas {
 		x.addDelta(d)
 	}
+	x.Pending = pend.snapshot()
 	x.prune(since)
 	x.UpdatedAt = now
 	x.Scanned = scanned
@@ -290,6 +338,28 @@ func (x *Index) add(e Event) {
 		if len(x.Recent) > MaxRecent*2 {
 			sort.SliceStable(x.Recent, func(i, j int) bool { return x.Recent[i].At.Before(x.Recent[j].At) })
 			x.Recent = x.Recent[len(x.Recent)-MaxRecent:]
+		}
+	}
+}
+
+// addFail folds one failed call in: the counter for the day the CALL was
+// made — not the day its result arrived — and the mark on the event in the
+// activity list, so "Latest" can say which of those calls came back empty.
+// Caller holds the lock.
+func (x *Index) addFail(f failure) {
+	e := f.Event
+	rd := x.repoDay(DayKey(e.At), e.Repo)
+	if rd.Fails == nil {
+		rd.Fails = map[string]int{}
+	}
+	rd.Fails[failKey(e.Tool, f.Reason, e.Verb)]++
+	if e.ID == "" {
+		return
+	}
+	for i := len(x.Recent) - 1; i >= 0; i-- {
+		if x.Recent[i].ID == e.ID {
+			x.Recent[i].Fail = f.Reason
+			return
 		}
 	}
 }
@@ -363,6 +433,11 @@ func (x *Index) prune(since time.Time) {
 	x.Recent = keep
 	if len(x.Recent) > MaxRecent {
 		x.Recent = x.Recent[len(x.Recent)-MaxRecent:]
+	}
+	for id, c := range x.Pending {
+		if c.Seen.Before(since) {
+			delete(x.Pending, id)
+		}
 	}
 }
 

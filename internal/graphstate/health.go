@@ -24,6 +24,7 @@ const (
 	IssueBroken      = "broken"        // graph.json missing or unreadable
 	IssueNeedsUpdate = "needs-extract" // graphify's own needs_update flag
 	IssueDrift       = "drift"         // the tree has moved since the manifest
+	IssueBehind      = "behind"        // built from a commit that is no longer HEAD
 	IssueNoCommunity = "no-community"  // clustering has not run
 	IssueUnnamed     = "unnamed"       // communities exist with placeholder names
 	IssueNoReport    = "no-report"     // no GRAPH_REPORT.md
@@ -80,6 +81,13 @@ func (g Graph) Issues() []Issue {
 			Why:  "queries answer from the old code — the worst failure mode, because it looks like an answer",
 		})
 	}
+	if g.Behind() {
+		out = append(out, Issue{
+			Code: IssueBehind,
+			What: "built at " + shortSHA(g.BuiltCommit) + ", HEAD is now " + shortSHA(g.HeadCommit),
+			Why:  "commits have landed since the build; the graph answers for code this checkout has moved past",
+		})
+	}
 	if g.Communities == 0 {
 		out = append(out, Issue{
 			Code: IssueNoCommunity,
@@ -101,6 +109,15 @@ func (g Graph) Issues() []Issue {
 		})
 	}
 	return out
+}
+
+// shortSHA is the seven-character form the UI shows commits in. A commit that
+// is already shorter than that is left alone rather than padded.
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
 }
 
 // IssueSummary is the compact form for a tooltip or a row: the issue codes,

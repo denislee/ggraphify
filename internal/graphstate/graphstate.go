@@ -78,6 +78,10 @@ type Graph struct {
 	Labeled     bool      `json:"labeled"`      // .graphify_labels.json present and non-empty
 	BuiltAt     time.Time `json:"built_at"`     // graph.json mtime
 	BuiltCommit string    `json:"built_commit"` // graph.json's built_at_commit
+	// HeadCommit is the checkout's resolved HEAD at the time of the read,
+	// supplied by the caller — this package runs no git. It is what turns
+	// BuiltCommit from a fact into a verdict: see Behind.
+	HeadCommit string `json:"head_commit,omitempty"`
 
 	DriftAdded   int  `json:"drift_added"`   // in the tree, absent from the manifest
 	DriftChanged int  `json:"drift_changed"` // newer than the manifest's mtime
@@ -102,6 +106,30 @@ type Graph struct {
 
 	// Err is why the state is Broken, when it is.
 	Err string `json:"err,omitempty"`
+}
+
+// Behind reports that the graph was built from a commit that is no longer
+// HEAD — history moved under it, whether or not a single working file did.
+//
+// It is a separate question from drift and neither implies the other: a
+// `git checkout` of another branch rewrites the tree and moves HEAD (both), a
+// `git commit` of already-extracted files moves only HEAD, and an unsaved
+// editor buffer moves only the tree. Answering it needs the caller's Head,
+// so a Graph read without one is never Behind.
+//
+// The comparison is by prefix because the two strings do not have to be the
+// same length: graphify has written both a short and a full built_at_commit
+// across versions, and a full-vs-short mismatch must not read as "behind" for
+// every repository on the board.
+func (g Graph) Behind() bool {
+	if g.BuiltCommit == "" || g.HeadCommit == "" {
+		return false
+	}
+	a, b := g.BuiltCommit, g.HeadCommit
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	return !strings.HasPrefix(b, a)
 }
 
 // Drift reports whether anything has moved since the graph was built.
@@ -166,6 +194,10 @@ type Options struct {
 	Repo string
 	// Out is the output directory. Empty means Repo/graphify-out.
 	Out string
+	// Head is the checkout's resolved HEAD commit, when the caller knows it.
+	// Empty is not an error — it only means the read cannot judge whether the
+	// graph is behind history, and Behind stays false.
+	Head string
 	// SkipDrift omits the tree walk. The board wants drift; a one-shot that
 	// only needs counters does not.
 	SkipDrift bool
@@ -192,7 +224,7 @@ func Read(opts Options) (Graph, error) {
 	if out == "" {
 		out = filepath.Join(opts.Repo, DefaultOutName)
 	}
-	g := Graph{Out: out}
+	g := Graph{Out: out, HeadCommit: opts.Head}
 
 	fi, err := os.Stat(out)
 	if err != nil || !fi.IsDir() {
@@ -253,9 +285,16 @@ func Read(opts Options) (Graph, error) {
 	}
 
 	switch {
-	case g.Err != "" && g.State == StateBroken:
-		// already decided
-	case g.NeedsUpdate || g.DriftAdded+g.DriftChanged+g.DriftRemoved > 0:
+	case g.Err != "" && (g.State == StateBroken || g.State == StateRaw):
+		// Already decided, and it stays decided. Broken is obvious; Raw is the
+		// graph that was too large to parse, whose counters were never read —
+		// calling that one fresh would vouch for numbers nobody has seen. The
+		// row still carries size, age and drift, which is what you act on.
+	case g.NeedsUpdate || g.DriftAdded+g.DriftChanged+g.DriftRemoved > 0 || g.Behind():
+		// Behind counts as stale even with a clean tree. The graph answers
+		// queries about the commit it was built from, and once that is not
+		// HEAD any more the answer is about code this checkout no longer has —
+		// which is the failure that looks like a success.
 		g.State = StateStale
 	case !g.Labeled:
 		g.State = StateRaw

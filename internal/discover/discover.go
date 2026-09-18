@@ -541,7 +541,13 @@ func (c *Cache) Walk(opts Options) ([]Repo, error) {
 	if c.key == k && c.repos != nil && time.Since(c.at) < ttl {
 		repos := c.repos
 		c.mu.Unlock()
-		return repos, nil
+		// The listing is cached; HEAD is not. A commit made in a terminal
+		// moves .git/HEAD and nothing else — not the scan root's mtime, which
+		// is this cache's key — so a branch, a short SHA and the board's
+		// behind-HEAD verdict would all sit on the previous commit until the
+		// TTL expired. Re-resolving is two small file reads per checkout,
+		// which is a fraction of the walk this hit just skipped.
+		return refreshHeads(repos), nil
 	}
 	c.mu.Unlock()
 
@@ -553,6 +559,31 @@ func (c *Cache) Walk(opts Options) ([]Repo, error) {
 	c.key, c.repos, c.at = k, repos, time.Now()
 	c.mu.Unlock()
 	return repos, nil
+}
+
+// refreshHeads re-resolves every cached checkout's branch and HEAD.
+//
+// It returns a new slice rather than writing through the cached one: the
+// cached slice has already been handed to callers, and the board reads it from
+// the scan goroutine while the next tick is being served.
+//
+// A checkout whose HEAD cannot be read keeps the values it had. That case is a
+// repository being deleted or a .git being rewritten mid-read, and blanking the
+// Branch column for a tick would report it as something it is not.
+func refreshHeads(repos []Repo) []Repo {
+	out := make([]Repo, len(repos))
+	copy(out, repos)
+	for i := range out {
+		if out[i].GitDir == "" {
+			continue
+		}
+		branch, sha := head(out[i].GitDir)
+		if branch == "" && sha == "" {
+			continue
+		}
+		out[i].Branch, out[i].HeadSHA = branch, sha
+	}
+	return out
 }
 
 // Invalidate forces the next Walk to re-read the filesystem. The board calls

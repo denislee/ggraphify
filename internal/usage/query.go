@@ -1,7 +1,9 @@
 package usage
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -73,6 +75,21 @@ type Summary struct {
 	// Sessions is how many distinct agent sessions touched either tool.
 	Sessions int
 
+	// The failed half: calls that ran and came back unusable. They are a
+	// SUBSET of Events, not an addition to it — an agent that asked this
+	// repository a question and was told there was no graph still asked.
+	Fails        int
+	FailByTool   map[Tool]int
+	FailByReason map[Fail]int
+	// FailVerbs is the per-tool breakdown of what was being run when it
+	// failed, so "every failure here was a query" reads differently from
+	// "every failure here was an extract".
+	FailVerbs map[Tool][]Count
+	// FailRepos is the working directories where calls failed, worst first,
+	// and FailSplit is each one's detail.
+	FailRepos []Count
+	FailSplit map[string]RepoFail
+
 	// The graft counter half, summed over the window.
 	GraftReads   int
 	SourceReads  int
@@ -97,6 +114,46 @@ func (r RepoSplit) Uses() int { return r.Graphify + r.Graft }
 // Hooks is both integrations' injections.
 func (r RepoSplit) Hooks() int { return r.GraphifyHooks + r.GraftHooks }
 
+// RepoFail is one working directory's failed calls: how many, of which tool,
+// for which reasons, and when the last one was.
+//
+// NoGraph is pulled out of Reasons because it is the only one a button can
+// fix. Every other reason is a fact about the harness, the machine or the
+// command line — worth showing, not worth offering to extract for.
+type RepoFail struct {
+	Total           int
+	NoGraph         int
+	Graphify, Graft int
+	Reasons         map[Fail]int
+	Last            time.Time
+}
+
+// Top is the reason that accounts for most of this directory's failures, with
+// a missing index winning any tie: it is the one that can be acted on.
+func (r RepoFail) Top() Fail {
+	if r.NoGraph > 0 {
+		return FailNoGraph
+	}
+	best, n := FailOther, 0
+	for _, f := range Fails {
+		if c := r.Reasons[f]; c > n {
+			best, n = f, c
+		}
+	}
+	return best
+}
+
+// ReasonLine is the reasons as one readable clause: "no-graph 4 · timeout 1".
+func (r RepoFail) ReasonLine() string {
+	parts := make([]string, 0, len(r.Reasons))
+	for _, f := range Fails {
+		if c := r.Reasons[f]; c > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", f, c))
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
 // Mix is the share of reads that went through graft rather than straight to
 // the source, in percent, and whether there were any reads at all to divide.
 func (s Summary) Mix() (int, bool) {
@@ -118,9 +175,13 @@ func (x *Index) Summarize(w Window) Summary {
 		From: from, To: now, Days: days,
 		ByTool: map[Tool]int{}, HookByTool: map[Tool]int{}, ByKind: map[Kind]int{},
 		Verbs: map[Tool][]Count{}, RepoSplit: map[string]RepoSplit{},
+		FailByTool: map[Tool]int{}, FailByReason: map[Fail]int{},
+		FailVerbs: map[Tool][]Count{}, FailSplit: map[string]RepoFail{},
 	}
 
 	verbs := map[Tool]map[string]int{Graphify: {}, Graft: {}}
+	failVerbs := map[Tool]map[string]int{Graphify: {}, Graft: {}}
+	failRepos := map[string]int{}
 	accounts := map[string]int{}
 	repos := map[string]int{}
 	sessions := map[string]bool{}
@@ -166,6 +227,40 @@ func (x *Index) Summarize(w Window) Summary {
 				}
 				s.RepoSplit[cwd] = split
 			}
+			for fk, n := range rd.Fails {
+				tool, reason, verb := splitFail(fk)
+				if reason == FailNone {
+					continue
+				}
+				s.Fails += n
+				s.FailByTool[tool] += n
+				s.FailByReason[reason] += n
+				failVerbs[tool][verb] += n
+				failRepos[cwd] += n
+
+				f := s.FailSplit[cwd]
+				if f.Reasons == nil {
+					f.Reasons = map[Fail]int{}
+				}
+				f.Total += n
+				f.Reasons[reason] += n
+				if reason == FailNoGraph {
+					f.NoGraph += n
+				}
+				if tool == Graft {
+					f.Graft += n
+				} else {
+					f.Graphify += n
+				}
+				// Day resolution: the rollup keeps failures per day, so the
+				// most this can say is which day the last one fell on. That
+				// is what the dashboard shows, and claiming a time of day the
+				// counter never held would be a worse answer.
+				if d := ParseDay(key); d.After(f.Last) {
+					f.Last = d
+				}
+				s.FailSplit[cwd] = f
+			}
 			for acct, n := range rd.Accounts {
 				accounts[acct] += n
 			}
@@ -185,8 +280,12 @@ func (x *Index) Summarize(w Window) Summary {
 	for tool, m := range verbs {
 		s.Verbs[tool] = counts(m)
 	}
+	for tool, m := range failVerbs {
+		s.FailVerbs[tool] = counts(m)
+	}
 	s.Accounts = counts(accounts)
 	s.Repos = counts(repos)
+	s.FailRepos = counts(failRepos)
 	s.Series = make([]DayPoint, 0, days)
 	for i := 0; i < days; i++ {
 		s.Series = append(s.Series, *points[DayKey(from.AddDate(0, 0, i))])

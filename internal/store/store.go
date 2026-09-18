@@ -51,6 +51,14 @@ type Settings struct {
 	Backend string `json:"backend"`
 	Model   string `json:"model"`
 
+	// OpenCodeModel is the model the opencode-go backend runs, kept apart
+	// from Model because Model is one field shared by every backend and a
+	// model id is not portable between them: "qwen2.5-coder:7b" is a real
+	// answer for ollama and a 404 for OpenCode Go. A repository's own model
+	// override still wins over this one — that was typed for that repository.
+	// Blank means gfy.DefaultOpenCodeModel.
+	OpenCodeModel string `json:"opencode_model,omitempty"`
+
 	// ClaudeAccount is the Claude Code configuration directory jobs run
 	// against — one of this machine's ~/.claude* logins. Blank means the
 	// inherited environment decides, which is the behaviour every state file

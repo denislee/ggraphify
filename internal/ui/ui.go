@@ -151,9 +151,17 @@ type App struct {
 	sorters map[string]*gtk.CustomSorter
 
 	// usageCells is the Used column's realised cells, by list-item pointer.
-	// Every other column renders from the row itself, so a rebind is the only
-	// way its text can be stale; usage lives beside the row and arrives later.
+	// It is kept separately from repaints below because the usage tick has to
+	// repaint that one column without re-rendering the other nine.
 	usageCells map[uintptr]*rowCell
+	// repaints is one closure per column, each re-rendering its own realised
+	// cells against the board's current rows. GTK re-binds a cell only when
+	// its *item* changes, and the items here are the repository paths — which
+	// do not change when a scan lands with a new state, a cleared drift or a
+	// finished job. Without this, a board whose repository set is stable
+	// repaints nothing between the moment a fix succeeds and the moment
+	// somebody scrolls the row out of view and back. See repaintRows.
+	repaints []func()
 
 	// The detail half.
 	detail   *detailPane
@@ -193,6 +201,13 @@ type App struct {
 	graftFixBtn    *gtk.Button
 	graftSetup     gfy.GraftSetup
 	graftVersion   gfy.GraftVersion
+	// The OpenCode Go group: the model dropdown for the one backend graphify
+	// does not ship. ocApply is how the Backend picker tells it that it is
+	// now the selected backend — a dropdown two groups below the choice that
+	// activates it is a dropdown nobody finds.
+	ocGroup    *adw.PreferencesGroup
+	ocModelRow *adw.ComboRow
+	ocApply    func(backend string)
 	// The local-model group: is there a model server on this machine, is it
 	// up, and what has it got. Four rows because the three ways it can be
 	// unusable have three different fixes.
@@ -531,6 +546,11 @@ func (a *App) startTick() {
 // tick is the once-a-second repaint: elapsed times, the status bar, and the
 // job log if it has moved.
 func (a *App) tick() {
+	// The rows first: a running job's cell carries its own elapsed clock, and
+	// nothing re-binds it — QueueDraw repaints the widget with the text it
+	// already has. This is what "a running job's cell is repainted every
+	// second" in jobCell has always meant, and what it now does.
+	a.repaintRows()
 	a.refreshStatus()
 	a.detail.tick()
 	a.usagePane.tick(a.onUsagePage())
@@ -661,6 +681,8 @@ func (a *App) setRows(rows []board.Row) {
 		// filter boundary or a sort key — so the filter and sorter are told,
 		// and the realised cells are repainted.
 		a.cfilt.Changed(gtk.FilterChangeDifferent)
+		a.repaintRows()
+		a.resortRows()
 	}
 	// The folder list is derived from the rows, so it is rebuilt here and
 	// nowhere else: a root added in settings, a checkout cloned into one, a
@@ -962,33 +984,21 @@ func (a *App) onJobEvent(ev jobs.Event) {
 		if s.Kind == "install" {
 			a.onSkillInstalled()
 		}
-		rescans := gfy.Rescans(s.Kind)
-		if gfy.Graft(s.Kind) {
-			// A graft run rewrote <repo>/graft and nothing in graphify-out/,
-			// so only that half of the row is re-derived.
-			a.grafts.Invalidate(s.Repo)
-			a.refresh(false)
-			if s.Kind == "graft-init" {
-				// Every check in the settings group just became stale, in the
-				// one direction that matters: it was the fix.
-				a.checkGraftSetup(false)
-			}
-		} else if gfy.Known[s.Kind].Mutates {
-			// The job changed graphify-out/, so drop that row's cached
-			// derivation and re-derive now rather than waiting up to a full
-			// tick for the board to catch up with what just happened.
-			a.graphs.Invalidate(s.Repo)
-			if !rescans {
-				a.refresh(false)
-			}
-		}
-		if rescans {
+		if gfy.Rescans(s.Kind) && s.Repo != "" {
 			// Deliberately no refresh here: the scan would race the baseline
 			// walk below and derive this row from the *old* baseline, which
 			// is the whole reason a repository whose only drift was settled
-			// by this very run kept showing as stale. ackDrift refreshes once
-			// the baseline is recorded.
+			// by this very run kept showing as stale. ackDrift invalidates
+			// and refreshes once the baseline is recorded.
+			a.graphs.Invalidate(s.Repo)
 			a.ackDrift(s.Repo, s.Started)
+		} else {
+			a.reDerive(s)
+		}
+		if s.Kind == "graft-init" {
+			// Every check in the settings group just became stale, in the
+			// one direction that matters: it was the fix.
+			a.checkGraftSetup(false)
 		}
 	case jobs.Failed:
 		// Deliberately not a toast that disappears. A failure pins itself on
@@ -1002,10 +1012,24 @@ func (a *App) onJobEvent(ev jobs.Event) {
 		} else {
 			a.toastf("%s failed (exit %d)", s.Label, s.Exit)
 		}
+		// A failed run is not a run that changed nothing: a killed `extract`
+		// leaves a half-written graph.json, which is precisely the `broken`
+		// the row has to start saying. What it must NOT do is ackDrift —
+		// graphify did not finish its walk, so it has had no final word on
+		// which files it declines to graph, and recording a baseline from a
+		// failure would settle drift that was never adjudicated.
+		a.reDerive(s)
 	case jobs.Canceled:
 		applog.Warnf("job %d cancelled: %s", s.ID, s.Label)
 		a.toastf("%s cancelled", s.Label)
+		// Same as a failure, and for the same reason: SIGKILL lands in the
+		// middle of a write as readily as an error does.
+		a.reDerive(s)
 	}
+	// Not QueueDraw alone: a transition — queued to running, running to ok —
+	// changes what the Job and Status cells should say, and a redraw of a
+	// widget GTK never re-bound repaints the previous words.
+	a.repaintRows()
 	a.view.QueueDraw()
 	a.resortJobs()
 	a.refreshStatus()
@@ -1016,6 +1040,65 @@ func (a *App) onJobEvent(ev jobs.Event) {
 	if a.jobsPage != nil {
 		a.jobsPage.reload()
 	}
+}
+
+// deriveScope is how much of the board a finished job invalidates.
+type deriveScope int
+
+const (
+	// scopeNone is a job that wrote nothing the board derives a row from — a
+	// query, a listing, a merge into a file of its own.
+	scopeNone deriveScope = iota
+	// scopeGraft is a job that rewrote <repo>/graft and nothing else.
+	scopeGraft
+	// scopeRepo is a job that wrote into one repository's graphify-out/.
+	scopeRepo
+	// scopeBoard is a mutating job with no repository of its own: a rescan,
+	// but no memo to drop. Clearing the whole graph cache would be a full
+	// re-derivation of every repository — and an unnecessary one, because the
+	// graph cache is keyed on each output directory's own identity (graph.json
+	// and manifest.json's size and mtime, the needs_update flag), so an output
+	// directory a global command wrote into busts its own entry on the next
+	// read. What Invalidate buys on top of that is the drift walk, and drift
+	// belongs to a repository.
+	scopeBoard
+)
+
+// deriveScopeOf is the decision on its own, so it can be tested without a
+// window. It is deliberately indifferent to whether the job succeeded: a
+// half-written output directory is exactly as much a reason to re-derive a row
+// as a finished one, and the row is what says so.
+func deriveScopeOf(kind, repo string) deriveScope {
+	switch {
+	case gfy.Graft(kind):
+		if repo == "" {
+			return scopeNone
+		}
+		return scopeGraft
+	case !gfy.Known[kind].Mutates:
+		return scopeNone
+	case repo == "":
+		return scopeBoard
+	default:
+		return scopeRepo
+	}
+}
+
+// reDerive drops whatever cached derivation a finished job has invalidated and
+// rescans, rather than leaving the board on a memo of the world as it was
+// before the job ran. Main thread only.
+func (a *App) reDerive(s jobs.Snapshot) {
+	switch deriveScopeOf(s.Kind, s.Repo) {
+	case scopeNone:
+		return
+	case scopeGraft:
+		a.grafts.Invalidate(s.Repo)
+	case scopeRepo:
+		a.graphs.Invalidate(s.Repo)
+	case scopeBoard:
+		// Nothing to drop — see the constant. The scan below is the point.
+	}
+	a.refresh(false)
 }
 
 // ackDrift settles what a successful tree rescan left behind.

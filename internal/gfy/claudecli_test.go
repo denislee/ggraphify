@@ -170,3 +170,34 @@ func TestBackendsOffersClaudeCLI(t *testing.T) {
 	}
 	t.Fatalf("Backends does not offer %q: %q", ClaudeCLIBackend, Backends)
 }
+
+// An overlay entry the user typed themselves outranks the model setting: the
+// settings page offers GRAPHIFY_CLAUDE_CLI_MODEL by name, so a board that
+// overwrote it would make that editor a lie.
+func TestClaudeCLIModelEnvPrecedence(t *testing.T) {
+	e := Env{ClaudeCLIModelVar: "sonnet"}
+	got := ClaudeCLIModelEnv(e, ClaudeCLIBackend, "haiku")
+	if got[ClaudeCLIModelVar] != "sonnet" {
+		t.Errorf("the overlay lost to the setting: %q", got[ClaudeCLIModelVar])
+	}
+
+	// A blank model is left alone rather than pinned to a guess — the
+	// inherited environment, then Claude Code's own default, decide.
+	if got := ClaudeCLIModelEnv(Env{}, ClaudeCLIBackend, "  "); len(got) != 0 {
+		t.Errorf("a blank model invented a variable: %v", got)
+	}
+}
+
+// A job rebuilt from its saved argv — a retry, a session restored after a
+// restart — has to recover the model the same way it recovers the backend.
+func TestArgvModelRoundTripsThroughAnExtractArgv(t *testing.T) {
+	argv := Argv("extract", Params{
+		Repo: ".", Backend: ClaudeCLIBackend, Model: "haiku",
+	})
+	if got := ArgvModel(argv); got != "haiku" {
+		t.Errorf("ArgvModel(%v) = %q, want haiku", argv, got)
+	}
+	if got := ArgvModel(Argv("update", Params{Repo: "."})); got != "" {
+		t.Errorf("a modelless argv reported %q", got)
+	}
+}

@@ -148,6 +148,10 @@ var KnownVars = []string{
 	"GRAPHIFY_ALLOW_LOCAL_PROVIDERS", "GRAPHIFY_HOOK_STRICT", "GRAPHIFY_HOOK_STRICT_TTL",
 	"GRAPHIFY_GEMINI_MODEL", OpenAIModelVar, "GRAPHIFY_DEEPSEEK_MODEL",
 	ClaudeCLIModelVar, "GRAPHIFY_CLAUDE_CLI_PARALLEL",
+	// OpenCode Zen. The model variable is the registered provider's
+	// model_env_key; the base-URL one is read by this board when it writes
+	// that provider, not by graphify.
+	OpenCodeModelVar, OpenCodeBaseURLVar,
 	// Local models. The first three are ollama's OWN variables, not graphify's:
 	// graphify reads them unprefixed so a machine already set up for ollama
 	// needs no second configuration. GRAPHIFY_OLLAMA_MODEL and
@@ -181,6 +185,20 @@ func ValidVar(name string) bool {
 // extraction that is going to fail on every repository for want of a key is
 // worth catching before it starts, not after.
 func HasAPIKey() bool {
+	// OpenCode's key is asked about separately, not added to the list below:
+	// graphify's own detection reaches a custom provider only after every
+	// built-in and only once the provider file exists, so "a key is set,
+	// therefore auto-detect works" is exactly the claim it cannot support.
+	// EffectiveBackend names the backend outright instead.
+	if HasOpenCodeKey() {
+		return true
+	}
+	return hasVendorAPIKey()
+}
+
+// hasVendorAPIKey is the narrower question EffectiveBackend asks: is there a
+// key for a backend graphify can detect on its own, with no help from here.
+func hasVendorAPIKey() bool {
 	for _, k := range []string{
 		"GRAPHIFY_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
 		"GEMINI_API_KEY", "GOOGLE_API_KEY", "DEEPSEEK_API_KEY", "MOONSHOT_API_KEY",

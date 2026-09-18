@@ -32,6 +32,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dns/ggraphify/internal/applog"
 	"github.com/dns/ggraphify/internal/gfy"
 	"github.com/dns/ggraphify/internal/ringbuf"
 )
@@ -516,6 +517,29 @@ func (r *Runner) SubmitCmd(kind, repo, label string, p gfy.Params, env gfy.Env) 
 	if argv == nil {
 		return nil, errors.New("jobs: no command builder for kind " + kind)
 	}
+	// OpenCode Go is a custom provider, and `--backend opencode-go` means
+	// nothing to graphify until it is written to ~/.graphify/providers.json.
+	// Doing it here rather than at the call site is the same reason the env
+	// overlays are composed here: ggraphify-job submits through this function
+	// too, and a headless sweep must not be the one path that launches a
+	// backend graphify will reject. The model goes in as well, because the
+	// entry carries the price pair graphify estimates the run's cost from and
+	// that pair is per model. A failure to write refuses the submit — the job
+	// would otherwise fail per repository with graphify's own "unknown
+	// backend", once for each of them.
+	// One token asked of the gateway before twenty-five files are: a model can
+	// be in the gateway's own listing and still refuse this account or region,
+	// and graphify reports that as "all semantic chunks failed" with no cause.
+	// Cached per model per process, so a sweep pays it once.
+	if err := gfy.PreflightOpenCode(p.Backend, p.Model); err != nil {
+		return nil, errors.New("jobs: " + err.Error())
+	}
+	if path, wrote, err := gfy.EnsureOpenCodeProvider(p.Backend, p.Model); err != nil {
+		return nil, errors.New("jobs: cannot register the " + gfy.OpenCodeBackend +
+			" provider in " + path + ": " + err.Error())
+	} else if wrote {
+		applog.Infof("registered the %s provider in %s (model %s)", gfy.OpenCodeBackend, path, p.Model)
+	}
 	dir := p.Repo
 	if dir == "" {
 		dir = repo
@@ -543,7 +567,9 @@ func (r *Runner) SubmitCmd(kind, repo, label string, p gfy.Params, env gfy.Env) 
 		// submits through this function too, and an overlay applied in the GUI
 		// only is an overlay a headless sweep runs without.
 		Env: gfy.ClaudeAccountEnv(
-			gfy.ClaudeCLIEnv(gfy.LocalEnv(gfy.JobEnv(env), p.Backend), p.Backend),
+			gfy.ClaudeCLIModelEnv(
+				gfy.ClaudeCLIEnv(gfy.LocalEnv(gfy.JobEnv(env), p.Backend), p.Backend),
+				p.Backend, p.Model),
 			p.ClaudeDir),
 		Dir: dir,
 		Out: p.Out,

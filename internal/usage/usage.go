@@ -111,7 +111,18 @@ type Event struct {
 	Branch  string    `json:"branch"` // its git branch, when the record named one
 	Account string    `json:"account"`
 	Session string    `json:"session"`
+
+	// ID is the harness's tool_use id, which is what lets a call be joined to
+	// the result that came back for it. It is empty for the events that have
+	// no result at all — a hook firing, a slash command in a user turn.
+	ID string `json:"id,omitempty"`
+	// Fail is why the call came back unusable, once its result has been seen.
+	// A call whose result has not arrived yet, or that worked, is FailNone.
+	Fail Fail `json:"fail,omitempty"`
 }
+
+// Failed reports whether this call came back unusable.
+func (e Event) Failed() bool { return e.Fail != FailNone }
 
 // Account is one Claude Code configuration directory to read: one login, and
 // the transcripts written under it. It mirrors gfy.ClaudeAccount without

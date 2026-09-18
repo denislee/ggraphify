@@ -268,6 +268,7 @@ func printUsage(rows []board.Row, days int, asJSON, asMarkdown bool) {
 			Scanned:    scanned,
 			Repos:      repos,
 			Recents:    x.Recents("", 20),
+			Blocked:    usage.Blockages(rows, s, 0),
 		}))
 		return
 	}
@@ -289,6 +290,31 @@ func printUsage(rows []board.Row, days int, asJSON, asMarkdown bool) {
 	}
 	fmt.Printf("read %d account(s) in %v, %d transcripts were new; rollup at %s\n\n",
 		len(accounts), took, scanned, strings.Replace(path, home, "~", 1))
+
+	if blocked := usage.Blockages(rows, s, 10); len(blocked) > 0 {
+		fmt.Printf("ASKED AND GOT NOTHING — %d of %d calls failed", s.Fails, s.Events)
+		if n := s.FailByReason[usage.FailNoGraph]; n > 0 {
+			fmt.Printf(", %d of them for want of an index", n)
+		}
+		fmt.Println()
+		bw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+		fmt.Fprintln(bw, "FAILED\tNO INDEX\tREPOSITORY\tDO\tWHY")
+		for _, b := range blocked {
+			do := b.Action.Command()
+			switch {
+			case b.Action == usage.AddRoot:
+				do = "add a scan root"
+			case do == "":
+				do = "-"
+			}
+			if b.Metered() {
+				do += " ($)"
+			}
+			fmt.Fprintf(bw, "%d\t%d\t%s\t%s\t%s\n", b.Fails, b.NoGraph, b.Name, do, b.Why)
+		}
+		_ = bw.Flush()
+		fmt.Println()
+	}
 
 	if recs := usage.Recommend(rows, s, 10); len(recs) > 0 {
 		fmt.Println("WORTH DOING NEXT — where usage and index state disagree")

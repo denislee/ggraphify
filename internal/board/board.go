@@ -171,6 +171,7 @@ func derive(repo discover.Repo, opts Options) Row {
 	gopts := graphstate.Options{
 		Repo:      repo.Path,
 		Out:       r.Out,
+		Head:      repo.HeadSHA,
 		SkipDrift: opts.SkipDrift,
 	}
 	if opts.Baseline != nil {
@@ -204,7 +205,7 @@ func derive(repo discover.Repo, opts Options) Row {
 	}
 	r.Graft = gr
 
-	r.Behind = g.BuiltCommit != "" && repo.HeadSHA != "" && g.BuiltCommit != repo.HeadSHA
+	r.Behind = g.Behind()
 	return r
 }
 

@@ -52,13 +52,22 @@ type record struct {
 }
 
 // block is one content block of an assistant or user message.
+//
+// The tool_use half carries the call; the tool_result half carries what came
+// back for it, joined on ID. Content is the result's output, which is read
+// only far enough to classify a failure (see failure.go) and never retained.
 type block struct {
 	Type  string `json:"type"`
 	Name  string `json:"name"`
+	ID    string `json:"id"`
 	Input struct {
 		Command string `json:"command"`
 		Skill   string `json:"skill"`
 	} `json:"input"`
+
+	ToolUseID string          `json:"tool_use_id"`
+	IsError   bool            `json:"is_error"`
+	Content   json.RawMessage `json:"content"`
 }
 
 // scanTranscript parses one transcript from off, appending what it finds to
@@ -68,7 +77,7 @@ type block struct {
 // decoder is involved. That test is what makes the corpus affordable: on a
 // working machine fewer than one line in two hundred survives it, and the
 // decoder — by far the expensive part — runs only on those.
-func scanTranscript(ctx context.Context, path, account string, off int64, since time.Time, emit func(Event)) (int64, error) {
+func scanTranscript(ctx context.Context, path, account string, off int64, since time.Time, pend *pendingSet, emit func(Event), emitR func(string, Fail)) (int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return off, err
@@ -95,8 +104,14 @@ func scanTranscript(ctx context.Context, path, account string, off int64, since 
 			if n++; n%512 == 0 && ctx.Err() != nil {
 				return pos, ctx.Err()
 			}
-			if mentions(line) {
-				parseLine(line, account, since, emit)
+			// Two ways a line is worth decoding: it names one of the tools,
+			// or it is the answer to a call that is still outstanding. The
+			// second test exists because a failure rarely names the tool that
+			// produced it — "Exit code 2" and a stack trace say nothing about
+			// graphify — so the result of a call cannot be found by the same
+			// byte scan that finds the call.
+			if mentions(line) || (pend != nil && pend.match(line)) {
+				parseLine(line, account, since, emit, emitR)
 			}
 		}
 		if err != nil {
@@ -107,16 +122,19 @@ func scanTranscript(ctx context.Context, path, account string, off int64, since 
 }
 
 var (
-	needleGraphify = []byte("graphify")
-	needleGraft    = []byte("graft")
+	needleGraphify   = []byte("graphify")
+	needleGraft      = []byte("graft")
+	needleToolResult = []byte(`"tool_result"`)
 )
 
 func mentions(line []byte) bool {
 	return bytes.Contains(line, needleGraphify) || bytes.Contains(line, needleGraft)
 }
 
-// parseLine turns one transcript record into zero or more events.
-func parseLine(line []byte, account string, since time.Time, emit func(Event)) {
+// parseLine turns one transcript record into zero or more events, and
+// resolves the results of calls this scan — or an earlier one — is still
+// waiting on.
+func parseLine(line []byte, account string, since time.Time, emit func(Event), emitR func(string, Fail)) {
 	var rec record
 	if err := json.Unmarshal(line, &rec); err != nil {
 		return
@@ -162,6 +180,15 @@ func parseLine(line []byte, account string, since time.Time, emit func(Event)) {
 		return
 	}
 	for _, b := range blocks {
+		if b.Type == "tool_result" {
+			// A result for a call this scan is not tracking is not an error:
+			// it is every other tool the agent ran. match() already made that
+			// rare, and take() is what makes it free.
+			if emitR != nil && b.ToolUseID != "" {
+				emitR(b.ToolUseID, classifyFail(resultText(b.Content), b.IsError))
+			}
+			continue
+		}
 		if b.Type != "tool_use" {
 			continue
 		}
@@ -169,19 +196,24 @@ func parseLine(line []byte, account string, since time.Time, emit func(Event)) {
 		case b.Name == "Bash":
 			for _, c := range Commands(b.Input.Command) {
 				e := base
-				e.Tool, e.Kind, e.Verb = c.Tool, CLI, c.Verb
+				// One Bash call can hold two invocations and comes back with
+				// exactly one result, so the id goes to the first of them. The
+				// alternative — every call in the line sharing the id — would
+				// report one failing command line as two failures.
+				e.Tool, e.Kind, e.Verb, e.ID = c.Tool, CLI, c.Verb, b.ID
 				emit(e)
+				b.ID = ""
 			}
 		case b.Name == "Skill":
 			if t, ok := toolNamed(b.Input.Skill); ok {
 				e := base
-				e.Tool, e.Kind, e.Verb = t, Skill, "/"+b.Input.Skill
+				e.Tool, e.Kind, e.Verb, e.ID = t, Skill, "/"+b.Input.Skill, b.ID
 				emit(e)
 			}
 		case strings.HasPrefix(b.Name, "mcp__"):
 			if t, verb, ok := mcpVerb(b.Name); ok {
 				e := base
-				e.Tool, e.Kind, e.Verb = t, MCP, verb
+				e.Tool, e.Kind, e.Verb, e.ID = t, MCP, verb, b.ID
 				emit(e)
 			}
 		}

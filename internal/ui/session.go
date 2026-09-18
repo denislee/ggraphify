@@ -174,7 +174,9 @@ func restoredJob(e store.JobEntry, st *store.Store, account string) *jobs.Job {
 	// value, and the backend the argv was built for is readable from the argv.
 	backend := gfy.ArgvBackend(e.Argv)
 	j.Env = gfy.ClaudeAccountEnv(
-		gfy.ClaudeCLIEnv(gfy.LocalEnv(gfy.JobEnv(st.Overlay(e.Repo)), backend), backend),
+		gfy.ClaudeCLIModelEnv(
+			gfy.ClaudeCLIEnv(gfy.LocalEnv(gfy.JobEnv(st.Overlay(e.Repo)), backend), backend),
+			backend, gfy.ArgvModel(e.Argv)),
 		account)
 
 	j.Held = e.Held || j.Cost == gfy.Metered || j.Local

@@ -47,6 +47,16 @@ func (a *App) params(r board.Row) gfy.Params {
 	// run would refuse; there this names claude-cli. The resolved name is in
 	// the argv the confirm dialog prints, so the substitution is on screen.
 	p.Backend = gfy.EffectiveBackend(p.Backend)
+	// OpenCode Go takes its model from its own setting, for the reason
+	// store.Settings.OpenCodeModel documents: the shared Model field holds
+	// whatever the last backend needed, and sending an ollama tag to a
+	// gateway is a failure per repository rather than a substitution.
+	if p.Backend == gfy.OpenCodeBackend && strings.TrimSpace(o.Model) == "" {
+		p.Model = gfy.DefaultOpenCodeModel
+		if m := strings.TrimSpace(set.OpenCodeModel); m != "" {
+			p.Model = m
+		}
+	}
 	// Size the chunk to the local server's context slot. graphify derives a
 	// num_ctx per request and sends it, but ollama's OpenAI-compatible
 	// endpoint drops it, so the slot stays at whatever the server was started
@@ -278,13 +288,22 @@ func (a *App) meteredNotice(sample gfy.Params) string {
 		shown = "auto-detected from whichever API key is set"
 	}
 	model := sample.Model
+	if backend == gfy.OpenCodeBackend {
+		// Never "the backend's default" for this one: the default lives in a
+		// provider entry this board wrote, so it can be named exactly, along
+		// with what it costs.
+		m, origin := gfy.OpenCodeModelFor(a.opts.Store.Overlay(sample.Repo), sample.Model)
+		model = m.Label() + " (from " + origin + ")"
+	}
 	if model == "" {
 		model = "the backend's default"
 		if backend == gfy.ClaudeCLIBackend {
 			if m := strings.TrimSpace(os.Getenv(gfy.ClaudeCLIModelVar)); m != "" {
 				model = m + " (" + gfy.ClaudeCLIModelVar + ")"
 			} else {
-				model = "Claude Code's own default (set " + gfy.ClaudeCLIModelVar + " to change it)"
+				model = "Claude Code's own default for this login — Opus on a Pro/Max plan, " +
+					"at that account's effort level (set the Model field, or " +
+					gfy.ClaudeCLIModelVar + ", to change it)"
 			}
 		}
 	}
@@ -305,22 +324,35 @@ func (a *App) meteredNotice(sample gfy.Params) string {
 		}
 		return b.String()
 	}
-	if backend == gfy.ClaudeCLIBackend {
+	switch backend {
+	case gfy.ClaudeCLIBackend:
 		acc := gfy.ClaudeAccountFor(sample.ClaudeDir)
 		b.WriteString("This is METERED. It dispatches LLM requests through the " +
 			"Claude Code CLI on this machine, billed to the " + acc.Name +
 			" login's plan rather than to an API key.\n")
 		b.WriteString("Claude Code account: " + acc.Name + " (" + acc.Dir + ")\n")
-	} else {
+	case gfy.OpenCodeBackend:
+		b.WriteString("This is METERED. It dispatches LLM requests to OpenCode Go " +
+			"against " + gfy.OpenCodeKeyVar + ", drawn from that subscription's monthly " +
+			"allowance for this model rather than from an API balance.\n")
+		b.WriteString("Endpoint: " + gfy.OpenCodeUpstream() + " (through this board's loopback " +
+			"proxy, which adds the session header the gateway requires)\n")
+	default:
 		b.WriteString("This is METERED. It dispatches LLM requests against your " +
 			"own API key and will be billed.\n")
 	}
 	b.WriteString("Backend: " + shown + "\nModel: " + model + "\n")
 	_, meteredLanes, _ := a.runner.Lanes()
 	b.WriteString("Metered lane concurrency: " + gfy.Itoa(meteredLanes) + "\n")
-	if ok, why := gfy.BackendReady(backend); !ok {
+	ready, why := gfy.BackendReady(backend)
+	if backend == gfy.OpenCodeBackend {
+		// BackendReady answers for a job with nothing chosen; here the model
+		// is known, and it is half of what this backend's readiness means.
+		ready, why = gfy.OpenCodeReady(sample.Model)
+	}
+	if !ready {
 		b.WriteString("\n⚠ " + why + "\nEvery one of these runs is likely to fail.")
-	} else if backend == gfy.ClaudeCLIBackend {
+	} else if backend == gfy.ClaudeCLIBackend || backend == gfy.OpenCodeBackend {
 		b.WriteString("\n" + why)
 	}
 	return b.String()

@@ -183,3 +183,32 @@ func containsArg(argv []string, want string) bool {
 	}
 	return false
 }
+
+// A graph whose only defect is that HEAD moved past it gets the same free
+// remedy drift gets: one `update`, which re-extracts, re-clusters and re-stamps
+// the graph with the current commit. Nothing metered, so the auto-fix loop can
+// run it unattended.
+func TestBehindHeadPlansTheFreeUpdate(t *testing.T) {
+	g := graphstate.Graph{
+		State:       graphstate.StateStale,
+		BuiltCommit: "1111111",
+		HeadCommit:  "2222222",
+		Communities: 12,
+		Labeled:     true,
+		HasReport:   true,
+	}
+	p := For(g, false)
+	kinds := []string{}
+	for _, s := range p.Steps {
+		kinds = append(kinds, s.Kind)
+	}
+	if len(kinds) != 1 || kinds[0] != "update" {
+		t.Fatalf("steps = %v, want [update]", kinds)
+	}
+	if p.Metered() {
+		t.Error("the behind-HEAD plan must stay free")
+	}
+	if len(p.Unreachable) != 0 {
+		t.Errorf("unreachable = %+v, want none", p.Unreachable)
+	}
+}

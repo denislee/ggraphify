@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/graftstate"
@@ -208,4 +209,182 @@ func times(n int) string {
 		return "once"
 	}
 	return fmt.Sprintf("%d times", n)
+}
+
+// --- failures -------------------------------------------------------------
+
+// Blocked is one working directory where calls actually came back unusable.
+//
+// It is the evidence-backed twin of Rec. A recommendation is an inference —
+// this checkout was used and has no graph, so extraction would have paid —
+// whereas this is the thing itself: an agent ran `graphify query` here and was
+// told there was no graph to answer from. That is why the two lists are not
+// merged. A repository can appear in both, and when it does the failure is the
+// stronger statement.
+type Blocked struct {
+	// Repo is the working directory the calls failed in, folded up to the
+	// checkout that owns it when the board knows one.
+	Repo string
+	Name string
+	// Fails is every failed call in the window; NoGraph is the subset that
+	// failed for want of an index.
+	Fails   int
+	NoGraph int
+	// Uses is how often either tool was called there at all, failures
+	// included, which is what says whether the failures are the exception or
+	// the whole story.
+	Uses   int
+	Reason Fail
+	// Reasons is the readable breakdown — "no-graph 4 · timeout 1".
+	Reasons string
+	Last    time.Time
+	// OnBoard is whether this is a checkout the board scans. A directory that
+	// is not cannot be extracted until a scan root covers it.
+	OnBoard bool
+	// Action is what to do about it, or "" when there is nothing to build —
+	// a call that failed on a timeout or a denied permission is not a missing
+	// index, and offering to spend money on one would be a lie.
+	Action Action
+	Why    string
+}
+
+// Metered is shorthand for the UI, matching Rec.
+func (b Blocked) Metered() bool { return b.Action.Metered() }
+
+// Blockages ranks the directories where calls failed, worst first.
+//
+// The ranking is by failures and not by uses, because the question this list
+// answers is not "where would an index pay off" — Recommend answers that —
+// but "where did an agent already try and get nothing". A single failed query
+// in a checkout with no graph is a stronger argument for extracting it than a
+// hundred successful ones anywhere else.
+//
+// limit caps the result; zero means everything.
+func Blockages(rows []board.Row, s Summary, limit int) []Blocked {
+	byPath := make(map[string]*board.Row, len(rows))
+	paths := make([]string, 0, len(rows))
+	for i := range rows {
+		byPath[rows[i].Path] = &rows[i]
+		paths = append(paths, rows[i].Path)
+	}
+
+	// Uses and failures are both recorded per working directory; fold each up
+	// to the checkout that owns it, so one repository worked in from three
+	// subdirectories is one row and not three.
+	uses := map[string]int{}
+	for _, c := range s.Repos {
+		uses[fold(paths, c.Name)] += c.Count
+	}
+	folded := map[string]RepoFail{}
+	for cwd, f := range s.FailSplit {
+		if f.Total == 0 {
+			continue
+		}
+		key := fold(paths, cwd)
+		cur := folded[key]
+		if cur.Reasons == nil {
+			cur.Reasons = map[Fail]int{}
+		}
+		cur.Total += f.Total
+		cur.NoGraph += f.NoGraph
+		cur.Graphify += f.Graphify
+		cur.Graft += f.Graft
+		for reason, n := range f.Reasons {
+			cur.Reasons[reason] += n
+		}
+		if f.Last.After(cur.Last) {
+			cur.Last = f.Last
+		}
+		folded[key] = cur
+	}
+
+	out := make([]Blocked, 0, len(folded))
+	for path, f := range folded {
+		b := Blocked{
+			Repo: path, Name: filepath.Base(path), Fails: f.Total, NoGraph: f.NoGraph,
+			Uses: uses[path], Reason: f.Top(), Reasons: f.ReasonLine(), Last: f.Last,
+		}
+		row := byPath[path]
+		b.OnBoard = row != nil
+		b.Action, b.Why = blockedAction(row, f)
+		if row != nil {
+			b.Name = row.Name
+		}
+		out = append(out, b)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Fails != out[j].Fails {
+			return out[i].Fails > out[j].Fails
+		}
+		if out[i].NoGraph != out[j].NoGraph {
+			return out[i].NoGraph > out[j].NoGraph
+		}
+		return out[i].Repo < out[j].Repo
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// blockedAction is the verdict for one directory's failures: what to build, and
+// the sentence that says why the failures are evidence for building it.
+//
+// The board's own state is what decides, not the failure alone. A repository
+// whose graph is current and whose calls still failed has a different problem
+// — a timeout, a denied permission, a bad command line — and saying "extract
+// it" there would be advice that cannot help.
+func blockedAction(r *board.Row, f RepoFail) (Action, string) {
+	switch {
+	case r == nil:
+		return AddRoot, fmt.Sprintf("%s failed here, and it is not a checkout the board scans — "+
+			"add its folder as a scan root before anything can be built for it", calls(f.Total))
+	case r.Graph.State == graphstate.StateNone:
+		return Extract, fmt.Sprintf("%s failed with no graphify graph here at all — "+
+			"extraction is what creates the thing they were asking for", calls(f.Total))
+	case r.Graph.State == graphstate.StateBroken:
+		return Extract, fmt.Sprintf("%s failed and the graphify output here is unreadable — "+
+			"a fresh extraction is the way out", calls(f.Total))
+	case f.NoGraph > 0 && r.Graph.BuiltAt.After(f.Last.AddDate(0, 0, 1)):
+		// The graph was built after the last call that failed for want of
+		// one: the gap this row records has already been closed, and the row
+		// is history rather than work. It is still shown — a person reading
+		// "3 failed" wants to know it was three and that it is over — but
+		// offering to spend money on another extraction would be answering a
+		// question that was settled.
+		return "", fmt.Sprintf("%s failed here before the graph was built %s — already settled",
+			calls(f.Total), board.Age(r.Graph.BuiltAt))
+	case f.NoGraph > 0 && r.Graft.State == graftstate.StateNone:
+		return GraftBuild, fmt.Sprintf("%s came back with no index — the graphify graph is here, "+
+			"the graft one is not, and graft build is free", calls(f.NoGraph))
+	case f.NoGraph > 0 && r.Graph.Drift():
+		return Update, fmt.Sprintf("%s came back with no index although a graph exists (%s behind) — "+
+			"the free AST pass catches it up", calls(f.NoGraph), r.Graph.DriftString())
+	case f.NoGraph > 0:
+		return Extract, fmt.Sprintf("%s came back with no index although the board reads one here — "+
+			"re-extracting is the way to settle it", calls(f.NoGraph))
+	}
+	// Everything left failed for a reason no index would have changed. It is
+	// still shown: a repository whose every call times out is worth knowing
+	// about, and silently dropping it would make the failure count on the
+	// dashboard not add up.
+	return "", fmt.Sprintf("%s failed here, and the indexes are current — %s. Nothing to build; "+
+		"this is the harness or the command line, not a missing graph", calls(f.Total), f.ReasonLine())
+}
+
+// fold maps a working directory to the checkout that owns it, or leaves it as
+// it is when no checkout does.
+func fold(paths []string, cwd string) string {
+	if owner, ok := ownerOf(paths, cwd); ok {
+		return owner
+	}
+	return cwd
+}
+
+func calls(n int) string {
+	if n == 1 {
+		return "1 call"
+	}
+	return fmt.Sprintf("%d calls", n)
 }

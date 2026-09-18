@@ -353,6 +353,8 @@ type usagePane struct {
 	tiles    *gtk.FlowBox
 	recs     *gtk.Box
 	recsSec  gtk.Widgetter
+	fails    *gtk.Box
+	failsSec gtk.Widgetter
 	timeline *gtk.Label
 	verbs    *gtk.Box
 	where    gtk.Widgetter
@@ -466,6 +468,9 @@ func (a *App) newUsagePane() *usagePane {
 	p.recs = gtk.NewBox(gtk.OrientationVertical, 4)
 	p.recsSec = usageSection("Worth doing next", p.recs)
 
+	p.fails = gtk.NewBox(gtk.OrientationVertical, 4)
+	p.failsSec = usageSection("Asked, and got nothing", p.fails)
+
 	p.verbs = gtk.NewBox(gtk.OrientationHorizontal, 24)
 	p.verbs.SetHomogeneous(true)
 	p.whereBox = gtk.NewBox(gtk.OrientationVertical, 2)
@@ -498,6 +503,12 @@ func (a *App) newUsagePane() *usagePane {
 	// and a work queue below three sections of statistics is a work queue
 	// nobody scrolls to.
 	body.Append(p.recsSec)
+	// The failures sit with the recommendations rather than down among the
+	// breakdowns, and above them: a recommendation is an inference from
+	// counters, a failure is an agent that already asked this repository a
+	// question and was told there was no graph. The stronger evidence goes
+	// first, and both are within one screen of the tiles.
+	body.Append(p.failsSec)
 	body.Append(usageSection("Every day", p.timeline))
 	body.Append(usageSection("What was run", p.verbs))
 	body.Append(p.where)
@@ -599,8 +610,19 @@ func (p *usagePane) reload() {
 		p.tiles.Append(usageTile("—", "reads through graft"))
 	}
 	p.tiles.Append(usageTile(shortCount(s.SavedTokens), "tokens graft saved"))
+	// The failure tile is only drawn when there are failures. A permanent
+	// "0 failed" tile would push one of the five that always mean something
+	// onto a second row of the flow box to say nothing.
+	if s.Fails > 0 {
+		label := "calls came back with nothing"
+		if n := s.FailByReason[usage.FailNoGraph]; n > 0 {
+			label = fmt.Sprintf("failed — %d for want of an index", n)
+		}
+		p.tiles.Append(usageFailTile(fmt.Sprint(s.Fails), label))
+	}
 
 	p.fillRecs(s, repo)
+	p.fillFails(s, repo)
 
 	p.timeline.SetText(usageTimeline(s))
 
@@ -732,6 +754,79 @@ func (p *usagePane) recButton(r usage.Rec) *gtk.Button {
 	return b
 }
 
+// fillFails repaints the failure list: the directories where a call actually
+// ran and came back unusable.
+//
+// This is the section the dashboard was missing. Everything else on the page
+// is derived from counters that only say a tool WAS used; this says what came
+// back, and the common answer — "error: graph file not found" — names a
+// repository that an agent tried to use and could not, with the button that
+// creates the thing it was asking for.
+func (p *usagePane) fillFails(s usage.Summary, repo string) {
+	blocked := usage.Blockages(p.a.allRows(), s, 8)
+
+	clearBox(p.fails)
+	if len(blocked) == 0 {
+		switch {
+		case s.Events == 0:
+			p.fails.Append(dimLabel("No call was made here in this window, so none could fail."))
+		default:
+			p.fails.Append(dimLabel("Every call either tool made in this window came back usable."))
+		}
+		return
+	}
+	head := fmt.Sprintf("%d of %d calls failed in this window", s.Fails, s.Events)
+	if n := s.FailByReason[usage.FailNoGraph]; n > 0 {
+		head += fmt.Sprintf(" — %d of them had no index to answer from", n)
+	}
+	p.fails.Append(dimLabel(head))
+	for _, b := range blocked {
+		p.fails.Append(p.failRow(b))
+	}
+}
+
+// failRow is one directory's failures: how many, why, and — when an index is
+// what was missing — the button that builds it.
+func (p *usagePane) failRow(b usage.Blocked) gtk.Widgetter {
+	count := gtk.NewLabel(fmt.Sprint(b.Fails))
+	count.AddCSSClass("heading")
+	if b.NoGraph > 0 {
+		// The same mark the board's Used column gives a repository that was
+		// used with no graph, for the same reason: this is the failure that
+		// has a fix.
+		count.AddCSSClass("st-broken")
+	}
+	count.SetWidthChars(5)
+	count.SetXAlign(1)
+	count.SetTooltipText(fmt.Sprintf("%d failed call(s) of %d here — %s", b.Fails, b.Uses, b.Reasons))
+
+	title := fmt.Sprintf("%s — %s", b.Name, b.Why)
+	if !b.Last.IsZero() {
+		title += fmt.Sprintf(" (last %s)", board.Age(b.Last))
+	}
+	name := gtk.NewLabel(title)
+	name.SetXAlign(0)
+	name.SetWrap(true)
+	name.SetHExpand(true)
+	name.SetTooltipText(gfy.Tilde(b.Repo) + "\n" + b.Reasons)
+
+	box := gtk.NewBox(gtk.OrientationHorizontal, 12)
+	box.Append(count)
+	box.Append(name)
+	if b.Action == "" {
+		// Nothing to build: the calls failed on a timeout, a denied
+		// permission or a bad command line, and a button offering to spend
+		// money on an extraction here would be answering a question nobody
+		// asked.
+		box.Append(dimLabel(b.Reasons))
+		return box
+	}
+	box.Append(p.recButton(usage.Rec{
+		Repo: b.Repo, Name: b.Name, Uses: b.Fails, Action: b.Action, Why: b.Why,
+	}))
+	return box
+}
+
 // copyReport puts the whole window on the clipboard as markdown.
 //
 // The dashboard can show that graft was offered to two hundred sessions and
@@ -755,6 +850,7 @@ func (p *usagePane) copyReport() {
 		Scanned:    scanned,
 		Repos:      repoPaths(rows),
 		Recents:    p.a.usage.Recents(repo, 20),
+		Blocked:    usage.Blockages(rows, s, 0),
 	})
 	p.a.win.Clipboard().SetText(text)
 	p.a.toastf("copied %s of usage — paste it to an agent and ask where the indexes are being missed",
@@ -1017,18 +1113,39 @@ func usageEventRow(e usage.Event) gtk.Widgetter {
 	// Local time: transcripts record UTC, and a list headed "Latest" that
 	// disagrees with the clock on the wall by three hours is worse than no
 	// list at all.
+	verb := ellipsis(e.Verb, 16)
+	tip := e.Repo + "\nsession " + e.Session + "\nvia " + e.Kind.String()
+	if e.Failed() {
+		// The one mark this list needed: a call that ran and came back with
+		// nothing reads identically to one that answered, and on a list headed
+		// "Latest" that is the difference between a tool being used and a tool
+		// being tried.
+		verb = ellipsis("✕ "+e.Verb, 16)
+		tip += "\nfailed: " + e.Fail.Why()
+	}
 	l := gtk.NewLabel(fmt.Sprintf("%s  %-9s %-16s %-18s %s",
-		e.At.Local().Format("Jan 2 15:04"), e.Tool, ellipsis(e.Verb, 16), ellipsis(where, 18), e.Account))
+		e.At.Local().Format("Jan 2 15:04"), e.Tool, verb, ellipsis(where, 18), e.Account))
 	l.SetXAlign(0)
 	l.AddCSSClass("argv")
-	l.SetTooltipText(e.Repo + "\nsession " + e.Session + "\nvia " + e.Kind.String())
+	if e.Failed() {
+		l.AddCSSClass("st-broken")
+	}
+	l.SetTooltipText(tip)
 	return l
 }
 
-func usageTile(value, label string) gtk.Widgetter {
+func usageTile(value, label string) gtk.Widgetter { return tile(value, label, "") }
+
+// usageFailTile is the same tile in the colour the board gives a broken state.
+func usageFailTile(value, label string) gtk.Widgetter { return tile(value, label, "st-broken") }
+
+func tile(value, label, class string) gtk.Widgetter {
 	v := gtk.NewLabel(value)
 	v.SetXAlign(0)
 	v.AddCSSClass("title-2")
+	if class != "" {
+		v.AddCSSClass(class)
+	}
 	l := gtk.NewLabel(label)
 	l.SetXAlign(0)
 	l.AddCSSClass("dim")

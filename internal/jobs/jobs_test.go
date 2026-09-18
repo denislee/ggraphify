@@ -1254,3 +1254,43 @@ func TestGetAgreesWithSnapshotAndMissesNothing(t *testing.T) {
 		t.Error("Get invented a job that was never submitted")
 	}
 }
+
+// The model setting has to reach the claude-cli backend as an environment
+// variable, because graphify's CLI path never receives the --model flag it
+// puts on the command line: _call_claude_cli reads GRAPHIFY_CLAUDE_CLI_MODEL
+// and nothing else. Before this, a board configured for haiku ran every
+// extraction on whatever the Claude Code account defaulted to — Opus, on a
+// Pro/Max login — and the settings field looked like it had taken effect.
+func TestClaudeCLIModelReachesTheSubprocess(t *testing.T) {
+	fakeGraphify(t, `echo "CLI_MODEL=$GRAPHIFY_CLAUDE_CLI_MODEL"`)
+
+	r := New(Options{})
+	defer r.Close()
+	repo := repoDir(t)
+	job, _ := r.SubmitCmd("update", repo, "Update",
+		gfy.Params{Repo: repo, Backend: gfy.ClaudeCLIBackend, Model: "haiku"}, nil)
+	wait(t, r, job.ID)
+
+	if out := job.Log.String(); !strings.Contains(out, "CLI_MODEL=haiku") {
+		t.Errorf("the model setting did not reach the CLI backend:\n%s", out)
+	}
+}
+
+// And it stays off every other backend's environment: those take --model on
+// the command line, and a variable naming a second model is how a job comes to
+// disagree with the argv the confirm dialog showed.
+func TestClaudeCLIModelIsNotAppliedToAnotherBackend(t *testing.T) {
+	fakeGraphify(t, `echo "CLI_MODEL=$GRAPHIFY_CLAUDE_CLI_MODEL"`)
+	t.Setenv(gfy.ClaudeCLIModelVar, "")
+
+	r := New(Options{})
+	defer r.Close()
+	repo := repoDir(t)
+	job, _ := r.SubmitCmd("update", repo, "Update",
+		gfy.Params{Repo: repo, Backend: "claude", Model: "haiku"}, nil)
+	wait(t, r, job.ID)
+
+	if out := job.Log.String(); !strings.Contains(out, "CLI_MODEL=\n") {
+		t.Errorf("a metered API job carried the CLI backend's model variable:\n%s", out)
+	}
+}

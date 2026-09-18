@@ -167,3 +167,31 @@ func TestRestoredJobKeepsItsRecordedLabel(t *testing.T) {
 		t.Fatalf("a recorded label was rewritten: %+v", j)
 	}
 }
+
+// What a finished job invalidates. The cases that matter are the two the board
+// got wrong: a failure is scoped exactly like a success (a killed extract
+// leaves a half-written graph.json behind, which is a row that has to start
+// saying `broken`), and a job with no repository of its own has no row to drop
+// but still deserves a rescan.
+func TestDeriveScopeOf(t *testing.T) {
+	cases := []struct {
+		kind, repo string
+		want       deriveScope
+	}{
+		{"update", "/r", scopeRepo},
+		{"extract", "/r", scopeRepo},
+		{"cluster-only", "/r", scopeRepo},
+		{"export-html", "/r", scopeRepo},
+		{"graft-init", "/r", scopeGraft},
+		{"install", "", scopeBoard},
+		{"global-list", "", scopeNone},  // reads, writes nothing
+		{"merge-graphs", "", scopeNone}, // writes a file of its own, not an output dir
+		{"query", "/r", scopeNone},      // reads the graph
+		{"nonesuch", "/r", scopeNone},   // unknown kinds are not assumed to mutate
+	}
+	for _, c := range cases {
+		if got := deriveScopeOf(c.kind, c.repo); got != c.want {
+			t.Errorf("deriveScopeOf(%q, %q) = %d, want %d", c.kind, c.repo, got, c.want)
+		}
+	}
+}

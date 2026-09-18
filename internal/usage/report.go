@@ -44,6 +44,10 @@ type ReportOptions struct {
 	Repos []string
 	// Recents is the tail of the event log, newest first. Optional.
 	Recents []Event
+	// Blocked is where calls actually failed, worst first — Blockages. It is
+	// passed in rather than derived because it needs the board's rows, which
+	// this package's renderer deliberately does not read.
+	Blocked []Blocked
 }
 
 // reportRepos caps the per-repository table. A machine with three hundred
@@ -71,6 +75,7 @@ func Report(s Summary, recs []Rec, opt ReportOptions) string {
 	b.WriteString(".\n\n")
 
 	reportHeadline(&b, s)
+	reportFailures(&b, s, opt)
 	reportOpportunity(&b, s, recs)
 	reportRepoTable(&b, s, opt)
 	reportVerbs(&b, s)
@@ -110,6 +115,61 @@ func reportHeadline(b *strings.Builder, s Summary) {
 			short(s.SavedTokens), short(s.BilledTokens), s.CostUSD())
 		b.WriteString("  (the dollars are what the sessions that used graft were billed in total, " +
 			"not the cost of graft)\n")
+	}
+	b.WriteByte('\n')
+}
+
+// reportFailures is the evidence half: not where an index would have paid off,
+// but where an agent already asked and was told there was nothing to answer
+// with. It comes before the recommendations because a failed call is a
+// stronger argument than an inference from counters.
+func reportFailures(b *strings.Builder, s Summary, opt ReportOptions) {
+	b.WriteString("## Failed calls — where an agent asked and got nothing\n\n")
+	if s.Fails == 0 {
+		b.WriteString("Every call either tool made in this window came back usable.\n\n")
+		return
+	}
+	fmt.Fprintf(b, "- **%d of %d calls failed** (graphify %d, graft %d)\n",
+		s.Fails, s.Events, s.FailByTool[Graphify], s.FailByTool[Graft])
+	if n := s.FailByReason[FailNoGraph]; n > 0 {
+		fmt.Fprintf(b, "- **%d of them had no index to answer from** — the tool ran, the repository "+
+			"had no graph, and the agent fell through to raw source\n", n)
+	}
+	parts := make([]string, 0, len(Fails))
+	for _, f := range Fails {
+		if n := s.FailByReason[f]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", f, n))
+		}
+	}
+	fmt.Fprintf(b, "- by reason: %s\n", strings.Join(parts, " · "))
+	b.WriteString("- failures are counted as uses as well: an agent that asked and got nothing " +
+		"still asked, and dropping those calls would hide the gap this section exists to show\n")
+
+	if len(opt.Blocked) == 0 {
+		b.WriteByte('\n')
+		return
+	}
+	b.WriteString("\n### Where, and what would fix it\n\n")
+	b.WriteString("| failed | no index | uses | repository | do | cost | why |\n|---:|---:|---:|---|---|---|---|\n")
+	for i, x := range opt.Blocked {
+		if i >= reportRepos {
+			fmt.Fprintf(b, "\n…and %d more directories with failures.\n", len(opt.Blocked)-reportRepos)
+			break
+		}
+		do, cost := "`"+x.Action.Command()+"`", "free"
+		switch {
+		case x.Action == AddRoot:
+			do = "add a scan root"
+		case x.Action == "":
+			// Nothing to build: the failures were not a missing index, or the
+			// index that was missing has since been built. A command in this
+			// cell would be advice that cannot help.
+			do, cost = "—", "—"
+		case x.Metered():
+			cost = "METERED"
+		}
+		fmt.Fprintf(b, "| %d | %d | %d | %s | %s | %s | %s |\n",
+			x.Fails, x.NoGraph, x.Uses, board.Tilde(x.Repo), do, cost, x.Why)
 	}
 	b.WriteByte('\n')
 }
@@ -342,7 +402,9 @@ func reportAsk(b *strings.Builder) {
 	b.WriteString("4. Do the verbs suggest shallow use — one `ask` per session and nothing else — " +
 		"where `callers`, `grep` or `skeleton` would have answered better?\n")
 	b.WriteString("5. Which of the recommendations above would pay for itself fastest, given the " +
-		"usage each repository already has?\n\n")
+		"usage each repository already has?\n")
+	b.WriteString("6. Which of the failed calls were a missing index rather than a bad command " +
+		"line — and is any repository failing repeatedly for the same reason?\n\n")
 	b.WriteString("Answer from this report. Do not re-derive the numbers, and do not treat the " +
 		"absence of a repository as evidence of anything — it may simply have had no sessions.\n")
 }

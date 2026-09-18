@@ -138,7 +138,11 @@ func For(g graphstate.Graph, allowMetered bool) Plan {
 			Why:  "graphify flagged this graph for re-extraction, which is the semantic pass, not the AST one",
 		})
 
-	case has(graphstate.IssueDrift), has(graphstate.IssueNeedsUpdate):
+	case has(graphstate.IssueDrift), has(graphstate.IssueNeedsUpdate), has(graphstate.IssueBehind):
+		// Behind-HEAD lands here with drift because the remedy is the same
+		// command: `update` re-extracts whatever moved and stamps the graph
+		// with the current commit, which is what clears the issue even when
+		// the tree itself never drifted (a commit of already-extracted files).
 		p.Steps = append(p.Steps, Step{
 			Kind: "update",
 			Why:  "re-extract the changed files from the AST and re-cluster — free",

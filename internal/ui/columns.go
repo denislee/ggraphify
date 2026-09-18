@@ -141,6 +141,13 @@ var columns = []colSpec{
 		render: func(a *App, l *gtk.Label, r *board.Row) (string, string) {
 			s := r.Graph.DriftString()
 			if s == "" {
+				// A commit of already-extracted files moves HEAD without
+				// moving one byte in the tree, so the counters are all zero
+				// and the row is still out of date. An empty cell next to a
+				// stale chip is the one thing this column must not show.
+				if r.Graph.Behind() {
+					return "behind HEAD", "st-stale"
+				}
 				return "", ""
 			}
 			if r.Graph.NeedsUpdate {
@@ -263,6 +270,12 @@ func stateWeight(a *App, r *board.Row) int {
 func driftWeight(r *board.Row) int {
 	g := r.Graph
 	n := g.DriftAdded + g.DriftChanged + g.DriftRemoved
+	if g.Behind() {
+		// Enough to sort above a clean row, far below any real drift count:
+		// behind-HEAD is a reason to update, not a bigger one than 30 changed
+		// files.
+		n++
+	}
 	if g.NeedsUpdate {
 		n += 100000
 	}
@@ -391,6 +404,30 @@ func (a *App) addColumn(spec colSpec, width int) *gtk.ColumnViewColumn {
 	factory.ConnectTeardown(func(obj *coreglib.Object) {
 		if li := asCell(obj); li != nil {
 			delete(cells, li.Native())
+		}
+	})
+
+	// The out-of-band repaint for this column. Every scan replaces the Row
+	// structs wholesale, so the pointer a bind stored belongs to the previous
+	// scan's slice — the path is what survives, and the row is looked up again
+	// through it. A cell whose row has left the board is left alone: it is
+	// about to be unbound by the splice that removed it.
+	a.repaints = append(a.repaints, func() {
+		for _, c := range cells {
+			if c == nil || c.row == nil || c.label == nil {
+				continue
+			}
+			r := a.row(c.row.Path)
+			if r == nil {
+				continue
+			}
+			c.row = r
+			text, class := spec.render(a, c.label, r)
+			if c.text != text {
+				c.label.SetText(text)
+				c.text = text
+			}
+			setClass(c.label, &c.class, class)
 		}
 	})
 
@@ -525,6 +562,47 @@ func (a *App) resortJobs() {
 	}
 	col, _ := a.currentSort()
 	if col != "job" && col != "state" {
+		return
+	}
+	if s := a.sorters[col]; s != nil {
+		s.Changed(gtk.SorterChangeDifferent)
+	}
+}
+
+// repaintRows re-renders every realised cell of every column in place, for the
+// rows the board holds now. Main thread only.
+//
+// It is the whole-board form of repaintUsageCells, and it exists for the same
+// GTK reason: a cell is re-bound when its ITEM changes, and the items are the
+// repository paths. A scan that lands with the same repositories in it —
+// which is every scan on a settled board — changes only what is behind those
+// paths, so nothing re-binds and the Status, Drift, Built and Job cells keep
+// whatever text they were last given. That is what makes a finished auto-fix
+// look like it did nothing until the row is scrolled away and back.
+//
+// items-changed over the whole range would also work, and is what a splice
+// emits: it would drop the scroll position and the selection on every tick.
+// There are about as many realised cells as visible rows, so repainting them
+// directly is both cheaper and quieter.
+func (a *App) repaintRows() {
+	for _, repaint := range a.repaints {
+		repaint()
+	}
+}
+
+// resortRows re-sorts the board after a scan replaced the rows underneath it.
+//
+// Same GTK contract as the repaint above, one layer up: the sorter is asked
+// for its keys when the model changes, and a scan does not change the model —
+// so a row that just went from stale to fresh keeps its place in a board
+// sorted by state until something else moves. Only the column actually being
+// sorted by is invalidated; every Changed is a full re-sort.
+func (a *App) resortRows() {
+	if a.view == nil {
+		return
+	}
+	col, _ := a.currentSort()
+	if col == "" {
 		return
 	}
 	if s := a.sorters[col]; s != nil {

@@ -686,7 +686,8 @@ nothing and every extraction would refuse. So when the backend is left on **auto
 
 | environment | backend ggraphify runs | shown as |
 | --- | --- | --- |
-| an API key is exported | blank — graphify detects from the key | `auto-detect` |
+| a vendor API key is exported | blank — graphify detects from the key | `auto-detect` |
+| no vendor key, `OPENCODE_API_KEY` exported | `opencode-go`, passed explicitly | `auto-detect (→ opencode-go)` |
 | no key, `claude` installed | `claude-cli`, passed explicitly | `auto-detect (→ claude-cli)` |
 | no key, no `claude`, a local server answering | `ollama`, passed explicitly | `auto-detect (→ ollama)` |
 | none of those | blank, and the confirm dialog says why the run will fail | `auto-detect` |
@@ -694,6 +695,64 @@ nothing and every extraction would refuse. So when the backend is left on **auto
 The resolved name goes into the argv the confirm dialog prints and the job log records, so
 the substitution is on screen rather than behind it. Picking `claude-cli` in **Settings ▸
 LLM defaults ▸ Backend** pins it regardless of what keys are set.
+
+### OpenCode Go: a $10/month subscription, with the model as a setting
+
+`opencode-go` is the one entry in the Backend list that `graphify` does not ship. It does
+not have to: `llm.py` merges every provider in `~/.graphify/providers.json` into its backend
+table before detection runs, so a registered provider is a name `--backend` accepts like any
+built-in. The board writes that entry — endpoint `https://opencode.ai/zen/go/v1`, `env_key`
+`OPENCODE_API_KEY` — the first time a job asks for the backend.
+
+Registering a provider rather than repointing the `openai` backend at the gateway with
+`OPENAI_BASE_URL` is deliberate. The other route would mean copying your credential through
+ggraphify's own job state, and would leave a job whose argv said `openai` indistinguishable
+from a real OpenAI run in the log, the retry path and the cost notice. This way the key
+stays where you exported it — graphify reads it itself — and the argv says `opencode-go`.
+
+- **Export `OPENCODE_API_KEY` before launching the board.** Subscribe at
+  <https://opencode.ai/docs/go>. ggraphify never stores a key, only the backend's name.
+- **The model is a dropdown, in Settings ▸ OpenCode Go ▸ Model,** not the shared Model field
+  under LLM defaults. It is kept apart because a model id is not portable between backends:
+  `qwen2.5-coder:7b` is a real answer for ollama and a 404 for this gateway. A repository's
+  own model override still wins over it.
+- **A listed model is not necessarily a working model,** so one is asked for a single token
+  before a run starts. `muse-spark-1.2-contributor` and `-1.3-` are in the gateway's listing
+  and answer `500 Internal server error` — the plan marks them "limited regions", and a region
+  your account is not in presents as that 500 rather than as an absence. Nothing readable
+  tells the two apart, so ggraphify probes the chosen model (once per model per process,
+  single-digit tokens), refuses the submit with the gateway's own sentence, and says the same
+  thing in the settings group as you pick. A probe that cannot reach the gateway is not
+  treated as a verdict.
+- **Which models exist comes from the gateway, what they cost comes from models.dev.** That
+  split is not pedantry: models.dev publishes ids for this provider that the gateway does not
+  serve — `ox-alpha-free` is one — and choosing one fails every chunk of a run with
+  `Model ox-alpha-free is not supported`, which graphify reports only as "all semantic chunks
+  failed". The dropdown is built from `https://opencode.ai/zen/go/v1/models`, priced from
+  models.dev, sorted cheapest first with the unpriced ones last, and this build's catalogue is
+  baked in so it is populated offline. Once a live list has been fetched, the confirm dialog
+  refuses a model that list does not contain.
+- **Choosing a model moves the price with it.** `llm.py` estimates a run's cost from the
+  provider entry's one price pair, so the entry is rewritten — `base_url`, `default_model`,
+  `env_key`, `model_env_key` and `pricing` are the board's fields. Any other field you add by
+  hand survives, as does every other provider in the file. The default model is
+  `glm-5.3-flash`: an extraction is a schema-constrained JSON job over one file at a time,
+  which is the shape a small fast model does well and a frontier model only does expensively.
+- **`OPENCODE_BASE_URL` overrides the gateway the proxy forwards to** — for a corporate proxy, or for
+  OpenCode Zen (`https://opencode.ai/zen/v1`, pay-as-you-go over the same estate plus the
+  frontier models) for somebody on that plan instead. Both plans read the same key variable,
+  so the URL is what decides which one a request is billed against.
+- **Jobs reach the gateway through a loopback proxy, and that is why `base_url` says
+  `127.0.0.1`.** The gateway *refuses* a request with no `x-opencode-session` header — every
+  model answers `400 MissingSessionID` — and graphify builds its client as
+  `OpenAI(api_key, base_url, timeout, max_retries)` with no `default_headers` and no hook for
+  one. So the board runs a proxy on 127.0.0.1 (port 11437, `GGRAPHIFY_OPENCODE_PORT` to move
+  it), started when an `opencode-go` job is submitted and shared with any other ggraphify that
+  finds the port already answering its probe. It forwards to the gateway and nowhere else,
+  adding that header — one stable session id per board process, which is the granularity the
+  plan describes for cache routing — and a `User-Agent: ggraphify/<version>`, which the plan
+  also asks for. Everything else, the `Authorization` header included, is passed through
+  untouched; the key is never read, logged or stored.
 
 Three things worth knowing about this backend:
 

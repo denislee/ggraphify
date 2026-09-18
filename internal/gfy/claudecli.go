@@ -118,8 +118,17 @@ func EffectiveBackend(backend string) string {
 	if b := strings.TrimSpace(backend); b != "" {
 		return b
 	}
-	if HasAPIKey() {
+	if hasVendorAPIKey() {
 		return "" // let graphify detect from the key that is set
+	}
+	// OpenCode next, and named rather than left to detection: it is a custom
+	// provider, which graphify only finds after every built-in and only once
+	// ~/.graphify/providers.json exists — which it may not yet, on the first
+	// run of a fresh machine. Naming it also makes SubmitCmd write that file.
+	// It outranks claude-cli for the same reason a vendor key does: a
+	// credential that was deliberately exported is a choice already made.
+	if HasOpenCodeKey() {
+		return OpenCodeBackend
 	}
 	if HasClaudeCLI() {
 		return ClaudeCLIBackend
@@ -165,14 +174,22 @@ func BackendReady(backend string) (bool, string) {
 		// its own reasons — no server, no model pulled — and those are worth
 		// catching in the confirm rather than in the job log. See LocalReady.
 		return LocalReady(OllamaBackend, "")
+	case OpenCodeBackend:
+		// Not just "is there a key": this backend is a provider entry and a
+		// model as much as it is a credential, and the entry is the half a
+		// user cannot see. Blank asks about the model a job with nothing
+		// chosen would run; a caller holding the chosen one — the confirm
+		// dialog — asks OpenCodeReady directly.
+		return OpenCodeReady("")
 	case "bedrock":
 		return true, "Bedrock authenticates through the AWS credential chain."
 	case "":
-		if HasAPIKey() {
+		if hasVendorAPIKey() {
 			return true, "An API key is visible in this environment; graphify will auto-detect the backend."
 		}
 		return false, "No API key is visible in this environment, no Claude Code CLI was found, " +
-			"and no local model server answered, so there is nothing for graphify to auto-detect."
+			"no OpenCode key was exported, and no local model server answered, so there is " +
+			"nothing for graphify to auto-detect."
 	default:
 		// openai with OPENAI_BASE_URL repointed at a loopback server is not the
 		// OpenAI API at all — it is llama.cpp, vLLM or LM Studio, and it wants
@@ -238,6 +255,79 @@ func ArgvBackend(argv []string) string {
 		}
 	}
 	return ""
+}
+
+// ClaudeCLIModelFor reports the model a claude-cli job will actually run on,
+// and where that answer came from, so the settings page and the confirm dialog
+// name the same thing for the same reason.
+//
+// The order is the one ClaudeCLIModelEnv applies, with the inherited
+// environment last: an exported variable is only reached when the board itself
+// has nothing to say. An empty model means Claude Code's own default decides,
+// which is the expensive case worth saying out loud.
+func ClaudeCLIModelFor(overlay Env, model string) (value, origin string) {
+	if v := strings.TrimSpace(overlay[ClaudeCLIModelVar]); v != "" {
+		return v, "the overlay's " + ClaudeCLIModelVar
+	}
+	if v := strings.TrimSpace(model); v != "" {
+		return v, "the model setting"
+	}
+	if v := strings.TrimSpace(os.Getenv(ClaudeCLIModelVar)); v != "" {
+		return v, "the inherited " + ClaudeCLIModelVar
+	}
+	return "", ""
+}
+
+// ArgvModel is ArgvBackend for `--model`, so a job rebuilt from its saved
+// argv — a re-run, a session restored after a restart — carries the same model
+// its first run did. It exists because the claude-cli backend takes its model
+// from an environment variable rather than from the flag, and the environment
+// is composed fresh each time while the argv is what was persisted.
+func ArgvModel(argv []string) string {
+	for i, a := range argv {
+		if a == "--model" && i+1 < len(argv) {
+			return argv[i+1]
+		}
+		if v, ok := strings.CutPrefix(a, "--model="); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// ClaudeCLIModelEnv translates the board's model setting into the one input
+// the claude-cli backend actually reads.
+//
+// graphify passes `--model` to every other backend, but `_call_claude_cli`
+// never receives it: the CLI path takes its model from
+// GRAPHIFY_CLAUDE_CLI_MODEL and from nothing else. Left unset, the extraction
+// runs on whatever the chosen Claude Code account defaults to — which for a
+// Pro/Max login is Opus, at that account's effort level, for a per-file call
+// whose entire output is a schema-constrained JSON object. The flag stays on
+// the command line (it is inert there, and it is what ArgvModel reads back on
+// a re-run); this is what makes the setting take effect.
+//
+// An overlay entry the user typed themselves always wins: settings offers the
+// variable by name, and a board that silently overwrote it would make that
+// editor a lie. A blank model is left alone rather than pinned to a guess —
+// the inherited environment, and then Claude Code's own default, decide.
+func ClaudeCLIModelEnv(e Env, backend, model string) Env {
+	if strings.TrimSpace(backend) != ClaudeCLIBackend {
+		return e
+	}
+	m := strings.TrimSpace(model)
+	if m == "" {
+		return e
+	}
+	if _, ok := e[ClaudeCLIModelVar]; ok {
+		return e
+	}
+	c := e.Clone()
+	if c == nil {
+		c = Env{}
+	}
+	c[ClaudeCLIModelVar] = m
+	return c
 }
 
 // sameFile compares two paths by identity rather than by spelling, so a

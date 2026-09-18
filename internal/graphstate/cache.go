@@ -67,7 +67,11 @@ func (c *Cache) Read(opts Options) (Graph, error) {
 	if out == "" {
 		out = filepath.Join(opts.Repo, "graphify-out")
 	}
-	key := outKey(out)
+	// HEAD is part of the key rather than of the TTL: a commit changes the
+	// Behind verdict without touching a byte in graphify-out/, and a row that
+	// went stale on commit should say so on the next tick, not up to a TTL
+	// later.
+	key := outKey(out) + "@" + opts.Head
 	ttl := c.TTL
 	if ttl <= 0 {
 		ttl = DefaultTTL

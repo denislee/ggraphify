@@ -358,6 +358,12 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 		desc += " With no API key set and a Claude Code CLI installed here, auto-detect " +
 			"resolves to claude-cli, which runs against your Claude Code login instead."
 	}
+	if eff := gfy.EffectiveBackend(""); eff == gfy.OpenCodeBackend {
+		desc += " With " + gfy.OpenCodeKeyVar + " exported and no vendor API key, auto-detect " +
+			"resolves to " + gfy.OpenCodeBackend + ": graphify has no built-in backend by that " +
+			"name, so the board names it outright and registers it as a custom provider. Its " +
+			"model is chosen in its own group below, not in the Model field here."
+	}
 	llm.SetDescription(desc)
 
 	backend := adw.NewComboRow()
@@ -374,6 +380,8 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 			names[i] = b + " (Claude Code on this machine, no API key)"
 		case gfy.OllamaBackend:
 			names[i] = b + " (a model on this machine — free, slow, no API key)"
+		case gfy.OpenCodeBackend:
+			names[i] = b + " (OpenCode Go — a $10/month subscription, " + gfy.OpenCodeKeyVar + ")"
 		default:
 			names[i] = b
 			// openai is the OpenAI API until OPENAI_BASE_URL says otherwise,
@@ -390,15 +398,16 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 			backend.SetSelected(uint(i))
 		}
 	}
-	backend.NotifyProperty("selected", func() {
-		s := a.opts.Store.Settings()
-		s.Backend = gfy.Backends[int(backend.Selected())]
-		a.opts.Store.SetSettings(s)
-	})
 	llm.Add(backend)
 
 	model := adw.NewEntryRow()
 	model.SetTitle("Model (blank = the backend's default)")
+	// Every backend but one takes this as `--model` on the command line. The
+	// claude-cli backend ignores that flag — graphify's CLI path reads
+	// GRAPHIFY_CLAUDE_CLI_MODEL and nothing else — so for that backend the
+	// board exports this value instead. Same field, same meaning, two
+	// mechanisms; the row says so because a setting that appeared to do
+	// nothing is what sent extractions to Opus for a JSON-shaped job.
 	model.SetText(set.Model)
 	model.ConnectApply(func() {
 		s := a.opts.Store.Settings()
@@ -407,12 +416,41 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 	})
 	llm.Add(model)
 
+	// The Model field is one field for every backend, and opencode-go is the
+	// one backend it does not reach: that plan's model is a pick from a list
+	// with prices attached, kept in its own group so the cost estimate can
+	// move with it. Saying so on this row, as it happens, is the difference
+	// between a dropdown nobody finds and a dropdown that is where the user
+	// already is.
+	syncBackend := func(b string) {
+		if gfy.EffectiveBackend(b) == gfy.OpenCodeBackend {
+			model.SetSensitive(false)
+			model.SetTitle("Model — chosen under OpenCode Go, below")
+		} else {
+			model.SetSensitive(true)
+			model.SetTitle("Model (blank = the backend's default)")
+		}
+		if a.ocApply != nil {
+			a.ocApply(gfy.EffectiveBackend(b))
+		}
+	}
+	backend.NotifyProperty("selected", func() {
+		s := a.opts.Store.Settings()
+		s.Backend = gfy.Backends[int(backend.Selected())]
+		a.opts.Store.SetSettings(s)
+		syncBackend(s.Backend)
+	})
+
 	key := adw.NewActionRow()
 	key.SetTitle("API key")
 	key.SetSubtitleLines(0)
 	if gfy.HasAPIKey() {
-		key.SetSubtitle("An API key is visible in this environment. It is passed through to " +
-			"graphify and is never written to ggraphify's state file.")
+		sub := "An API key is visible in this environment. It is passed through to " +
+			"graphify and is never written to ggraphify's state file."
+		if gfy.HasOpenCodeKey() {
+			sub += " That includes " + gfy.OpenCodeKeyVar + " — see the OpenCode Go group below."
+		}
+		key.SetSubtitle(sub)
 	} else if gfy.HasClaudeCLI() {
 		key.SetSubtitle("No API key is visible in this environment — the claude-cli backend " +
 			"will be used instead, and needs none.")
@@ -436,11 +474,13 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 			" login's plan (" + gfy.Tilde(acc.Dir) + ") rather than to an API key. " +
 			"graphify runs it one request at a time unless GRAPHIFY_CLAUDE_CLI_PARALLEL=1. " +
 			"The account is chosen under Claude Code integration, below."
-		if m := strings.TrimSpace(os.Getenv(gfy.ClaudeCLIModelVar)); m != "" {
-			sub += " Model: " + m + "."
+		if m, origin := gfy.ClaudeCLIModelFor(a.opts.Store.Overlay(""), set.Model); m != "" {
+			sub += " Model: " + m + " (from " + origin + ")."
 		} else {
-			sub += " Set " + gfy.ClaudeCLIModelVar + " in the overlay below to run it on " +
-				"something cheaper than Claude Code's default."
+			sub += " Model: Claude Code's own default for that login — Opus on a Pro/Max " +
+				"plan, at that account's effort level, for an extraction whose output is a " +
+				"schema-constrained JSON object. Put a cheaper model in the Model field " +
+				"above, or set " + gfy.ClaudeCLIModelVar + " in the overlay below."
 		}
 		cli.SetSubtitle(sub)
 	} else {
@@ -448,7 +488,13 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 			"run `claude` once to authenticate, then the claude-cli backend needs no API key.")
 	}
 	llm.Add(cli)
+
 	page.Add(llm)
+
+	page.Add(a.settingsOpenCode())
+	// After the group exists, so the first call reaches it rather than the
+	// nil it would find while the page above was still being built.
+	syncBackend(set.Backend)
 
 	page.Add(a.settingsAutoFix())
 

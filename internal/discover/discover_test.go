@@ -454,3 +454,85 @@ func TestHiddenDirectoriesAreOffByDefault(t *testing.T) {
 		t.Errorf("a hidden root was not scanned; got %v", names(repos))
 	}
 }
+
+// A commit made in a terminal moves .git/HEAD and nothing else — not the scan
+// root's mtime, which is this cache's key. The listing may still be served
+// from the memo, but the commit it reports must not be: the board's branch
+// cell, its short SHA and its behind-HEAD verdict all read it.
+func TestCacheRefreshesHeadOnAHit(t *testing.T) {
+	root := t.TempDir()
+	one, two := filepath.Join(root, "one"), filepath.Join(root, "two")
+	for _, d := range []string{one, two} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkrepo(t, one, "main", "1111111111111111111111111111111111111111")
+	mkrepo(t, two, "main", "9999999999999999999999999999999999999999")
+
+	var c Cache
+	first, err := c.Walk(Options{Roots: []string{root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 2 {
+		t.Fatalf("first walk = %v, want both checkouts", names(first))
+	}
+
+	// The commit under test, plus a second checkout stripped of its .git. A
+	// fresh walk would list only one repository; a served memo lists two —
+	// which is how this asserts the refresh happened on the CACHED path and
+	// not because the walk simply ran again.
+	if err := os.WriteFile(filepath.Join(one, ".git", "refs", "heads", "main"),
+		[]byte("2222222222222222222222222222222222222222\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(two, ".git")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.Walk(Options{Roots: []string{root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %v — the listing should still be the cached one", names(got))
+	}
+	r := has(got, "one")
+	if r == nil || r.HeadSHA != "2222222222222222222222222222222222222222" {
+		t.Errorf("got %+v, want the commit that just landed", r)
+	}
+	// The cached slice itself must not have been written through: it has
+	// already been handed to a caller that may be reading it right now.
+	if first[0].HeadSHA == "2222222222222222222222222222222222222222" {
+		t.Error("refreshHeads wrote through the slice it was given")
+	}
+}
+
+// A checkout whose HEAD cannot be read keeps what it had. Blanking the Branch
+// column for a repository being deleted underneath the board would report it
+// as detached, which it is not.
+func TestCacheKeepsTheLastHeadWhenItCannotBeRead(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "one")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mkrepo(t, dir, "main", "1111111111111111111111111111111111111111")
+
+	var c Cache
+	if _, err := c.Walk(Options{Roots: []string{root}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Walk(Options{Roots: []string{root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Branch != "main" ||
+		got[0].HeadSHA != "1111111111111111111111111111111111111111" {
+		t.Errorf("got %+v, want the previous branch and commit kept", got)
+	}
+}

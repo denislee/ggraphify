@@ -332,3 +332,137 @@ func TestRecentsExcludeHooksAndNarrowToRepo(t *testing.T) {
 		t.Fatalf("recents for repo = %v, want just the graft map", got)
 	}
 }
+
+// bashCallRec is bashRec with a tool_use id, so the call can be joined to the
+// result that answers it.
+func bashCallRec(repo, session, id string, at time.Time, cmd string) map[string]any {
+	r := bashRec(repo, session, at, cmd)
+	blocks := r["message"].(map[string]any)["content"].([]any)
+	blocks[0].(map[string]any)["id"] = id
+	return r
+}
+
+// resultRec is the user turn carrying one tool_result.
+func resultRec(repo, session, id string, at time.Time, isErr bool, text string) map[string]any {
+	return map[string]any{
+		"type": "user", "timestamp": at.Format(time.RFC3339Nano),
+		"cwd": repo, "sessionId": session,
+		"message": map[string]any{"content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": id,
+				"is_error": isErr, "content": text},
+		}},
+	}
+}
+
+func TestUpdateJoinsFailedCallsToTheirResults(t *testing.T) {
+	dir := t.TempDir()
+	acct := filepath.Join(dir, ".claude")
+	repo := filepath.Join(dir, "repo")
+	now := time.Now()
+
+	writeTranscript(t, acct, "sess-f",
+		bashCallRec(repo, "sess-f", "toolu_1", now.Add(-3*time.Hour), `graphify query "how does X work"`),
+		resultRec(repo, "sess-f", "toolu_1", now.Add(-3*time.Hour), true,
+			"error: graph file not found: "+repo+"/graphify-out/graph.json"),
+		bashCallRec(repo, "sess-f", "toolu_2", now.Add(-2*time.Hour), `graft grep "Foo"`),
+		resultRec(repo, "sess-f", "toolu_2", now.Add(-2*time.Hour), true,
+			"✗ no graph — run graft build first"),
+		bashCallRec(repo, "sess-f", "toolu_3", now.Add(-time.Hour), `graphify explain "Y"`),
+		resultRec(repo, "sess-f", "toolu_3", now.Add(-time.Hour), false, "Y is the thing that does Z"),
+	)
+
+	x := New()
+	opts := Options{Accounts: []Account{{Name: "default", Dir: acct}}, Now: now}
+	if err := x.Update(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	s := x.Summarize(Window{Days: 7, Now: now})
+
+	if s.Events != 3 {
+		t.Fatalf("events = %d, want 3 — a failed call is still a call", s.Events)
+	}
+	if s.Fails != 2 {
+		t.Fatalf("fails = %d, want 2 (%+v)", s.Fails, s.FailByReason)
+	}
+	if n := s.FailByReason[FailNoGraph]; n != 2 {
+		t.Fatalf("no-graph failures = %d, want 2 — both tools say it in their own words", n)
+	}
+	if s.FailByTool[Graphify] != 1 || s.FailByTool[Graft] != 1 {
+		t.Fatalf("by tool = %+v, want one each", s.FailByTool)
+	}
+	f := s.FailSplit[repo]
+	if f.Total != 2 || f.NoGraph != 2 || f.Top() != FailNoGraph {
+		t.Fatalf("repo fail = %+v, want 2 failures, both for want of an index", f)
+	}
+	// The successful call must have resolved and left nothing behind, and the
+	// failures must not be waiting for a second answer either.
+	if len(x.Pending) != 0 {
+		t.Fatalf("pending = %+v, want every call resolved", x.Pending)
+	}
+	// The activity list carries the verdict, so "Latest" can mark the calls
+	// that came back with nothing.
+	failed := 0
+	for _, e := range x.Recents("", 10) {
+		if e.Failed() {
+			failed++
+		}
+	}
+	if failed != 2 {
+		t.Fatalf("failed events in Recents = %d, want 2", failed)
+	}
+}
+
+func TestResultInALaterScanStillLandsOnTheCall(t *testing.T) {
+	dir := t.TempDir()
+	acct := filepath.Join(dir, ".claude")
+	repo := filepath.Join(dir, "repo")
+	now := time.Now()
+	opts := Options{Accounts: []Account{{Name: "default", Dir: acct}}, Now: now}
+
+	// The call, and nothing else: the shape the live watch reads while an
+	// agent is still waiting on the command.
+	writeTranscript(t, acct, "sess-l",
+		bashCallRec(repo, "sess-l", "toolu_9", now.Add(-time.Hour), `graphify query "x"`))
+	x := New()
+	if err := x.Update(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if s := x.Summarize(Window{Days: 7, Now: now}); s.Fails != 0 {
+		t.Fatalf("fails = %d before the result arrived, want 0", s.Fails)
+	}
+	if len(x.Pending) != 1 {
+		t.Fatalf("pending = %d, want the one call still waiting", len(x.Pending))
+	}
+
+	// The answer, appended two seconds later — a different scan, and a line
+	// that does not name either tool.
+	writeTranscript(t, acct, "sess-l",
+		resultRec(repo, "sess-l", "toolu_9", now.Add(-time.Hour), true, "Exit code 1\nerror: graph file not found"))
+	if err := x.Update(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	s := x.Summarize(Window{Days: 7, Now: now})
+	if s.Fails != 1 || s.FailByReason[FailNoGraph] != 1 {
+		t.Fatalf("fails = %d (%+v), want the failure to land on the earlier call", s.Fails, s.FailByReason)
+	}
+	if s.Events != 1 {
+		t.Fatalf("events = %d, want 1 — the call must not be counted twice", s.Events)
+	}
+}
+
+func TestPendingSurvivesASaveAndReload(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.json")
+	x := New()
+	x.Pending["toolu_x"] = pendingCall{
+		Event: Event{Tool: Graphify, Verb: "query", Repo: "/tmp/repo", ID: "toolu_x", At: time.Now()},
+		Seen:  time.Now(),
+	}
+	if err := x.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	got := Load(path)
+	if c, ok := got.Pending["toolu_x"]; !ok || c.Event.Verb != "query" {
+		t.Fatalf("pending after reload = %+v, want the call preserved", got.Pending)
+	}
+}

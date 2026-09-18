@@ -75,3 +75,37 @@ func TestMCPVerb(t *testing.T) {
 		t.Fatal("mcpVerb accepted a non-MCP tool")
 	}
 }
+
+func TestClassifyFail(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		err  bool
+		want Fail
+	}{
+		{"graphify with no graph", "error: graph file not found: /r/graphify-out/graph.json", true, FailNoGraph},
+		{"graft with no graph", "✗ no graph — run graft build first", true, FailNoGraph},
+		// graft ask exits zero with nothing to say, which is still a repository
+		// that could not answer.
+		{"graft ask on an empty index", "no matching nodes — try different words, or `graft build` if graft/ is empty", false, FailNoGraph},
+		{"denied", "Permission for this action was denied by the Claude Code auto mode classifier.", true, FailDenied},
+		{"timeout", "Exit code 143\nCommand timed out after 10m 0s", true, FailTimeout},
+		{"not installed", "bash: graphify: command not found", true, FailNoTool},
+		{"other error", "Exit code 2\nls: cannot access 'x': No such file or directory", true, FailOther},
+		{"success", "Traversal: BFS depth=2 | 72 nodes found", false, FailNone},
+		// Prose about a missing graph, in output that did not fail, is not a
+		// failure: only the phrases a tool prints verbatim are believed on
+		// their own.
+		{"prose about a missing graph", "whether the graph file not found case is handled", false, FailNone},
+		// …but the tool's own line is, because a pipeline can swallow the
+		// exit code that would otherwise have flagged it.
+		{"piped through head", "error: graph file not found: /r/graphify-out/graph.json", false, FailNoGraph},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := classifyFail(c.text, c.err); got != c.want {
+				t.Fatalf("classifyFail(%q, %v) = %v, want %v", c.text, c.err, got, c.want)
+			}
+		})
+	}
+}

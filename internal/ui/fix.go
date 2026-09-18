@@ -80,6 +80,7 @@ func (a *App) actFixFreeAll() {
 		work = append(work, plannable{row: r, opts: graphstate.Options{
 			Repo:     r.Path,
 			Out:      a.params(r).Out,
+			Head:     r.HeadSHA,
 			Baseline: a.opts.Store.DriftBaseline(r.Path),
 		}})
 	}
@@ -181,6 +182,7 @@ func (a *App) freshGraph(r board.Row) graphstate.Graph {
 	g, err := graphstate.Read(graphstate.Options{
 		Repo:     r.Path,
 		Out:      a.params(r).Out,
+		Head:     r.HeadSHA,
 		Baseline: a.opts.Store.DriftBaseline(r.Path),
 	})
 	if err != nil {
