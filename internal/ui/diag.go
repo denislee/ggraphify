@@ -296,6 +296,11 @@ func (a *App) describeAutoFix(set store.Settings) string {
 			s += "; no local model (" + why + ")"
 		}
 	}
+	if ok, why := gfy.GraftReady(); ok {
+		s += "; graft indexes repaired too"
+	} else {
+		s += "; graft indexes left alone (" + why + ")"
+	}
 	if set.AutoFixMetered {
 		s += "; METERED fixes allowed"
 	} else {

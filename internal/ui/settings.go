@@ -413,6 +413,9 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 		s := a.opts.Store.Settings()
 		s.Model = strings.TrimSpace(model.Text())
 		a.opts.Store.SetSettings(s)
+		// For a local backend the model is half of "is this ready": a name
+		// the server has not pulled fails every chunk.
+		a.checkBackend()
 	})
 	llm.Add(model)
 
@@ -439,6 +442,10 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 		s.Backend = gfy.Backends[int(backend.Selected())]
 		a.opts.Store.SetSettings(s)
 		syncBackend(s.Backend)
+		// The pin just moved, so the question the banner answers has a new
+		// answer — including the good case, where a dead pin was the reason
+		// the banner was up and choosing this one is what took it down.
+		a.checkBackend()
 	})
 
 	key := adw.NewActionRow()

@@ -36,6 +36,7 @@ var keyBindings = []keyBinding{
 	{"Ctrl+H", "Fix, free steps only, on every repository on the board", "Building"},
 	{"Ctrl+G", "Sync the graft index for every repository in the selected folder", "Building"},
 	{"Ctrl+L", "Force a full LLM extraction on every listed repository, on the local model", "Building"},
+	{"Ctrl+U", "Re-extract every repository whose graph is behind HEAD — free, AST only", "Building"},
 	{"u", "Update — AST re-extraction, free", "Building"},
 	{"c", "Re-cluster, keeping placeholder names, free", "Building"},
 	{"E", "Extract — full LLM extraction, METERED", "Building"},
@@ -106,11 +107,20 @@ func (a *App) installKeys() {
 			case gdk.KEY_h, gdk.KEY_H:
 				a.actFixFreeAll()
 				return true
-			case gdk.KEY_g, gdk.KEY_G:
+			case gdk.KEY_g:
 				a.actSyncGraft()
+				return true
+			// Shift+Ctrl+G is the same sweep with graft's LLM tier on top. GTK
+			// delivers the shifted keyval, so the upper-case arm IS the
+			// shifted binding — there is no state test to write.
+			case gdk.KEY_G:
+				a.actSyncGraftDeep()
 				return true
 			case gdk.KEY_l, gdk.KEY_L:
 				a.actExtractLocalAll()
+				return true
+			case gdk.KEY_u, gdk.KEY_U:
+				a.actUpdateBehind()
 				return true
 			}
 			return false

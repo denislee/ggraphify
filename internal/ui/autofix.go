@@ -20,7 +20,7 @@ import (
 // would have printed before running. What this file does is the join: gather
 // the board's rows, ask the engine, and turn its answers into chains.
 //
-// Two rules make it safe to have on by default, and they are the only two
+// Three rules make it safe to have on by default, and they are the only three
 // worth remembering:
 //
 //   - It never spends money on its own. The LLM steps — a full extraction,
@@ -28,6 +28,13 @@ import (
 //     time and nothing else. If no local server answers, the loop falls back
 //     to the free plan (AST rebuild, clustering, report) and leaves the
 //     semantic half undone rather than reaching for a billed backend.
+//   - It repairs both indexes, but only where repairing is unattended work.
+//     graft's own index under <repo>/graft goes stale exactly the way
+//     graphify's graph does, and `graft build` fixes it for free — so a stale
+//     or unreadable one is rebuilt in the same chain. What the loop will not
+//     do is BUILD a graft index where there has never been one (that writes a
+//     directory into somebody's checkout and appends to its .gitignore) or
+//     run graft's --deep pass (that is the deep sweep, with its own gate).
 //   - It gives up. A repository whose defects survive the fix is tried a
 //     bounded number of times and then left alone, with one line in the log
 //     saying so. A loop that retried forever would be a machine that is busy
@@ -99,10 +106,19 @@ func (a *App) autoFixCandidates() []autofix.Candidate {
 		if !busy {
 			_, busy = a.runner.Busy(r.Path)
 		}
+		if !busy {
+			// A rescan whose job is finished but whose settlement is not: the
+			// drift walk and the commit restamp run off the main thread after
+			// the job ends, and until they land this row still describes the
+			// repository as it was before the fix. Planning or giving up from
+			// that row is deciding on stale evidence.
+			busy = a.settling[r.Path]
+		}
 		out = append(out, autofix.Candidate{
 			Path:     r.Path,
 			Name:     r.Name,
 			Graph:    r.Graph,
+			Graft:    r.Graft,
 			Excluded: r.Excluded,
 			Busy:     busy,
 		})
@@ -124,6 +140,18 @@ func autoFixPolicy(set store.Settings) autofix.Policy {
 		Cooldown: time.Duration(set.AutoFixCooldown) * time.Second,
 		Attempts: set.AutoFixAttempts,
 	}
+	// The other index. Whether graft can be run at all is a fact about this
+	// machine — a PATH lookup, not a preference — and it has to be resolved
+	// before the engine plans, because a loop that queued `graft build` on a
+	// machine without graft would fail once per stale checkout per cooldown
+	// and give up on each of them for a reason that has nothing to do with the
+	// checkout.
+	if ok, why := gfy.GraftReady(); ok {
+		pol.Graft = true
+	} else {
+		applog.Debugf("auto-fix: graft indexes left alone — %s", why)
+	}
+
 	if !set.AutoFixLocal() {
 		return pol
 	}
@@ -258,13 +286,16 @@ func autoFixPlanLine(act autofix.Action, pol autofix.Policy) string {
 // log, and as a toast, because the alternative is a board that silently stops
 // repairing one checkout and never mentions it.
 func (a *App) onAutoFixStuck(s autofix.Stuck) {
-	why := "the same defects came back"
+	// The engine's own sentence, not one composed here: for behind-HEAD "the
+	// same defects came back" named the wrong obstacle, and "1 attempts" read
+	// as a loop that had barely tried.
+	why := s.Why
 	if s.Err != "" {
 		why = s.Err
 	}
-	applog.Errorf("auto-fix %s: giving up after %d attempts at %s — %s. "+
+	applog.Errorf("auto-fix %s: giving up on %s — %s. "+
 		"Fix it by hand, or select it and press Fix; the loop starts over for it "+
-		"as soon as its defects change.", s.Name, s.Tries, s.Sig, why)
+		"as soon as its defects change.", s.Name, s.Sig, why)
 	a.toastf("auto-fix gave up on %s — %s", s.Name, why)
 }
 

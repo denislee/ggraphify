@@ -12,13 +12,13 @@ import (
 
 // graft is the second indexer the board knows about. It is a Node CLI rather
 // than a Python one, it writes into `<repo>/graft` rather than into
-// graphify-out/, and the only thing ggraphify asks of it is the free wiring
-// build — so the whole of that coupling is this file plus the `graft-*` arms
-// of Argv.
+// graphify-out/, and this file resolves and probes the executable both of its
+// arms need — the free wiring build here, and the deep pass in graftdeep.go.
 //
-// Deliberately NOT wired up: `graft build --deep`, which dispatches LLM
-// requests. The board would have to describe that bill in the same terms it
-// describes graphify's, and the sync this GUI offers is the free one.
+// `graft build --deep` dispatches LLM requests, so the board runs it against a
+// model on THIS machine and refuses to build the argv for anything else. A
+// vendor key would mean describing a bill in the same terms the graphify
+// actions describe theirs, and nobody asked this GUI to meter graft.
 
 // GraftBinVar overrides the executable, the same escape hatch GRAPHIFY_BIN is.
 const GraftBinVar = "GRAFT_BIN"

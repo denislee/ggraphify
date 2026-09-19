@@ -340,6 +340,36 @@ func repoAt(root, dir string, git os.DirEntry) (Repo, bool) {
 	return r, true
 }
 
+// HeadOf is the branch and resolved HEAD of one checkout, for the callers that
+// have a path and no walk: a headless job publishing its own row into the
+// knowledge index, and `ggraphify doctor`. It resolves .git in both of its
+// shapes — a directory, and the file a linked worktree carries — and, like
+// everything else in this package, it runs no git.
+func HeadOf(repo string) (branch, sha string) {
+	gitPath := filepath.Join(repo, ".git")
+	fi, err := os.Stat(gitPath)
+	if err != nil {
+		return "", ""
+	}
+	gitDir := gitPath
+	if !fi.IsDir() {
+		b, err := os.ReadFile(gitPath)
+		if err != nil {
+			return "", ""
+		}
+		line := strings.TrimSpace(string(b))
+		if !strings.HasPrefix(line, "gitdir:") {
+			return "", ""
+		}
+		gd := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+		if !filepath.IsAbs(gd) {
+			gd = filepath.Join(repo, gd)
+		}
+		gitDir = filepath.Clean(gd)
+	}
+	return head(gitDir)
+}
+
 // head reads the branch and resolved HEAD out of a git directory without
 // running git. It understands the three shapes that occur in practice: a
 // symbolic ref into refs/heads, a loose ref file, and packed-refs.

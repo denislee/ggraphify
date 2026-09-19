@@ -139,6 +139,7 @@ func (a *App) settingsOpenCode() *adw.PreferencesGroup {
 		a.opts.Store.SetSettings(s)
 		refreshStatus()
 		verify(ids[i])
+		a.checkBackend()
 	})
 
 	// The catalogue is baked in, so the dropdown is populated before any

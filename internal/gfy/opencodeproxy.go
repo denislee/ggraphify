@@ -71,6 +71,39 @@ var proxyState struct {
 	sync.Mutex
 	base    string // what the provider entry should point at
 	session string
+	// owned is true when THIS process bound the port. A proxy inherited from
+	// another ggraphify is served by that process and outlives this one, so
+	// quitting here takes nothing away from anybody; a proxy we bound goes
+	// down with us, which is the fact the quit dialog is about.
+	owned bool
+	// requests and last are what that dialog needs: this gateway is useful to
+	// tools outside ggraphify — a fleet-wide `graft build --deep` runs against
+	// it — and an external consumer whose LLM vanishes mid-run sees only a
+	// stream of connection refusals. Counting the traffic turns "quitting
+	// silently breaks something" into "quitting will break this, carry on?".
+	requests int
+	last     time.Time
+}
+
+// OpenCodeProxyActivity reports what the loopback gateway has been doing:
+// whether this process is the one serving it, how many requests it has
+// forwarded, and when the last one was.
+//
+// It is deliberately a count of requests and not of clients: the proxy cannot
+// tell graphify's own chunk from another tool's, and pretending otherwise
+// would let a quit dialog claim nobody is out there when somebody is.
+func OpenCodeProxyActivity() (base string, owned bool, requests int, last time.Time) {
+	proxyState.Lock()
+	defer proxyState.Unlock()
+	return proxyState.base, proxyState.owned, proxyState.requests, proxyState.last
+}
+
+// noteProxyRequest records one forwarded exchange.
+func noteProxyRequest() {
+	proxyState.Lock()
+	proxyState.requests++
+	proxyState.last = time.Now()
+	proxyState.Unlock()
 }
 
 // OpenCodeSession is the conversation id every proxied request carries.
@@ -154,6 +187,7 @@ func StartOpenCodeProxy() (string, error) {
 
 	proxyState.Lock()
 	proxyState.base = base
+	proxyState.owned = true
 	proxyState.Unlock()
 	return base, nil
 }
@@ -228,6 +262,7 @@ func openCodeProxyHandler() http.Handler {
 		}
 		req.Header.Set("User-Agent", "ggraphify/"+AppVersion)
 
+		noteProxyRequest()
 		resp, err := proxyTransport.RoundTrip(req)
 		if err != nil {
 			http.Error(w, "opencode-go: "+err.Error(), http.StatusBadGateway)

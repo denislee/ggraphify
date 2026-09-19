@@ -18,6 +18,8 @@ package ui
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"log"
 	"os"
 	"strings"
@@ -95,6 +97,22 @@ type App struct {
 	title  *adw.WindowTitle
 	split  *gtk.Paned
 	banner *adw.Banner
+	// backendBanner is the second, separately owned banner: the version one
+	// above belongs to graphify's own install, this one to whether a metered
+	// job could run at all. Two facts, two lifetimes — multiplexing them onto
+	// one widget would mean whichever was set last silently hid the other.
+	backendBanner *adw.Banner
+	// The last verdict, kept so the banner's button can open a dialog that
+	// explains it without re-probing every port while a human waits.
+	backendReady bool
+	backendWhy   string
+	backendAlts  []gfy.BackendChoice
+	// backendAt is when the last probe was started, and backendBusy whether
+	// one is still in flight: the re-probe rides the one-second tick, and
+	// without both of these it would be a port scan per second for as long as
+	// the banner is up.
+	backendAt   time.Time
+	backendBusy bool
 
 	// vsplit is the horizontal splitter between the board+detail half and the
 	// bottom panel; dock is the panel itself. The panel is built whether or
@@ -278,6 +296,11 @@ type App struct {
 	// and must not do that on the main thread.
 	autofix     *autofix.Engine
 	autofixBusy bool
+	// settling is the repositories whose last rescan has finished but whose
+	// aftermath — the drift walk, the commit restamp — is still running off
+	// the main thread. They count as busy for the loop, which must not plan
+	// against, or give up on, a row that is about to change. Main thread only.
+	settling map[string]bool
 	// ollama is the local model server's lifecycle: the board starts it for
 	// a job that needs it and stops it again once nothing does. It is here
 	// rather than in the jobs package because the policy — is this switched
@@ -302,6 +325,17 @@ type App struct {
 	// dirty is set when a scan was requested while one was already running,
 	// so the result is not simply dropped.
 	dirty bool
+	// indexing guards the published knowledge index the same way: the write
+	// is off the main thread and a tick must not start a second one behind
+	// the first. See knowledge.go.
+	indexing bool
+	// indexed is how many entries the last write published, for the status
+	// line and the diagnostics report.
+	indexed int
+	// quitConfirmed is set once the user has answered the "this stops the
+	// OpenCode gateway" question, so the second close request goes through.
+	// See proxyquit.go.
+	quitConfirmed bool
 
 	tickID coreglib.SourceHandle
 }
@@ -419,6 +453,14 @@ func (a *App) activate() {
 	a.banner.SetRevealed(false)
 	toolbar.AddTopBar(a.banner)
 
+	// The backend banner. A dead backend pin is invisible until somebody
+	// tries to spend money — see backend.go — so it is asked about on startup
+	// and shown here until it is fixed.
+	a.backendBanner = adw.NewBanner("")
+	a.backendBanner.SetRevealed(false)
+	a.backendBanner.ConnectButtonClicked(func() { a.backendDialog() })
+	toolbar.AddTopBar(a.backendBanner)
+
 	a.split = gtk.NewPaned(gtk.OrientationHorizontal)
 	a.split.SetStartChild(a.buildBoard())
 	a.detail = a.newDetailPane()
@@ -472,6 +514,13 @@ func (a *App) activate() {
 	a.win.ConnectCloseRequest(func() bool {
 		a.saveWindow()
 		a.saveUsage()
+		// The OpenCode gateway on loopback is served by THIS process, so
+		// quitting takes it away from whatever else is using it. See
+		// proxyquit.go: a proxy with recent traffic turns the close into a
+		// question instead of a silent failure somewhere else.
+		if a.holdForProxy() {
+			return true
+		}
 		// Nothing is torn down here: Run's deferred Close does it after the
 		// main loop returns, so a job's SIGTERM grace period does not happen
 		// with a half-destroyed window on screen.
@@ -486,6 +535,7 @@ func (a *App) activate() {
 	a.startUsage()
 	a.startTick()
 	go a.probeVersion()
+	a.checkBackend()
 }
 
 // buildStatusBar is the one-line summary under the board: how many
@@ -552,6 +602,15 @@ func (a *App) tick() {
 	// second" in jobCell has always meant, and what it now does.
 	a.repaintRows()
 	a.refreshStatus()
+	// A dead backend can come back — `ollama serve` in another terminal, a
+	// key exported into the environment this board inherited on a relaunch —
+	// and the banner has to be able to go away on its own. Only while it is
+	// showing: a ready backend is not re-probed every second for the sake of
+	// a verdict that has not moved.
+	if a.backendBanner != nil && a.backendBanner.Revealed() &&
+		time.Since(a.backendAt) > backendRecheck {
+		a.checkBackend()
+	}
 	a.detail.tick()
 	a.usagePane.tick(a.onUsagePage())
 	if a.dock != nil {
@@ -697,6 +756,10 @@ func (a *App) setRows(rows []board.Row) {
 	// there is, which makes this — and not a timer of its own — the right
 	// moment to ask whether any of them should be repaired. See autofix.go.
 	a.autoFixTick()
+	// …and the right moment to republish where every one of those graphs is,
+	// for the tools outside this process that have no scan of their own. See
+	// knowledge.go.
+	a.syncIndex(rows)
 }
 
 // rowFor resolves a model object back to its row.
@@ -1118,9 +1181,17 @@ func (a *App) ackDrift(repo string, since time.Time) {
 	if repo == "" || a.opts.Store == nil {
 		return
 	}
+	if a.settling == nil {
+		a.settling = map[string]bool{}
+	}
+	a.settling[repo] = true
 	out := a.opts.Store.Out(repo)
-	if r := a.row(repo); r != nil && r.Graph.Out != "" {
-		out = r.Graph.Out
+	head := ""
+	if r := a.row(repo); r != nil {
+		if r.Graph.Out != "" {
+			out = r.Graph.Out
+		}
+		head = r.HeadSHA
 	}
 	st := a.opts.Store
 	go func() {
@@ -1128,7 +1199,12 @@ func (a *App) ackDrift(repo string, since time.Time) {
 		// the whole of what is left, not to add to what was recorded last time.
 		d := graphstate.DriftOf(repo, out, nil, graphstate.Baseline{})
 		b := graphstate.MakeBaseline(repo, d, since)
+		// Before the baseline is recorded, because the decision is about the
+		// walk this rescan produced rather than about what the board will
+		// derive from it afterwards.
+		restampBehind(repo, out, head, d)
 		coreglib.IdleAdd(func() {
+			delete(a.settling, repo)
 			st.SetDriftBaseline(repo, b)
 			a.graphs.Invalidate(repo)
 			a.refresh(false)
@@ -1137,6 +1213,48 @@ func (a *App) ackDrift(repo string, since time.Time) {
 			}
 		})
 	}()
+}
+
+// shortCommit is the seven-character commit the logs and the row both name.
+func shortCommit(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
+}
+
+// restampBehind settles the other half of what a successful rescan leaves
+// behind: the commit the graph says it was built from.
+//
+// `graphify update` cannot advance it. Its two no-change exits leave graph.json
+// untouched by design, and the comparison that decides "no change" pops
+// built_at_commit out of both sides first — so committing files graphify had
+// already extracted produces an update that succeeds and changes nothing,
+// leaving the row `behind` for good. Fix would then prescribe that same update
+// forever and the auto-fix loop would burn its attempts on it, which is the
+// same dead end ackDrift exists to close for drift.
+//
+// The two guards are what keep this honest rather than cosmetic. A tree with
+// changed files graphify has just walked and not rebuilt from is NOT a tree the
+// graph answers for, and neither is one carrying the needs_update flag, whose
+// whole meaning is that the AST pass is not enough. Outside those, graphify has
+// just asserted that the graph it holds is what this checkout at this commit
+// produces, and the stamp is the only stale thing left in the directory.
+//
+// Off the main thread, in ackDrift's goroutine: it is a file write.
+func restampBehind(repo, out, head string, d graphstate.Drift) bool {
+	if out == "" || head == "" || len(d.Changed) > 0 || graphstate.NeedsUpdateFlag(out) {
+		return false
+	}
+	ok, err := graphstate.Restamp(out, head)
+	switch {
+	case err != nil && !errors.Is(err, graphstate.ErrNoStamp) && !errors.Is(err, fs.ErrNotExist):
+		applog.Warnf("could not advance the commit stamp for %s: %v", board.Tilde(repo), err)
+	case ok:
+		applog.Infof("commit stamp for %s advanced to %s — the rebuild found nothing to change",
+			board.Tilde(repo), shortCommit(head))
+	}
+	return ok
 }
 
 // jobFor is the latest job for a repository, or nil.

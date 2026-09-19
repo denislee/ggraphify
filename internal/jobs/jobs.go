@@ -90,6 +90,12 @@ type Job struct {
 	Env   gfy.Env
 	Dir   string // working directory; normally the checkout root
 	Out   string // the graphify-out directory this job reads or writes
+	// Notes are the facts about this job that its argv does not carry, written
+	// at the top of its log. Today that is which Claude Code configuration
+	// directory it runs as — a setting that decides whose plan pays and whose
+	// hooks and skills apply, and which is otherwise invisible in a command
+	// line that says only `--backend claude-cli`.
+	Notes []string
 
 	// Held is true for a job that sits in the queue without being dispatched.
 	// It is not a fourth status: the job IS queued, and everything that reads
@@ -566,13 +572,24 @@ func (r *Runner) SubmitCmd(kind, repo, label string, p gfy.Params, env gfy.Env) 
 		// All three belong here rather than at the call sites: ggraphify-job
 		// submits through this function too, and an overlay applied in the GUI
 		// only is an overlay a headless sweep runs without.
-		Env: gfy.ClaudeAccountEnv(
-			gfy.ClaudeCLIModelEnv(
-				gfy.ClaudeCLIEnv(gfy.LocalEnv(gfy.JobEnv(env), p.Backend), p.Backend),
-				p.Backend, p.Model),
-			p.ClaudeDir),
+		// GraftDeepEnv is the fourth, and the same shape again: graft's deep
+		// pass needs a credential variable set even when the server it talks
+		// to authenticates nothing, and a headless sweep must not be the one
+		// path that dispatches without it.
+		Env: gfy.GraftDeepEnv(
+			gfy.ClaudeAccountEnv(
+				gfy.ClaudeCLIModelEnv(
+					gfy.ClaudeCLIEnv(gfy.LocalEnv(gfy.JobEnv(env), p.Backend), p.Backend),
+					p.Backend, p.Model),
+				p.ClaudeDir),
+			kind, p.Backend),
 		Dir: dir,
 		Out: p.Out,
+		// Which Claude Code install this runs as, when that is a fact about
+		// this job at all. Composed here for the same reason the overlays
+		// are: ggraphify-job submits through this function too, and a note
+		// added in the GUI only is a note a headless run does without.
+		Notes: notesFor(kind, p),
 	}
 	if pre := r.precheck(); pre != nil {
 		if err := pre(j); err != nil {
@@ -1115,6 +1132,9 @@ func (r *Runner) run(j *Job, ctx context.Context, cancel context.CancelFunc) {
 			j.Log.WriteString("  env " + line + "\n")
 		}
 	}
+	for _, note := range j.Notes {
+		j.Log.WriteString("# " + note + "\n")
+	}
 
 	// The model server this job needs, up before the process that will talk
 	// to it and released once that process is gone.
@@ -1313,4 +1333,15 @@ func (w logWriter) Write(p []byte) (int, error) {
 	n, err := w.buf.Write(p)
 	w.r.emit(Event{ID: w.job.ID, Gen: w.buf.Gen(), Output: true})
 	return n, err
+}
+
+// notesFor is the per-job preamble: facts a reader of the log needs that the
+// argv does not state. One function so the GUI and the headless runner cannot
+// print different ones.
+func notesFor(kind string, p gfy.Params) []string {
+	var out []string
+	if note := gfy.AccountNote(kind, p.Backend, p.ClaudeDir); note != "" {
+		out = append(out, note)
+	}
+	return out
 }

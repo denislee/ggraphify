@@ -69,6 +69,15 @@ the same question in commit terms — and they are genuinely different questions
 branch switch moves the second without touching a single file's mtime, so the board shows
 both rather than folding them together.
 
+A graph behind HEAD is the quieter of the two failures: it reads as perfectly healthy while
+its `file:line` spans point at code the checkout has moved past. So it gets a chip of its
+own — **Behind HEAD**, beside the state chips — a count in the status line, and one action
+that clears the lot: **Ctrl+U**, or the `document-open-recent-symbolic` button in the header,
+which queues `update` on every behind-HEAD row. That is an AST re-extraction: free, no key,
+no LLM call, and deliberately *not* behind the metered confirm, because for the seventy-odd
+repositories a week of committing leaves behind it is a background pass rather than a
+billing decision. `ggraphify-scan -behind` is the same list headlessly.
+
 The walk has to skip **exactly** what graphify's extraction skips, or the number is
 noise. graphify is `.gitignore`-aware (that is what its `--no-gitignore` flag turns off),
 it does not descend into a nested checkout, and it classifies extensionless files by their
@@ -284,6 +293,7 @@ Enter      open detail     e w  export html / wiki
 t          colour scheme   W  watch on/off           U y        usage dashboard, copy it
                                                       ,  ?       settings, help
 Ctrl+F/B   page down / up  x  cancel this row's job   b  L       bottom panel, its log
+Ctrl+H     free fix, board  Ctrl+U  update every row behind HEAD (free)
 ```
 
 The filter box is **fuzzy**: the letters of a term have to appear in order, not next to
@@ -590,6 +600,28 @@ ggraphify -out-base ~/.cache/graphify    # every graph outside the checkouts
 A setting the command line decided is shown greyed out in the dialog, naming the flag that
 pinned it, rather than silently disagreeing with what the board is doing.
 
+### The index: how anything else finds a graph
+
+Graphs kept outside the checkouts are invisible from the checkout they describe — which is
+how 212 fully built graphs on this machine went unread by every agent for weeks: the tools
+looked in `graphify-out/` and found nothing. So the board publishes a lookup table,
+`<out-base>/index.json`, keyed by each checkout's **absolute path**:
+
+```sh
+jq -r '.entries["'"$PWD"'"].graph' ~/knowledge/index.json
+```
+
+One read, no globbing, and no assumption that repository basenames are unique — `~/git/api`
+and `~/tmp/api` are two entries. Each carries the output directory, `graph.json`, the
+report, the build time and commit, whether the graph is behind HEAD, the node/edge/community
+counters and how far the semantic tier got.
+
+It is written from the scan the board already paid for, only when something actually
+changed, atomically (temp file plus rename) and under a lock file, so several ggraphify
+processes finishing at once cannot corrupt it. `ggraphify-job` updates its own entry after a
+build, and `ggraphify-scan -index` writes the whole thing on a machine that rarely runs the
+GUI. A board keeping graphs in-tree publishes nothing: there is no lookup to restore.
+
 ## Detail pages
 
 - **Overview** — every derived fact, the per-repository overrides (backend, model,
@@ -677,6 +709,14 @@ button that ran it would leave the very rows that enabled it red. So the group w
 fixability, says which directory the command would actually write, and names the two ways
 out: select the default account, or copy graft's hook entries across by hand.
 
+Because the account is a setting, and frequently not the default one, **every dialog and
+job log that the choice bears on names the resolved directory**: the confirm before a
+`claude-cli` extraction, the confirm before `install`, and the first lines of the job's own
+log. It is one sentence and no behaviour change, and it exists because the alternative is
+invisible — `--backend claude-cli` in an argv says nothing about which login paid, or whose
+hooks, skills and settings were in force. They are not the ones a Claude Code session in a
+checkout runs with.
+
 The **graphify hook-guard** row is about the two integrations meeting in one session rather
 than in one file. They merge cleanly — graphify owns `PreToolUse`, graft owns the other four
 events — and in the default advisory mode both simply put their own hint in front of the
@@ -710,6 +750,16 @@ nothing and every extraction would refuse. So when the backend is left on **auto
 The resolved name goes into the argv the confirm dialog prints and the job log records, so
 the substitution is on screen rather than behind it. Picking `claude-cli` in **Settings ▸
 LLM defaults ▸ Backend** pins it regardless of what keys are set.
+
+**A pin that has stopped working is said out loud, on startup.** The confirm dialog has
+always refused a metered job whose backend has no credential, server or model — but that
+refusal only appears at the moment somebody tries to spend money, and a board mostly driving
+the free lane can sit on a dead pin for weeks with no symptom except that every graph stays
+at the AST tier. So the readiness question is asked when the board opens and again whenever
+the backend or the model setting moves, and a failure raises a banner that names it. The
+banner's button lists what *is* ready on this machine, each with the reason it would work,
+and one click applies it — it never switches by itself, because which backend runs is which
+account pays. `ggraphify doctor` answers the same question headlessly.
 
 ### OpenCode Go: a $10/month subscription, with the model as a setting
 
@@ -768,6 +818,15 @@ stays where you exported it — graphify reads it itself — and the argv says `
   plan describes for cache routing — and a `User-Agent: ggraphify/<version>`, which the plan
   also asks for. Everything else, the `Authorization` header included, is passed through
   untouched; the key is never read, logged or stored.
+- **That proxy is GUI-bound: it lives and dies with the ggraphify window.** It is a useful
+  endpoint for other tools — register `http://127.0.0.1:11437/v1` in another tool's
+  `~/.graphify/providers.json` and it will work — but it is *not* a service. There is no
+  daemon, no unit file and nothing that restarts it; close the board and the port stops
+  answering, which an external consumer sees as its model refusing connections mid-run. The
+  board will not do that silently: quitting while the proxy has forwarded a request in the
+  last ten minutes asks first, naming the endpoint and the traffic. If you need a gateway
+  that outlives the GUI, run the board and leave it running — a headless `--serve-proxy`
+  mode does not exist yet.
 
 Three things worth knowing about this backend:
 
@@ -1092,6 +1151,8 @@ ggraphify-scan -gap                              # used, and no graph to have an
 ggraphify-scan -usage                            # who actually ran graphify and graft
 ggraphify-scan -usage -usage-days 7 -json        # …last week, as JSON
 ggraphify-scan -usage -markdown                  # …as the briefing to paste into an agent
+ggraphify-scan -behind                           # graphs built before the current HEAD
+ggraphify-scan -index                            # republish <out-base>/index.json, then exit
 
 ggraphify-job -list                              # every command this build knows
 ggraphify-job -kind update -repo ~/git/svc -n    # print the argv, run nothing
@@ -1103,6 +1164,22 @@ ggraphify-job -kind update -repo ~/git/svc -out-base ~/.cache/graphify
 Both commands take the same `-out-name` / `-out-base` pair as the GUI, and `ggraphify-job`
 additionally takes `-out` to name one checkout's output directory outright. They resolve
 through the same code the board does.
+
+There is also one subcommand of the GUI binary, which needs no display:
+
+```sh
+ggraphify doctor            # assert the invariants; exit 1 when one is broken
+ggraphify doctor -json      # …as JSON, for a cron or a pre-flight
+ggraphify doctor -strict    # …treating warnings as failures too
+```
+
+It answers, against live state: is graphify installed and is it the release the command
+builders target; could the configured backend actually run a metered job right now, and
+what is ready instead if not; is every graph discoverable from the checkout it describes;
+how many graphs were built before the current HEAD; which Claude Code account jobs run as
+(it is a setting, and frequently not `~/.claude`); and how far the semantic tier has got
+across the estate — the one measure that distinguishes "a healthy AST graph" from "a graph
+no metered pass has ever completed on".
 
 `ggraphify-job` applies the same cost gate as the GUI: a metered command refuses to run
 without `-y`, and says so along with whether the backend it resolved has a credential at

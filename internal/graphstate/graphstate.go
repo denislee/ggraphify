@@ -125,11 +125,20 @@ func (g Graph) Behind() bool {
 	if g.BuiltCommit == "" || g.HeadCommit == "" {
 		return false
 	}
-	a, b := g.BuiltCommit, g.HeadCommit
+	return !sameCommit(g.BuiltCommit, g.HeadCommit)
+}
+
+// sameCommit is that prefix comparison on its own, because Restamp has to ask
+// exactly the same question before it rewrites anything — a stamp this says is
+// already current must never be "advanced" to a different spelling of itself.
+func sameCommit(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
 	if len(a) > len(b) {
 		a, b = b, a
 	}
-	return !strings.HasPrefix(b, a)
+	return strings.HasPrefix(b, a)
 }
 
 // Drift reports whether anything has moved since the graph was built.

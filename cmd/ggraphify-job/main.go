@@ -9,8 +9,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -19,9 +21,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/discover"
 	"github.com/dns/ggraphify/internal/gfy"
+	"github.com/dns/ggraphify/internal/graphstate"
 	"github.com/dns/ggraphify/internal/jobs"
+	"github.com/dns/ggraphify/internal/knowledge"
 )
 
 func main() { os.Exit(run()) }
@@ -136,6 +141,17 @@ func run() int {
 	// backend gets graphify's 60_000-token default chunks, which an ollama
 	// context slot silently truncates from the front.
 	gfy.ApplyLocalSizing(&p)
+	// graft's deep pass resolves its own backend and model: it runs on a model
+	// on this machine or it does not run, so -backend/-model are a preference
+	// here rather than the answer, exactly as they are on the board. Refusing
+	// with the reason beats emitting an argv with no --base-url in it, which
+	// would send the corpus to a vendor on whatever key happens to be exported.
+	if *kind == gfy.GraftDeepKind {
+		if ok, why := gfy.GraftDeepParams(&p); !ok {
+			fmt.Fprintln(os.Stderr, "ggraphify-job:", why)
+			return 2
+		}
+	}
 	argv := gfy.Argv(*kind, p)
 	if argv == nil {
 		fmt.Fprintf(os.Stderr, "ggraphify-job: no command builder for %q\n", *kind)
@@ -250,6 +266,13 @@ func run() int {
 			ev.Job.Status, ev.Job.Elapsed().Round(time.Millisecond), ev.Job.Exit)
 		switch ev.Job.Status {
 		case jobs.Succeeded:
+			// The graph on disk has just moved, and this process is the only
+			// one that knows it: a board in another window will not rescan for
+			// up to thirty seconds, and a headless machine has no board at
+			// all. Publishing the entry here is what keeps index.json true
+			// after a scripted build. See internal/knowledge.
+			restampBehind(spec, abs, *kind)
+			publishIndex(spec, abs)
 			code = 0
 		case jobs.Canceled:
 			code = 130
@@ -262,4 +285,84 @@ func run() int {
 		break
 	}
 	return code
+}
+
+// restampBehind advances the graph's commit stamp after a headless rescan that
+// found nothing to rebuild — the same write the board performs in ackDrift,
+// for the same reason.
+//
+// `graphify update` cannot do it itself: both of its no-change exits leave
+// graph.json untouched on purpose, and the comparison behind them drops
+// built_at_commit before comparing. So a commit of files graphify had already
+// extracted leaves the graph stamped at the old commit and every reader —
+// this process's own index entry included — calls it stale for good.
+//
+// The guards are the board's: a tree with changed files graphify walked and
+// did not rebuild from is not a tree this graph answers for, and neither is one
+// flagged for re-extraction.
+func restampBehind(spec discover.OutSpec, repo, kind string) {
+	if !gfy.Rescans(kind) {
+		return
+	}
+	_, sha := discover.HeadOf(repo)
+	if sha == "" {
+		return
+	}
+	out := spec.For(repo)
+	if graphstate.NeedsUpdateFlag(out) {
+		return
+	}
+	if d := graphstate.DriftOf(repo, out, nil, graphstate.Baseline{}); len(d.Changed) > 0 {
+		return
+	}
+	ok, err := graphstate.Restamp(out, sha)
+	switch {
+	case err != nil && !errors.Is(err, graphstate.ErrNoStamp) && !errors.Is(err, fs.ErrNotExist):
+		fmt.Fprintln(os.Stderr, "# commit stamp:", err)
+	case ok:
+		fmt.Fprintln(os.Stderr, "# commit stamp advanced to", sha[:7],
+			"— the rebuild found nothing to change")
+	}
+}
+
+// publishIndex records one repository's graph in <out-base>/index.json after a
+// build that changed it.
+//
+// Only a central out-base has an index — a graph that lives inside its own
+// checkout needs no lookup table to be found — and a failure to write one is
+// reported and then let go: the job itself succeeded, and refusing to report
+// that because a derived file could not be updated would be the tail wagging
+// the dog.
+func publishIndex(spec discover.OutSpec, repo string) {
+	base := discover.Expand(strings.TrimSpace(spec.Base))
+	if base == "" || !spec.Central() {
+		return
+	}
+	_, sha := discover.HeadOf(repo)
+	out := spec.For(repo)
+	g, err := graphstate.Read(graphstate.Options{
+		Repo: repo, Out: out, Head: sha,
+		// The drift walk is the expensive half of a read and the index does
+		// not carry drift: what it publishes is where the graph is and what
+		// was built into it.
+		SkipDrift: true,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "# knowledge index:", err)
+		return
+	}
+	row := board.Row{
+		Repo:   discover.Repo{Path: repo, Name: filepath.Base(repo), HeadSHA: sha, Out: out},
+		Graph:  g,
+		Behind: g.Behind(),
+	}
+	e, ok := knowledge.FromRow(row, knowledge.Entry{}, false)
+	if !ok {
+		return
+	}
+	if err := knowledge.Put(base, repo, e); err != nil {
+		fmt.Fprintln(os.Stderr, "# knowledge index:", err)
+		return
+	}
+	fmt.Fprintln(os.Stderr, "# knowledge index updated:", knowledge.Path(base))
 }

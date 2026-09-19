@@ -405,6 +405,7 @@ func (d *detailPane) buildActionGroups() *adw.PreferencesGroup {
 	add("Label communities", "Name the communities with an LLM. METERED.", "label", d.a.actLabel, true)
 	add("Add to global graph", "Merge this graph into ~/.graphify/global-graph.json. Free.", "global-add", d.a.actGlobalAdd, false)
 	add("Sync graft index", "Rebuild this checkout's graft/ — graft's wiring graph, the one agents query. Free, tree-sitter only.", "graft-build", d.a.actGraftBuild, false)
+	add("Deep graft index", "Add graft's concept map and per-symbol summaries — the prose tier agents read. Runs on THIS machine's local model: no key and no bill, but slow.", gfy.GraftDeepKind, d.a.actGraftDeep, false)
 	add("Install git hooks", "graphify writes post-commit/post-checkout hooks into this repository.", "hook-install", d.a.actHookInstall, false)
 
 	// The two openers, which are not jobs at all.

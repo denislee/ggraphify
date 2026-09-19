@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/dns/ggraphify/internal/gfy"
+	"github.com/dns/ggraphify/internal/graftstate"
 	"github.com/dns/ggraphify/internal/graphstate"
 	"github.com/dns/ggraphify/internal/heal"
 )
@@ -66,6 +67,17 @@ type Policy struct {
 	// the one bug in this application nobody could undo.
 	Metered bool
 
+	// Graft says the loop may also repair the OTHER index — graft's own graph
+	// under <repo>/graft — when the tree has moved under it or it has become
+	// unreadable. It is a fact about this machine rather than a preference:
+	// true only when the graft CLI is actually runnable here, because a loop
+	// that queued `graft build` on a machine without graft would fail once per
+	// stale checkout per cooldown, forever.
+	//
+	// It never BUILDS a first index and never runs the deep pass: see
+	// graftstate.Index.Repairable for why those two are not unattended work.
+	Graft bool
+
 	Max      int
 	Cooldown time.Duration
 	Attempts int
@@ -100,9 +112,13 @@ func (p Policy) Spends() bool { return p.Metered && !p.Local }
 // not a pointer into the board's model, because the decision is taken off the
 // main thread.
 type Candidate struct {
-	Path     string
-	Name     string
-	Graph    graphstate.Graph
+	Path  string
+	Name  string
+	Graph graphstate.Graph
+	// Graft is the same repository's graft index, the second thing on the row
+	// that goes stale. Its zero value is StateNone, which asks for nothing, so
+	// a caller that does not read graft state simply gets the old behaviour.
+	Graft    graftstate.Index
 	Excluded bool
 	// Busy is set when a job for this repository is already queued or running
 	// — the user's own, or one of this loop's earlier chains.
@@ -146,6 +162,9 @@ type Stuck struct {
 	// Err is the last failure, when the attempts failed rather than merely
 	// achieved nothing.
 	Err string
+	// Why is the reason in one sentence, the same one the skip line carries.
+	// Err, when there is one, is the more specific answer and wins.
+	Why string
 }
 
 // Sig is the issue signature of a graph: its issue codes, in order, joined.
@@ -164,6 +183,32 @@ func Sig(g graphstate.Graph) string {
 		codes = append(codes, i.Code)
 	}
 	return strings.Join(codes, ",")
+}
+
+// candSig is the signature of everything the loop is willing to repair about
+// one repository: the graph's issue codes, then the graft index's when the
+// policy allows graft work at all.
+//
+// The two indexes share one signature rather than keeping one each, because
+// the loop attempts a repository rather than an index: a checkout whose graph
+// was rebuilt and whose graft index is still stale has a signature that
+// CHANGED, which is exactly the fresh budget of attempts that case deserves.
+// Gating on pol.Graft keeps a machine without graft installed on the old
+// signature — otherwise every stale index on it would read as a new defect the
+// loop can never clear.
+func candSig(c Candidate, pol Policy) string {
+	sig := Sig(c.Graph)
+	if !pol.Graft {
+		return sig
+	}
+	code := c.Graft.Issue()
+	switch {
+	case code == "":
+		return sig
+	case sig == "":
+		return code
+	}
+	return sig + "," + code
 }
 
 type record struct {
@@ -228,7 +273,7 @@ func (e *Engine) Plan(cands []Candidate, pol Policy) (actions []Action, skips []
 			skips = append(skips, Skip{c.Path, c.Name, "a job is already running here"})
 			continue
 		}
-		sig := Sig(c.Graph)
+		sig := candSig(c, pol)
 		if sig == "" {
 			// Healthy. Forget it, so a repository that goes bad again next
 			// month starts from a clean budget of attempts.
@@ -236,6 +281,14 @@ func (e *Engine) Plan(cands []Candidate, pol Policy) (actions []Action, skips []
 			continue
 		}
 		plan := heal.For(c.Graph, allow)
+		if pol.Graft {
+			if step, ok := heal.GraftStep(c.Graft); ok {
+				// Appended LAST, and the order is the point: a chain stops at
+				// its first failure, so a `graft build` that cannot run must
+				// not be what stops this checkout's graph being rebuilt.
+				plan.Steps = append(plan.Steps, step)
+			}
+		}
 		if plan.Empty() {
 			skips = append(skips, Skip{c.Path, c.Name,
 				"nothing free left to do — what remains needs an LLM"})
@@ -253,9 +306,8 @@ func (e *Engine) Plan(cands []Candidate, pol Policy) (actions []Action, skips []
 			// through a multi-stage repair — no-graph becomes unnamed becomes
 			// healthy — and each stage gets its own attempts.
 			rec.attempts, rec.err, rec.declared = 0, "", false
-		case rec.attempts >= pol.Attempts:
-			skips = append(skips, Skip{c.Path, c.Name,
-				"gave up: " + sig + " survived " + gfy.Itoa(rec.attempts) + " attempts"})
+		case rec.attempts >= attemptCap(pol, sig):
+			skips = append(skips, Skip{c.Path, c.Name, gaveUp(sig, rec.attempts)})
 			continue
 		case now.Sub(rec.last) < backoff(pol.Cooldown, rec.attempts):
 			skips = append(skips, Skip{c.Path, c.Name, "cooling down"})
@@ -273,6 +325,51 @@ func (e *Engine) Plan(cands []Candidate, pol Policy) (actions []Action, skips []
 		})
 	}
 	return actions, skips
+}
+
+// attemptCap is how many times this particular signature is worth attacking.
+//
+// It is pol.Attempts for everything except a repository whose ONLY complaint
+// is behind-HEAD, which gets exactly one. The plan for behind-HEAD is `update`,
+// and an update that ran and left the graph still behind has already told us
+// the whole story: graphify compared the rebuild to what was on disk, found no
+// difference and therefore rewrote nothing — including the commit stamp. The
+// board answers that by advancing the stamp itself after the rescan; when even
+// that does not take (an unreadable graph.json, a graph whose stamp lives
+// somewhere this version cannot splice), a second and third identical update
+// are a second and third identical no-op, and the honest move is to say so on
+// the first one rather than spend the budget discovering it again.
+func attemptCap(pol Policy, sig string) int {
+	if sig == graphstate.IssueBehind {
+		return 1
+	}
+	return pol.Attempts
+}
+
+// gaveUp is the skip line: the reason, with the verb the skip pane wants in
+// front of it.
+func gaveUp(sig string, attempts int) string {
+	return "gave up: " + stuckWhy(sig, attempts)
+}
+
+// stuckWhy is why the loop has stopped attacking this signature — one sentence,
+// used both on the skip line and in the give-up report, because they are the
+// same fact told twice and had drifted apart: the report used to say "the same
+// defects came back" for behind-HEAD, which is the one signature where that is
+// not what happened.
+//
+// For behind-HEAD it has to name the actual obstacle: "survived 1 attempt"
+// would read as a loop that barely tried.
+func stuckWhy(sig string, attempts int) string {
+	if sig == graphstate.IssueBehind {
+		return "behind HEAD survived an update — the graph's commit stamp is not advancing, " +
+			"so re-running update cannot clear it"
+	}
+	word := " attempts"
+	if attempts == 1 {
+		word = " attempt"
+	}
+	return sig + " survived " + gfy.Itoa(attempts) + word
 }
 
 // backoff grows the wait with each failed attempt, so a repository that cannot
@@ -309,15 +406,24 @@ func (e *Engine) Declare(cands []Candidate, pol Policy) []Stuck {
 	var out []Stuck
 	for _, c := range cands {
 		rec := e.seen[c.Path]
-		if rec == nil || rec.running || rec.declared || rec.attempts < pol.Attempts {
+		if rec == nil || rec.running || rec.declared || rec.attempts < attemptCap(pol, rec.sig) {
 			continue
 		}
-		if Sig(c.Graph) != rec.sig {
+		if c.Busy {
+			// Something is still working on this checkout — the runner, or the
+			// board settling what the last rescan left behind. Its row is the
+			// world as it was BEFORE that finishes, and declaring a repository
+			// stuck from a stale row is how a checkout that was repaired
+			// milliseconds ago gets written off as beyond help. The next tick
+			// asks again, against a row that has caught up.
+			continue
+		}
+		if candSig(c, pol) != rec.sig {
 			continue // it moved; it is not stuck on this signature
 		}
 		rec.declared = true
 		out = append(out, Stuck{Path: c.Path, Name: c.Name, Sig: rec.sig,
-			Tries: rec.attempts, Err: rec.err})
+			Tries: rec.attempts, Err: rec.err, Why: stuckWhy(rec.sig, rec.attempts)})
 	}
 	return out
 }

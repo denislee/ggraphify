@@ -80,6 +80,11 @@ type Params struct {
 	BatchSize      int
 	APITimeout     int
 	MissingOnly    bool
+	// AllowPartial is graft's --deep escape hatch: accept a meaning tier some
+	// files failed to fill rather than exiting 1 with nothing kept. It is set
+	// for every local deep run — see GraftDeepParams for why that is the
+	// honest default against a model on this machine.
+	AllowPartial bool
 
 	// Query-console parameters.
 	Question  string
@@ -162,6 +167,11 @@ var Known = map[string]Spec{
 	// graphify. It writes into <repo>/graft rather than into graphify-out/,
 	// which is why Mutates is true and why the board confirms it.
 	"graft-build": {Kind: "graft-build", Title: "Sync graft index", Cost: Free, Mutates: true},
+	// `graft build --deep` is the same build plus graft's LLM tier: a concept
+	// map and a per-symbol summary/crux. It is Free here and only here,
+	// because ggraphify runs it against a model on this machine and refuses to
+	// build the argv for anything else — see GraftDeepParams.
+	"graft-deep": {Kind: GraftDeepKind, Title: "Deep graft index (local LLM)", Cost: Free, Mutates: true},
 	// `graft init` is the installer: it writes the Claude Code wiring, both
 	// the user-level copy in ~/.claude and the repo-level one in the checkout
 	// it is pointed at. Free, and never run without the dialog that lists
@@ -406,6 +416,29 @@ func Argv(kind string, p Params) []string {
 		// build takes either costs money (--deep), or pins a choice graft
 		// persists in its own fingerprint and should keep making for itself.
 		add("build", p.Repo)
+
+	case GraftDeepKind:
+		// graft's global flags come BEFORE the subcommand, and these three are
+		// the whole of how a local server is named: the OpenAI wire format,
+		// the endpoint it is served on, and a model that endpoint actually
+		// has. The key is the one part that travels in the environment.
+		//
+		// A backend with no local endpoint yields no --base-url, which would
+		// send the corpus to api.openai.com on the user's key from a button
+		// the board calls free. So the argv is not built at all unless the
+		// endpoint is local: nil is what an unrunnable kind returns, and the
+		// dialog has already said why in GraftDeepReady's words.
+		if !IsLocalBackend(p.Backend) || LocalBaseURL(p.Backend) == "" {
+			return nil
+		}
+		flag("--provider", GraftProvider(p.Backend))
+		flag("--base-url", LocalBaseURL(p.Backend))
+		flag("--model", p.Model)
+		add("build", "--deep", p.Repo)
+		num("-j", p.MaxConcurrency)
+		if p.AllowPartial {
+			add("--allow-partial")
+		}
 
 	default:
 		return nil

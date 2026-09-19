@@ -1294,3 +1294,28 @@ func TestClaudeCLIModelIsNotAppliedToAnotherBackend(t *testing.T) {
 		t.Errorf("a metered API job carried the CLI backend's model variable:\n%s", out)
 	}
 }
+
+// A job log has to say which Claude Code install the job ran as. The argv says
+// `--backend claude-cli` and nothing more, so without this the one fact that
+// decides whose plan paid — and whose hooks and skills applied — appears
+// nowhere in the record of the run.
+func TestAClaudeCLIJobLogsItsAccount(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	acct := filepath.Join(home, ".claude-nova")
+	if err := os.MkdirAll(acct, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	notes := notesFor("extract", gfy.Params{Backend: gfy.ClaudeCLIBackend, ClaudeDir: acct})
+	if len(notes) == 0 {
+		t.Fatal("a claude-cli job carries no notes")
+	}
+	if !strings.Contains(notes[0], acct) {
+		t.Errorf("the note does not name the account directory: %q", notes[0])
+	}
+	// And an ordinary AST job carries none: a preamble on every log that said
+	// something irrelevant would be read past within a day.
+	if n := notesFor("update", gfy.Params{}); len(n) != 0 {
+		t.Errorf("a free AST job carries notes: %q", n)
+	}
+}

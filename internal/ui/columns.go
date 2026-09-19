@@ -509,6 +509,12 @@ func (a *App) matches(r *board.Row) bool {
 	}
 	switch f := a.activeFilter(); f {
 	case "":
+	case filterBehind:
+		// Also not a state: a row is behind when its graph's commit is not the
+		// checkout's HEAD, which is orthogonal to every state chip beside it.
+		if !r.Behind {
+			return false
+		}
 	case filterGap:
 		// Not a state, so it is answered before ParseState is asked: the whole
 		// point of this chip is a question no single state can express.

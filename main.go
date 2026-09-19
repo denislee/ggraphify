@@ -53,6 +53,15 @@ func main() {
 		light   = flag.Bool("light", false, "force the light colour scheme for this run")
 		showVer = flag.Bool("version", false, "print the version and exit")
 	)
+	// Subcommands before flags: `doctor` takes a flag set of its own, and a
+	// bare `flag.Parse` would reject it as an unknown argument. It is the
+	// only one, and it is deliberately not a fourth binary — what it asserts
+	// is this application's own configuration, and resolving that twice is
+	// the drift it exists to catch.
+	if len(os.Args) > 1 && os.Args[1] == "doctor" {
+		os.Exit(doctorCmd(os.Args[2:]))
+	}
+
 	flag.Usage = usage
 	flag.Parse()
 
@@ -180,6 +189,13 @@ func usage() {
 	fmt.Fprint(os.Stderr, `ggraphify — a board over every local repository's graphify graph
 
 usage: ggraphify [flags]
+
+Subcommands:
+  ggraphify doctor   assert the invariants: backend readiness, where graphs
+                     live and whether they are discoverable, how many are
+                     behind HEAD, which Claude Code account jobs run as, and
+                     how far the semantic tier got. Exits non-zero when one
+                     is broken.
 
 Companion commands, both headless:
   ggraphify-scan   print the board's rows as a table or JSON

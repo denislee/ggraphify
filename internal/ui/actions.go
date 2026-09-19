@@ -190,6 +190,14 @@ func (a *App) confirm(kind string, rows []board.Row, mutate func(*gfy.Params)) {
 
 	if spec.Cost == gfy.Metered {
 		body.WriteString("\n\n" + a.meteredNotice(sample))
+	} else if note := gfy.AccountNote(kind, sample.Backend, sample.ClaudeDir); note != "" {
+		// A free command can still write into a Claude Code configuration
+		// directory — `install` does, which is the whole of what it does — and
+		// which directory that is is a setting, not the default. The metered
+		// path says so inside meteredNotice; this is the other half, so the
+		// account is named on every dialog it bears on and on none it does
+		// not.
+		body.WriteString("\n\n" + note)
 	}
 
 	dlg := adw.NewAlertDialog(heading, body.String())
@@ -429,6 +437,48 @@ func (a *App) actCheckUpdate() { a.run("check-update", a.batch(), nil) }
 // indexer's free, tree-sitter-only build. The board-wide form of the same
 // command is the folder sweep in graft.go.
 func (a *App) actGraftBuild() { a.run("graft-build", a.batch(), nil) }
+
+// actGraftDeep runs graft's LLM tier on the selected repositories against the
+// model on this machine. It is the same command the sweep in graft.go queues
+// board-wide, and it costs nothing for the same reason: the corpus and the
+// bill both stay here.
+//
+// The readiness check is up front and once, not per repository: every way this
+// fails — no graft, no server, no model — fails identically for all of them,
+// and a refusal repeated forty times is a refusal nobody reads.
+func (a *App) actGraftDeep() {
+	rows := a.batch()
+	if len(rows) == 0 {
+		a.toast("nothing selected")
+		return
+	}
+	set := a.opts.Store.Settings()
+	if _, _, ok, why := gfy.GraftDeepReady(set.Backend, set.Model); !ok {
+		a.toast(why)
+		return
+	}
+	a.run(gfy.GraftDeepKind, rows, a.graftDeepParams())
+}
+
+// graftDeepParams is the mutation every deep submit applies: a local backend, a
+// model that server serves, and the concurrency its slots hold. Resolved once
+// per action rather than once per repository — ProbeLocal does network I/O,
+// and forty identical probes on the main thread is a visibly stalled board.
+func (a *App) graftDeepParams() func(*gfy.Params) {
+	set := a.opts.Store.Settings()
+	backend, model, ok, _ := gfy.GraftDeepReady(set.Backend, set.Model)
+	return func(p *gfy.Params) {
+		if !ok {
+			return
+		}
+		p.Backend, p.Model = backend, model
+		// The re-check inside is not redundant: the server can go away between
+		// the dialog and the submit, and a refusal here leaves the argv
+		// unbuildable, which SubmitCmd reports per repository rather than
+		// sending the corpus somewhere metered.
+		gfy.GraftDeepParams(p)
+	}
+}
 
 func (a *App) actExportHTML() { a.run("export-html", a.batch(), nil) }
 func (a *App) actExportWiki() { a.run("export-wiki", a.batch(), nil) }

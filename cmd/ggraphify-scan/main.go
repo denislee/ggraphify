@@ -20,6 +20,7 @@ import (
 	"github.com/dns/ggraphify/internal/discover"
 	"github.com/dns/ggraphify/internal/gfy"
 	"github.com/dns/ggraphify/internal/graphstate"
+	"github.com/dns/ggraphify/internal/knowledge"
 	"github.com/dns/ggraphify/internal/store"
 	"github.com/dns/ggraphify/internal/usage"
 )
@@ -38,6 +39,7 @@ func main() {
 		hidden    = flag.Bool("hidden", false, "board checkouts inside dot-named directories too")
 		groups    = flag.Bool("groups", false, "list the folders the rows fall into, with counts, and exit")
 		unhealthy = flag.Bool("unhealthy", false, "only rows with something wrong — what the board's Fix button would act on")
+		behind    = flag.Bool("behind", false, "only rows whose graph was built from a commit that is no longer HEAD — what the board's Ctrl+U sweep would act on")
 		gap       = flag.Bool("gap", false, "only rows an agent used that have no graphify graph to have answered with — the board's Used ✕ chip")
 		gapDays   = flag.Int("gap-days", 7, "the window -gap judges usage over, in days")
 		issues    = flag.Bool("issues", false, "add a column naming each row's issues (no-graph, drift, unnamed, no-report…)")
@@ -45,6 +47,7 @@ func main() {
 		usageMode = flag.Bool("usage", false, "report which agents actually ran graphify and graft, instead of the board")
 		usageDays = flag.Int("usage-days", 30, "the window -usage reports over, in days")
 		usageMD   = flag.Bool("markdown", false, "with -usage: emit the markdown briefing meant to be pasted into an agent")
+		writeIdx  = flag.Bool("index", false, "republish <out-base>/index.json from this scan — the lookup table that maps a checkout's absolute path to its graph — and exit")
 	)
 	flag.Parse()
 
@@ -112,6 +115,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	if *writeIdx {
+		// Before every filter below: an index narrowed by a -state chip would
+		// publish a partial answer to a question — "where is this checkout's
+		// graph" — that has nothing to do with which states are interesting
+		// right now.
+		writeIndex(opts.OutBase, rows)
+		return
+	}
+
 	if *groups {
 		w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
 		fmt.Fprintln(w, "REPOS\tFOLDER\tPATH")
@@ -140,6 +152,12 @@ func main() {
 	}
 	if *unhealthy {
 		rows = filter(rows, func(r board.Row) bool { return !r.Graph.Healthy() })
+	}
+	if *behind {
+		// Not a state, so it cannot be spelled -state: a graph can be behind
+		// HEAD and `fresh` at the same time, which is precisely why this is
+		// worth asking about separately.
+		rows = filter(rows, func(r board.Row) bool { return r.Behind })
 	}
 	if *gap {
 		// The same join the board's Used ✕ chip makes, over the same window:
@@ -229,6 +247,34 @@ func resolveOut(set store.Settings, flags map[string]bool, name, base string) (s
 	return outName, outBase
 }
 
+// writeIndex republishes the knowledge index from a completed scan — the same
+// file the board writes on every refresh, for a machine that runs the board
+// rarely or not at all.
+//
+// A blank out-base is refused rather than silently doing nothing: somebody who
+// typed -index asked for a file, and "your graphs live inside their own
+// checkouts, so there is no index to write" is the answer, not silence.
+func writeIndex(outBase string, rows []board.Row) {
+	base := discover.Expand(strings.TrimSpace(outBase))
+	if base == "" {
+		fmt.Fprintln(os.Stderr, "ggraphify-scan: -index needs a central out-base; this board keeps every "+
+			"graph inside its own checkout, where it is already discoverable (set one in the GUI's "+
+			"settings, or pass -out-base)")
+		os.Exit(2)
+	}
+	n, wrote, err := knowledge.Sync(base, rows)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ggraphify-scan:", err)
+		os.Exit(1)
+	}
+	verb := "unchanged"
+	if wrote {
+		verb = "written"
+	}
+	fmt.Printf("%s: %d repositories, %s\n", knowledge.Path(base), n, verb)
+	fmt.Printf("look one up with: jq -r '.entries[\"'\"$PWD\"'\"].graph' %s\n", knowledge.Path(base))
+}
+
 // printUsage is the headless twin of the board's Usage column and its U
 // dashboard: the same rollup, the same window, printed.
 func printUsage(rows []board.Row, days int, asJSON, asMarkdown bool) {
@@ -257,18 +303,23 @@ func printUsage(rows []board.Row, days int, asJSON, asMarkdown bool) {
 	took := time.Since(started).Round(time.Millisecond)
 	updated, scanned := x.LastUpdate()
 
-	s := x.Summarize(usage.Window{Days: days})
+	win := usage.Window{Days: days}
+	s := x.Summarize(win)
+	sessTotal, sessUsed := x.SessionCount(win)
 	if asMarkdown {
 		// The same text the GUI's Copy button puts on the clipboard, so a
 		// headless machine — or a pipe into wl-copy — is not a second format
 		// to keep in step with the first.
 		fmt.Print(usage.Report(s, usage.Recommend(rows, s, 0), usage.ReportOptions{
-			Accounts:   accounts,
-			LastUpdate: updated,
-			Scanned:    scanned,
-			Repos:      repos,
-			Recents:    x.Recents("", 20),
-			Blocked:    usage.Blockages(rows, s, 0),
+			Accounts:      accounts,
+			LastUpdate:    updated,
+			Scanned:       scanned,
+			Repos:         repos,
+			Recents:       x.Recents("", 20),
+			Blocked:       usage.Blockages(rows, s, 0),
+			Sessions:      x.SessionRolls(win, 40),
+			SessionsTotal: sessTotal,
+			SessionsUsed:  sessUsed,
 		}))
 		return
 	}
@@ -284,6 +335,10 @@ func printUsage(rows []board.Row, days int, asJSON, asMarkdown bool) {
 
 	fmt.Printf("%d uses over %d days — graphify %d · graft %d · %d sessions · %d hook injections\n",
 		s.Events, s.Days, s.ByTool[usage.Graphify], s.ByTool[usage.Graft], s.Sessions, s.Hooks)
+	// The denominator: every session the transcripts recorded, against the ones
+	// that reached for either tool. Three of three and three of forty are the
+	// same line above and opposite findings.
+	fmt.Printf("%d Claude Code sessions ran, %d of them used either tool\n", sessTotal, sessUsed)
 	if mix, ok := s.Mix(); ok {
 		fmt.Printf("graft read %d%% of the time (%d through the index, %d straight to source), ~%d tokens saved\n",
 			mix, s.GraftReads, s.SourceReads, s.SavedTokens)

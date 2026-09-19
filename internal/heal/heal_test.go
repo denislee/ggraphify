@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/dns/ggraphify/internal/gfy"
+	"github.com/dns/ggraphify/internal/graftstate"
 	"github.com/dns/ggraphify/internal/graphstate"
 )
 
@@ -210,5 +211,33 @@ func TestBehindHeadPlansTheFreeUpdate(t *testing.T) {
 	}
 	if len(p.Unreachable) != 0 {
 		t.Errorf("unreachable = %+v, want none", p.Unreachable)
+	}
+}
+
+// The graft step is planned for the two states a machine may repair on its
+// own, and for no other — and it is free, which is the whole reason the
+// unattended loop may queue it.
+func TestGraftStepCoversStaleAndBrokenOnly(t *testing.T) {
+	want := map[graftstate.State]bool{
+		graftstate.StateStale:  true,
+		graftstate.StateBroken: true,
+		graftstate.StateNone:   false,
+		graftstate.StateRaw:    false,
+		graftstate.StateFresh:  false,
+	}
+	for st, ok := range want {
+		s, got := GraftStep(graftstate.Index{State: st})
+		if got != ok {
+			t.Fatalf("GraftStep(%v) = %v, want %v", st, got, ok)
+		}
+		if !got {
+			continue
+		}
+		if s.Kind != "graft-build" {
+			t.Fatalf("GraftStep(%v).Kind = %q", st, s.Kind)
+		}
+		if s.Cost() != gfy.Free {
+			t.Fatalf("GraftStep(%v) costs %v, want free", st, s.Cost())
+		}
 	}
 }

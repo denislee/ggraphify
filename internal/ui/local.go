@@ -84,6 +84,7 @@ func (a *App) settingsLocal() *adw.PreferencesGroup {
 		s.Model = a.localModelNames[i]
 		a.opts.Store.SetSettings(s)
 		a.toastf("model set to %s", s.Model)
+		a.checkBackend()
 	})
 	g.Add(models)
 
@@ -349,7 +350,10 @@ func (a *App) leaseOllama(j *jobs.Job) jobs.Lease {
 	if j == nil || !j.Local {
 		return nil
 	}
-	if gfy.ArgvBackend(j.Argv) != gfy.OllamaBackend {
+	// ArgvOllama rather than ArgvBackend: a graft deep build names the same
+	// server with --base-url and has no --backend at all, and the two queue
+	// for the same slots.
+	if !gfy.ArgvOllama(j.Argv) {
 		return nil
 	}
 	return a.ollama.Acquire()

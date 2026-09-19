@@ -291,3 +291,39 @@ func sameDirSpelling(a, b string) bool {
 	}
 	return sameFile(a, b)
 }
+
+// AccountNote is the one line a job log and a confirm dialog need about which
+// Claude Code install a job is actually running as.
+//
+// The account is chosen in settings and is frequently NOT the default one:
+// this machine runs the backend out of ~/.claude-nova. That is a deliberate
+// choice and a correct one, and the only risk it carries is that it is
+// invisible — anybody reasoning about a claude-cli job assumes their own
+// configuration directory, and therefore assumes their own hooks, skills,
+// settings and login apply to it. They do not. A Claude Code session in a
+// checkout runs with a PreToolUse guard and a set of hooks that ggraphify's
+// `claude -p` invocations never see.
+//
+// So it is stated wherever the backend and model are already stated. It is a
+// sentence, not a behaviour change; the resolution itself is ClaudeDirFor's.
+//
+// Returns "" for a job the account has no bearing on — which is most of them:
+// an AST update does not talk to Claude Code at all.
+func AccountNote(kind, backend, sel string) string {
+	usesAccount := strings.TrimSpace(backend) == ClaudeCLIBackend || kind == "install"
+	if !usesAccount {
+		return ""
+	}
+	acc := ClaudeAccountFor(sel)
+	s := "Claude Code account: " + acc.Name + " (" + acc.Dir + ")"
+	switch {
+	case acc.Missing:
+		s += " — that directory does not exist"
+	case !acc.Default:
+		s += " — not the default ~/.claude, so its hooks, skills, settings and login are the ones in effect"
+	}
+	if !acc.Credential && !acc.Missing {
+		s += "; no stored login file there"
+	}
+	return s
+}

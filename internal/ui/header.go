@@ -18,6 +18,18 @@ import (
 // describe.
 const filterGap = "used-no-graph"
 
+// filterBehind is the other non-state chip: repositories whose graph was built
+// from a commit that is no longer HEAD.
+//
+// It is deliberately separate from the `stale` state. Stale means the manifest
+// no longer matches the working tree; behind means history moved under the
+// graph — a `git commit` of files that were already extracted, a branch
+// switch, a pull. Neither implies the other, and a graph that is behind reads
+// as perfectly healthy while its node spans point at lines the checkout has
+// moved past. That is the quiet kind of wrongness, so it gets its own chip and
+// its own one-click remedy (see actUpdateBehind).
+const filterBehind = "behind-head"
+
 // filterChips are the state filters across the top, in the order they appear.
 // "all" is the empty filter rather than a state of its own.
 var filterChips = []struct {
@@ -26,6 +38,7 @@ var filterChips = []struct {
 }{
 	{"", "All"},
 	{filterGap, "Used ✕"},
+	{filterBehind, "Behind HEAD"},
 	{graphstate.StateNone.String(), "No graph"},
 	{graphstate.StateStale.String(), "Stale"},
 	{graphstate.StateRaw.String(), "Unlabeled"},
@@ -63,6 +76,18 @@ func (a *App) buildHeader() gtk.Widgetter {
 	freeAll.ConnectClicked(func() { a.actFixFreeAll() })
 	header.PackStart(freeAll)
 
+	// Clearing the behind-HEAD rows is one press, and it belongs in this row
+	// of board-wide buttons rather than behind the chip that lists them: an
+	// AST refresh needs no LLM, no key and no spend, so for the 71 repositories
+	// this machine had behind HEAD it is a background pass, not a billing
+	// decision, and it must not sit behind the metered confirm.
+	behindAll := gtk.NewButtonFromIconName("document-open-recent-symbolic")
+	behindAll.AddCSSClass("flat")
+	behindAll.SetTooltipText("Re-extract every repository whose graph was built before the current " +
+		"HEAD (Ctrl+U) — free: AST only, no LLM call")
+	behindAll.ConnectClicked(func() { a.actUpdateBehind() })
+	header.PackStart(behindAll)
+
 	// The graft sweep, beside the graphify one: same shape (a free, board-wide
 	// button whose dialog carries the count and the plan), different indexer.
 	// It is scoped to the folder filter in force, which is the dropdown one
@@ -72,6 +97,18 @@ func (a *App) buildHeader() gtk.Widgetter {
 	graftAll.SetTooltipText("Sync the graft index for every repository in the selected folder (Ctrl+G) — free, no LLM call")
 	graftAll.ConnectClicked(func() { a.actSyncGraft() })
 	header.PackStart(graftAll)
+
+	// The deep graft sweep, immediately after the free one because it is the
+	// same target with the second tier on top. Shift+Ctrl+G rather than a
+	// fourth icon of its own: the two are one decision — index this folder,
+	// wiring only or wiring plus prose.
+	graftDeep := gtk.NewButtonFromIconName("folder-documents-symbolic")
+	graftDeep.AddCSSClass("flat")
+	graftDeep.SetTooltipText("Deep-index every repository in the selected folder (Shift+Ctrl+G) — " +
+		"graft's concept map and per-symbol summaries, run on this machine's local model. " +
+		"No API key and no bill, but hours of this machine.")
+	graftDeep.ConnectClicked(func() { a.actSyncGraftDeep() })
+	header.PackStart(graftDeep)
 
 	// The local-model sweep, third in the same row of board-wide buttons. It
 	// is the one of the three that runs an LLM, so it does NOT get the "free"

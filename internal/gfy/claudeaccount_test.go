@@ -3,6 +3,7 @@ package gfy
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -189,5 +190,38 @@ func TestTilde(t *testing.T) {
 	}
 	if got := Tilde("/etc/claude"); got != "/etc/claude" {
 		t.Errorf("Tilde outside home rewrote %q", got)
+	}
+}
+
+// Which Claude Code install a job runs as is a setting, and on this machine it
+// is not the default one. The risk is purely that it is invisible: a reader of
+// a job log assumes their own configuration directory, and therefore their own
+// hooks, skills and login. So the note has to name the directory AND say when
+// it is not the default.
+func TestAccountNoteNamesTheResolvedDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	alt := filepath.Join(home, ".claude-nova")
+	if err := os.MkdirAll(alt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	note := AccountNote("extract", ClaudeCLIBackend, alt)
+	if !strings.Contains(note, alt) {
+		t.Errorf("the note does not name the directory: %q", note)
+	}
+	if !strings.Contains(note, "not the default") {
+		t.Errorf("the note does not say it is not ~/.claude: %q", note)
+	}
+
+	// `install` writes into that same directory, so it is the one free
+	// command the account bears on.
+	if AccountNote("install", "", alt) == "" {
+		t.Error("the installer carries no account note")
+	}
+	// An AST update never talks to Claude Code, and a line about it there
+	// would be noise in every log on the board.
+	if got := AccountNote("update", "", alt); got != "" {
+		t.Errorf("AccountNote on a free AST job = %q, want empty", got)
 	}
 }

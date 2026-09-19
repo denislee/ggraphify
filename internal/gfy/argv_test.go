@@ -190,8 +190,20 @@ func TestEveryKnownKindBuilds(t *testing.T) {
 		Repo: "/r", Out: "/r/graphify-out", Question: "q", NodeA: "A", NodeB: "B",
 		Tag: "t", Platform: "claude", Graphs: []string{"/a.json", "/b.json"},
 	}
+	// graft's deep pass is the one kind whose argv depends on more than its
+	// params: it is built only for an endpoint on this machine, so the test
+	// gives it one. Without this it returns nil by design — see
+	// TestArgvGraftDeepRefusesAMeteredBackend, which pins that half.
+	t.Setenv(OllamaBaseURLVar, "http://127.0.0.1:11434/v1")
+	local := p
+	local.Backend, local.Model = OllamaBackend, "qwen2.5-coder:14b"
+
 	for kind := range Known {
-		if got := Argv(kind, p); got == nil {
+		in := p
+		if kind == GraftDeepKind {
+			in = local
+		}
+		if got := Argv(kind, in); got == nil {
 			t.Errorf("kind %q has a spec but no argv builder", kind)
 		}
 	}

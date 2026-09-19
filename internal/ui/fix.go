@@ -429,3 +429,31 @@ func fixSubtitle(r *board.Row) string {
 	return plural(len(issues), "issue", "issues") + ": " + strings.Join(what, ", ") +
 		". Runs the commands that clear them, in order."
 }
+
+// actUpdateBehind re-extracts every repository whose graph was built from a
+// commit that is no longer HEAD.
+//
+// It is `update` and only `update`: the AST pass re-reads whatever moved and
+// stamps the graph with the current commit, which is what clears the issue
+// even for a repository whose working tree never drifted — a commit of
+// already-extracted files moves HEAD and nothing else. That command is free,
+// so this sweep deliberately does not go through the metered confirm; the
+// ordinary batch confirm still applies once the count crosses the threshold in
+// settings, because queueing seventy subprocesses is worth a look either way.
+//
+// Rows kept out of batch actions (X) are skipped, and so is any row with a job
+// already running on it — the runner would refuse it, and a toast per
+// repository saying so is not a report.
+func (a *App) actUpdateBehind() {
+	var rows []board.Row
+	for _, r := range a.fixableRows() {
+		if r.Behind {
+			rows = append(rows, r)
+		}
+	}
+	if len(rows) == 0 {
+		a.toast("no repository is behind its HEAD")
+		return
+	}
+	a.run("update", rows, nil)
+}

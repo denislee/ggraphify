@@ -167,6 +167,13 @@ func (i Index) NeedsBuild() bool {
 	return false
 }
 
+// NeedsDeep reports whether `graft build --deep` has work to do here: every
+// state but Fresh, which is the only one that means "in step with the tree AND
+// carrying the concept layer". StateRaw is the case NeedsBuild deliberately
+// does not claim — a wiring graph that is perfectly current and has no prose
+// tier at all.
+func (i Index) NeedsDeep() bool { return i.State != StateFresh }
+
 // DirFor is the graft directory of a checkout.
 func DirFor(repo string) string { return filepath.Join(repo, DirName) }
 
