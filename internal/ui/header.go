@@ -161,18 +161,31 @@ func (a *App) buildHeader() gtk.Widgetter {
 	a.usageBtn.AddCSSClass("flat")
 	a.usageBtn.SetTooltipText("Agent usage: what actually ran graphify and graft (U)")
 	a.usageBtn.ConnectToggled(func() {
-		if a.usageGuard {
+		if a.pageGuard {
 			return
 		}
 		a.setMainPage(pageUsage(a.usageBtn.Active()))
 	})
 	header.PackEnd(a.usageBtn)
 
-	globalBtn := gtk.NewButtonFromIconName("network-workgroup-symbolic")
-	globalBtn.AddCSSClass("flat")
-	globalBtn.SetTooltipText("Cross-repo global graph (G)")
-	globalBtn.ConnectClicked(func() { a.showGlobal() })
-	header.PackEnd(globalBtn)
+	// The Global screen, on the same footing as Usage and for the same
+	// reason: it replaces the board rather than opening over it, so it is a
+	// toggle and not a button.
+	a.globalBtn = gtk.NewToggleButton()
+	a.globalBtn.SetIconName("network-workgroup-symbolic")
+	a.globalBtn.AddCSSClass("flat")
+	a.globalBtn.SetTooltipText("Global graph: which repositories are in ~/.graphify/global-graph.json (G)")
+	a.globalBtn.ConnectToggled(func() {
+		if a.pageGuard {
+			return
+		}
+		if a.globalBtn.Active() {
+			a.setMainPage(pageGlobalName)
+			return
+		}
+		a.setMainPage(pageBoard)
+	})
+	header.PackEnd(a.globalBtn)
 
 	return header
 }
@@ -204,6 +217,11 @@ func (a *App) buildFilterBar() *gtk.Box {
 	// because it narrows *which* repositories are on the board, where the
 	// chips narrow which of those are interesting — the coarser cut first.
 	a.groupDrop = gtk.NewDropDownFromStrings([]string{groupAllLabel})
+	// A folder entry is a path plus a count, and the filter bar is narrow: the
+	// default list item would clip every one of them to the same "~/gi…" and
+	// leave nothing to choose between. The popup gets its own width; the
+	// button keeps the default, so the bar does not stretch to the longest root.
+	a.groupDrop.SetListFactory(&wideTextFactory(nil).ListItemFactory)
 	a.groupDrop.SetTooltipText("Show only the repositories under one folder (F)")
 	a.groupDrop.NotifyProperty("selected", func() {
 		if a.groupGuard {

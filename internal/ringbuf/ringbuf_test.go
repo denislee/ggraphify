@@ -188,3 +188,79 @@ func BenchmarkWriteLinesPastCapacity(b *testing.B) {
 		buf.Write(line)
 	}
 }
+
+// A carriage-return progress stream is a redraw of one line, not an
+// ever-growing line. graft's --deep pass emits nothing else for tens of
+// minutes; appended verbatim it filled the whole budget and then evicted
+// every real line of output along with itself.
+func TestCarriageReturnRedrawsOneLine(t *testing.T) {
+	b := New(0)
+	b.WriteString("$ graft build --deep /home/dns/git/pulumi\n")
+	for i := 1; i <= 444; i++ {
+		b.WriteString("\rreading concepts " + itoa(i) + "/444: some/package/file.go        ")
+	}
+	got := b.String()
+	if n := strings.Count(got, "reading concepts"); n != 1 {
+		t.Errorf("progress kept %d times, want 1 redrawn line:\n%q", n, got)
+	}
+	if !strings.HasPrefix(got, "$ graft build --deep") {
+		t.Errorf("the command header did not survive the progress stream: %q", got[:min(80, len(got))])
+	}
+	if !strings.Contains(got, "444/444") {
+		t.Error("the retained progress line is not the latest one")
+	}
+	if b.Len() > 1<<10 {
+		t.Errorf("Len = %d; a redrawn line must not grow the buffer", b.Len())
+	}
+}
+
+// CRLF terminates a line; it does not redraw it. Including when the pair is
+// split across two writes, which is what a pipe does at a 64 KiB boundary.
+func TestCarriageReturnBeforeNewlineIsATerminator(t *testing.T) {
+	b := New(0)
+	b.WriteString("first\r\nsecond\r")
+	b.WriteString("\nthird\n")
+	if got, want := b.String(), "first\nsecond\nthird\n"; got != want {
+		t.Errorf("String = %q, want %q", got, want)
+	}
+}
+
+// The case job 203 died on: a failing run whose output carries no newline at
+// all must still leave its tail behind. Evicting the whole buffer recorded
+// the failure with an empty log.
+func TestOverflowOfOneHugeLineKeepsTheTail(t *testing.T) {
+	b := New(1024)
+	b.WriteString(strings.Repeat("x", 4096) + "the deep pass did not complete")
+	got := b.String()
+	if got == "" {
+		t.Fatal("the whole buffer was discarded; a failed job would record no log")
+	}
+	if b.Len() > 1024 {
+		t.Errorf("Len = %d, over cap", b.Len())
+	}
+	if !strings.HasSuffix(got, "the deep pass did not complete") {
+		t.Errorf("kept the head rather than the tail: %q", got[max(0, len(got)-60):])
+	}
+}
+
+// And the sidecar, which is where the empty log was actually observed.
+func TestTailBytesSurvivesANewlineFreeStream(t *testing.T) {
+	b := New(0)
+	b.WriteString("$ graft build --deep /repo\n")
+	for i := 0; i < 20000; i++ {
+		b.WriteString("\rsummarizing " + itoa(i) + "/20000: " + strings.Repeat("y", 60))
+	}
+	if got := b.TailBytes(8 << 10); got == "" {
+		t.Fatal("TailBytes returned nothing to persist")
+	}
+	if got := b.LastLine(); !strings.HasPrefix(got, "summarizing 19999/") {
+		t.Errorf("LastLine = %q, want the newest progress line", ellipsis(got))
+	}
+}
+
+func ellipsis(s string) string {
+	if len(s) > 80 {
+		return s[:80] + "…"
+	}
+	return s
+}

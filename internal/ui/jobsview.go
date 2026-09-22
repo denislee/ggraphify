@@ -7,6 +7,7 @@ import (
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
 	"github.com/dns/ggraphify/internal/gfy"
+	"github.com/dns/ggraphify/internal/globalgraph"
 	"github.com/dns/ggraphify/internal/jobs"
 )
 
@@ -146,22 +147,17 @@ func (a *App) showJobs() {
 	paned.SetVExpand(true)
 
 	header := adw.NewHeaderBar()
-	// Stop all is deliberately NOT behind a confirm, unlike every other
-	// destructive control in this application. The gates elsewhere stand
-	// between a click and work starting; this one stops work already running,
-	// which is the recoverable direction — every job it kills can simply be
-	// run again. Friction here would be friction in the one moment somebody
-	// needs it immediately, having just started a sweep over the whole board.
+	// Stopping work already running is the recoverable direction — every job
+	// it kills can simply be run again — so this stays one click, and friction
+	// here would be friction in the one moment somebody needs it immediately,
+	// having just started a sweep over the whole board. A large QUEUE is the
+	// exception, and the only one: see cancelall.go, which owns that policy
+	// for all three of these buttons.
 	v.stopAll = gtk.NewButtonWithLabel("Stop all")
 	v.stopAll.AddCSSClass("destructive-action")
 	v.stopAll.SetTooltipText("Cancel every running and queued job, across every repository. " +
-		"Nothing is lost that cannot be re-run.")
-	v.stopAll.ConnectClicked(func() {
-		queued, running := a.runner.Active()
-		a.runner.CancelAll()
-		a.toastf("stopped %s", plural(queued+running, "job", "jobs"))
-		v.reload()
-	})
+		"Running jobs can be re-run from their rows; a large queue is asked about first.")
+	v.stopAll.ConnectClicked(func() { a.cancelAll(v.reload) })
 	header.PackEnd(v.stopAll)
 
 	// Unlike Stop all, this one starts work, so it says exactly how much and
@@ -172,8 +168,7 @@ func (a *App) showJobs() {
 	v.startAll.SetTooltipText("Release every held job at once. The lane limits still apply — " +
 		"metered jobs run one at a time, as they always do.")
 	v.startAll.ConnectClicked(func() {
-		n := a.runner.ReleaseAll()
-		a.toastf("started %s", plural(n, "held job", "held jobs"))
+		a.startAllHeld()
 		v.reload()
 	})
 	header.PackEnd(v.startAll)
@@ -286,12 +281,7 @@ func (v *jobsView) jobRow(s jobs.Snapshot) *gtk.ListBoxRow {
 	l.SetHExpand(true)
 	box.Append(l)
 
-	if s.Cost == gfy.Metered {
-		m := gtk.NewLabel("$")
-		m.AddCSSClass("metered")
-		m.SetTooltipText("This job dispatched LLM requests against your API key.")
-		box.Append(m)
-	}
+	appendCostMark(box, s)
 	prog := newJobProgressBar()
 	box.Append(progressSlot(prog))
 	setJobProgress(prog, &s)
@@ -302,6 +292,14 @@ func (v *jobsView) jobRow(s jobs.Snapshot) *gtk.ListBoxRow {
 	status := gtk.NewLabel(text)
 	status.AddCSSClass("dim-label")
 	box.Append(status)
+
+	// The per-row Retry, on the failed rows only. It acts on THIS row's job
+	// rather than on the selection: the button is in the row you are pointing
+	// at, and having it re-run a different job because the click landed
+	// before the selection changed would be the worst bug this dialog could
+	// have. The snapshot is captured by value for the same reason — v.rows is
+	// rebuilt from under these closures on every reload.
+	box.Append(retrySlot(v, s))
 
 	row := gtk.NewListBoxRow()
 	row.SetChild(box)
@@ -350,10 +348,40 @@ func (v *jobsView) tick() {
 	}
 }
 
-// retry re-runs a finished job with the identical argv, which is what makes a
-// transient failure — a rate limit, a flaky network — a one-click recovery.
-func (v *jobsView) retry() {
-	s := v.selected()
+// retrySlot is one row's Retry button, in a fixed-width box so that the rows
+// without one line up with the rows that have one — the same reason
+// progressSlot exists, and the same failure without it: a list whose right
+// edge steps in and out down its length.
+//
+// The button is flat and icon-only because it repeats down the list. A row is
+// a glance, not a form.
+func retrySlot(v *jobsView, s jobs.Snapshot) *gtk.Box {
+	slot := gtk.NewBox(gtk.OrientationHorizontal, 0)
+	slot.SetSizeRequest(retrySlotWidth, -1)
+	slot.SetVAlign(gtk.AlignCenter)
+	slot.SetHAlign(gtk.AlignEnd)
+	if !jobRetryable(&s) {
+		return slot
+	}
+	b := gtk.NewButtonFromIconName("view-refresh-symbolic")
+	b.AddCSSClass("flat")
+	b.SetVAlign(gtk.AlignCenter)
+	b.SetTooltipText("Run this job again, with the identical command line.")
+	b.ConnectClicked(func() { v.retryJob(&s) })
+	slot.Append(b)
+	return slot
+}
+
+// retrySlotWidth holds the column open on the rows with no button in it.
+const retrySlotWidth = 34
+
+// retry re-runs the SELECTED finished job — the toolbar button, which is the
+// one that reaches a cancelled or succeeded job as well.
+func (v *jobsView) retry() { v.retryJob(v.selected()) }
+
+// retryJob re-runs a finished job with the identical argv, which is what makes
+// a transient failure — a rate limit, a flaky network — a one-click recovery.
+func (v *jobsView) retryJob(s *jobs.Snapshot) {
 	if s == nil || !s.Status.Done() {
 		return
 	}
@@ -376,98 +404,41 @@ func (v *jobsView) retry() {
 	v.a.toastf("re-queued %s", s.Label)
 }
 
-// --- the global graph view ---------------------------------------------------
+// --- the global graph -------------------------------------------------------
 
-// showGlobal is the cross-repo surface: which repositories are in
-// ~/.graphify/global-graph.json, adding the current selection to it, and
-// merging a chosen subset into one file. This is the answer the CLI makes
-// tedious — the whole reason a board over every checkout is worth having.
+// showGlobal puts the Global screen on screen; G toggles back to the board.
+//
+// It used to be a preferences dialog with three buttons in it. Membership of
+// the cross-repo graph turned out to be a thing you MANAGE — two lists, a
+// filter, twenty repositories at a time — and that does not fit in something
+// you open, read and dismiss. See globalpane.go.
 func (a *App) showGlobal() {
-	page := adw.NewPreferencesPage()
-
-	out := gtk.NewTextView()
-	out.SetEditable(false)
-	out.SetMonospace(true)
-	out.SetWrapMode(gtk.WrapWordChar)
-	out.SetLeftMargin(12)
-	out.AddCSSClass("joblog")
-	out.Buffer().SetText("Press “List” to read ~/.graphify/global-graph.json.")
-
-	g := adw.NewPreferencesGroup()
-	g.SetTitle("Global graph")
-	g.SetDescription("~/.graphify/global-graph.json — one graph across every repository you have added to it.")
-
-	listRow := adw.NewActionRow()
-	listRow.SetTitle("List repositories in the global graph")
-	listRow.SetSubtitle("graphify global list")
-	listBtn := gtk.NewButtonWithLabel("List")
-	listBtn.SetVAlign(gtk.AlignCenter)
-	listBtn.AddCSSClass("flat")
-	listBtn.ConnectClicked(func() {
-		job, err := a.runner.SubmitCmd("global-list", "", "Global list", gfy.Params{}, nil)
-		if err != nil {
-			a.toastf("%v", err)
-			return
-		}
-		a.watchInto(job.ID, out)
-	})
-	listRow.AddSuffix(listBtn)
-	g.Add(listRow)
-
-	addRow := adw.NewActionRow()
-	addRow.SetTitle("Add the selection to the global graph")
-	addRow.SetSubtitle("graphify global add <graph.json> --as <tag>")
-	addBtn := gtk.NewButtonWithLabel("Add")
-	addBtn.SetVAlign(gtk.AlignCenter)
-	addBtn.AddCSSClass("flat")
-	addBtn.ConnectClicked(func() { a.actGlobalAdd() })
-	addRow.AddSuffix(addBtn)
-	g.Add(addRow)
-
-	mergeRow := adw.NewActionRow()
-	mergeRow.SetTitle("Merge the selected repositories into one graph")
-	mergeRow.SetSubtitle("graphify merge-graphs g1 g2 … --out merged-graph.json")
-	mergeBtn := gtk.NewButtonWithLabel("Merge")
-	mergeBtn.SetVAlign(gtk.AlignCenter)
-	mergeBtn.AddCSSClass("flat")
-	mergeBtn.ConnectClicked(func() { a.mergeSelected(out) })
-	mergeRow.AddSuffix(mergeBtn)
-	g.Add(mergeRow)
-
-	page.Add(g)
-
-	outGroup := adw.NewPreferencesGroup()
-	outGroup.SetTitle("Output")
-	sw := gtk.NewScrolledWindow()
-	sw.SetChild(out)
-	sw.SetSizeRequest(-1, 320)
-	outRow := adw.NewActionRow()
-	outRow.SetChild(sw)
-	outGroup.Add(outRow)
-	page.Add(outGroup)
-
-	dlg := adw.NewPreferencesDialog()
-	dlg.SetTitle("Global graph")
-	dlg.Add(page)
-	dlg.Present(a.win)
+	if a.onGlobalPage() {
+		a.setMainPage(pageBoard)
+		return
+	}
+	a.setMainPage(pageGlobalName)
 }
 
 // mergeSelected merges every selected repository's graph.json into one file.
 func (a *App) mergeSelected(out *gtk.TextView) {
-	rows := a.batch()
-	if len(rows) < 2 {
-		a.toast("merge needs at least two repositories — use select mode (v) and Space")
-		return
-	}
 	var graphs []string
-	for _, r := range rows {
+	for _, r := range a.batch() {
 		if r.Graph.Nodes == 0 {
 			continue
 		}
-		graphs = append(graphs, r.Graph.Out+"/graph.json")
+		graphs = append(graphs, globalgraph.GraphFor(r.Graph.Out))
 	}
+	a.mergeGraphs(graphs, out)
+}
+
+// mergeGraphs is `graphify merge-graphs`: one file out of several graphs,
+// leaving the global graph alone. Both the board's selection and the Global
+// screen's tick boxes funnel through here so the two cannot disagree about
+// what the command needs.
+func (a *App) mergeGraphs(graphs []string, out *gtk.TextView) {
 	if len(graphs) < 2 {
-		a.toast("at least two of the selected repositories need a graph first")
+		a.toast("merging needs at least two repositories with a graph")
 		return
 	}
 	p := gfy.Params{Graphs: graphs, OutFile: "merged-graph.json"}

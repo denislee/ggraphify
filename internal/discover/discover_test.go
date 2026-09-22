@@ -536,3 +536,87 @@ func TestCacheKeepsTheLastHeadWhenItCannotBeRead(t *testing.T) {
 		t.Errorf("got %+v, want the previous branch and commit kept", got)
 	}
 }
+
+// A directory that carries a graph but is not a checkout is boarded anyway —
+// the plan-doc corpus case. Before this, a .git-gated walk skipped it, so its
+// graph aged with nothing on the board admitting the directory existed.
+func TestWalkBoardsAGraphedDirectoryWithNoGit(t *testing.T) {
+	t.Setenv("GRAPHIFY_OUT", "")
+	t.Setenv("GRAPHIFY_OUT_NAME", "")
+	root := t.TempDir()
+	corpus := mkdir(t, root, "docs")
+	out := filepath.Join(corpus, "graphify-out")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "graph.json"), []byte(`{"nodes":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	repos, err := Walk(Options{Roots: []string{root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := has(repos, "docs")
+	if d == nil {
+		t.Fatalf("a graphed non-checkout was not boarded: %v", names(repos))
+	}
+	if !d.NoGit {
+		t.Errorf("NoGit = false, want true — it has no .git")
+	}
+	if d.HeadSHA != "" || d.Branch != "" {
+		t.Errorf("invented a ref for a non-checkout: %+v", d)
+	}
+	if d.Ref() != "—" {
+		t.Errorf("Ref() = %q, want the em dash", d.Ref())
+	}
+}
+
+// Negative control: the boarding above is opt-in by construction. A directory
+// with no .git and no graph stays off the board — otherwise every directory
+// on the machine becomes a row.
+func TestWalkIgnoresAnUngraphedDirectoryWithNoGit(t *testing.T) {
+	t.Setenv("GRAPHIFY_OUT", "")
+	t.Setenv("GRAPHIFY_OUT_NAME", "")
+	root := t.TempDir()
+	mkdir(t, root, "just-a-folder")
+	mkdir(t, root, "just-a-folder/nested")
+
+	repos, err := Walk(Options{Roots: []string{root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 0 {
+		t.Fatalf("boarded %v, want nothing — no .git and no graph", names(repos))
+	}
+}
+
+// With graphs kept centrally, a corpus whose graph predates that layout still
+// boards — and keeps pointing at the in-tree graph it actually has, not at the
+// central path that was never built.
+func TestWalkBoardsAnInTreeCorpusUnderACentralOutBase(t *testing.T) {
+	t.Setenv("GRAPHIFY_OUT", "")
+	t.Setenv("GRAPHIFY_OUT_NAME", "")
+	root := t.TempDir()
+	corpus := mkdir(t, root, "docs")
+	inTree := filepath.Join(corpus, "graphify-out")
+	if err := os.MkdirAll(inTree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inTree, "graph.json"), []byte(`{"nodes":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := t.TempDir() // central, and empty: nothing ever built this corpus there
+
+	repos, err := Walk(Options{Roots: []string{root}, OutBase: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := has(repos, "docs")
+	if d == nil {
+		t.Fatalf("in-tree corpus lost under a central out-base: %v", names(repos))
+	}
+	if d.Out != inTree {
+		t.Errorf("Out = %q, want the in-tree graph %q — reads would go to the empty central dir", d.Out, inTree)
+	}
+}

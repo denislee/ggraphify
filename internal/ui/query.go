@@ -62,6 +62,9 @@ func (a *App) newQueryPage() *queryPage {
 		names[i] = m.title
 	}
 	q.mode = gtk.NewDropDownFromStrings(names)
+	// The mode titles are phrases, not words; clipped to the row they all
+	// start alike and none of them says which query it runs.
+	q.mode.SetListFactory(&wideTextFactory(nil).ListItemFactory)
 	q.mode.NotifyProperty("selected", func() { q.syncInputs() })
 
 	q.inputA = gtk.NewEntry()
@@ -211,7 +214,9 @@ func (q *queryPage) run() {
 
 	job, err := q.a.runner.SubmitCmd(m.kind, q.row.Path, m.title+" · "+q.row.Name, p, q.a.opts.Store.Overlay(q.row.Path))
 	if err != nil {
-		q.a.toastf("%v", err)
+		// One row here, so the fatal/not distinction has nothing to decide —
+		// but the clipboard help does, and it is the same help.
+		q.a.submitRefused(q.row.Name, err)
 		return
 	}
 	q.jobID = job.ID

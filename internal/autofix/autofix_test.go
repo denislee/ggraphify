@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dns/ggraphify/internal/globalgraph"
 	"github.com/dns/ggraphify/internal/graftstate"
 	"github.com/dns/ggraphify/internal/graphstate"
 )
@@ -356,6 +357,80 @@ func TestBehindHeadIsAttemptedOnceAndThenLeftAlone(t *testing.T) {
 	}
 }
 
+// A restamp that landed and was overtaken by a new commit is not a stuck
+// stamp. The board advances built_at_commit to whatever HEAD was when the
+// rescan finished; a commit that arrives four seconds later leaves the row
+// behind again, by a DIFFERENT commit. Capping that at one attempt parks the
+// repository forever on the strength of one lost race, and tells the user the
+// stamp is not advancing when it demonstrably did.
+func TestARestampThatWasOvertakenGetsAFreshBudget(t *testing.T) {
+	e, now := fixed(t)
+	c := behindOnly("/a", "a")
+
+	acts, _ := e.Plan([]Candidate{c}, on())
+	if len(acts) != 1 {
+		t.Fatalf("first tick planned %d actions, want 1", len(acts))
+	}
+	e.Done(acts[0], "")
+
+	// The update ran, the stamp moved to what was HEAD at the time — and HEAD
+	// moved again while it ran. Same signature, different graph.
+	c.Graph.BuiltCommit = "2222222"
+	c.Graph.HeadCommit = "3333333"
+
+	// Declared on its own first, which is the tick where Plan stopped at
+	// pol.Max and never reached this candidate: the record still holds the old
+	// attempt and only the graph says otherwise.
+	if stuck := e.Declare([]Candidate{c}, on()); len(stuck) != 0 {
+		t.Fatalf("Declare = %+v, want nothing — the stamp advanced", stuck)
+	}
+
+	*now = now.Add(24 * time.Hour)
+	acts, skips := e.Plan([]Candidate{c}, on())
+	if len(acts) != 1 {
+		t.Fatalf("second tick planned %d actions, want 1 — the stamp advanced, so this is progress", len(acts))
+	}
+	if acts[0].Attempt != 1 {
+		t.Errorf("Attempt = %d, want 1 — a stamp that moved buys a fresh budget", acts[0].Attempt)
+	}
+	for _, s := range skips {
+		if strings.Contains(s.Why, "commit stamp") {
+			t.Errorf("skipped with %q — the stamp did advance", s.Why)
+		}
+	}
+}
+
+// The negative control for the test above: a stamp that does NOT move across
+// the attempt is the original stuck case, and must still be given up on after
+// one try. Without this, "a fresh budget when the graph changed" would quietly
+// become "an unlimited budget".
+func TestAStampThatNeverMovesIsStillGivenUpOn(t *testing.T) {
+	e, now := fixed(t)
+	c := behindOnly("/a", "a")
+
+	acts, _ := e.Plan([]Candidate{c}, on())
+	if len(acts) != 1 {
+		t.Fatalf("first tick planned %d actions, want 1", len(acts))
+	}
+	e.Done(acts[0], "")
+
+	// HEAD moved on, as it does on any active checkout — but built_at_commit
+	// is exactly where it was. That is the stamp failing to advance.
+	c.Graph.HeadCommit = "3333333"
+
+	*now = now.Add(24 * time.Hour)
+	acts, skips := e.Plan([]Candidate{c}, on())
+	if len(acts) != 0 {
+		t.Fatalf("planned %d more updates for a stamp that never moved", len(acts))
+	}
+	if len(skips) != 1 || !strings.Contains(skips[0].Why, "commit stamp") {
+		t.Fatalf("skips = %+v, want one naming the stamp", skips)
+	}
+	if stuck := e.Declare([]Candidate{c}, on()); len(stuck) != 1 {
+		t.Fatalf("Declare = %+v, want the repository declared stuck", stuck)
+	}
+}
+
 // The cap is for behind-HEAD ALONE. A repository that is behind AND drifted is
 // an ordinary rebuild — the update has real work to do and may well need the
 // second try the policy allows for.
@@ -524,5 +599,156 @@ func TestClearingTheGraphKeepsTheGraftAttemptsFresh(t *testing.T) {
 	}
 	if acts[0].Attempt != 1 {
 		t.Fatalf("Attempt = %d, want a fresh budget on the new signature", acts[0].Attempt)
+	}
+}
+
+// The global graph — the third thing on a row that goes stale, and the one
+// this loop makes stale itself every time it rebuilds a member's graph.
+
+func globalOn() Policy { p := on(); p.Global = true; return p }
+
+// staleMember is a repository whose own graph is perfect and whose merged copy
+// in the global graph is a rebuild behind.
+func staleMember(path, name string) Candidate {
+	c := healthy(path, name)
+	c.Global = globalgraph.Member{In: true, Tag: name, Stale: true}
+	return c
+}
+
+// A healthy graph with a stale membership is still work: one free re-merge.
+func TestStaleGlobalMemberIsReMergedOnAHealthyGraph(t *testing.T) {
+	e, _ := fixed(t)
+	acts, _ := e.Plan([]Candidate{staleMember("/a", "a")}, globalOn())
+	if len(acts) != 1 {
+		t.Fatalf("got %d actions, want 1", len(acts))
+	}
+	if got := kinds(globalOn(), acts[0]); len(got) != 1 || got[0] != "global-add" {
+		t.Fatalf("plan = %v, want [global-add]", got)
+	}
+	if acts[0].Plan.Metered() {
+		t.Error("a re-merge is free; the plan says it is metered")
+	}
+}
+
+// The switch is a switch. With it off the same row is a row with nothing to do.
+func TestGlobalOffLeavesStaleMembersAlone(t *testing.T) {
+	e, _ := fixed(t)
+	acts, skips := e.Plan([]Candidate{staleMember("/a", "a")}, on())
+	if len(acts) != 0 {
+		t.Fatalf("got %d actions with the global switch off, want 0", len(acts))
+	}
+	if len(skips) != 0 {
+		t.Fatalf("a repository with nothing to do produced skips: %v", skips)
+	}
+}
+
+// Membership is a decision, not a defect. A repository that was never merged
+// is never merged BY the loop, however stale everything else about it is.
+func TestNonMembersAreNeverJoined(t *testing.T) {
+	e, _ := fixed(t)
+	c := drifted("/a", "a") // not a member: zero Member
+	acts, _ := e.Plan([]Candidate{c}, globalOn())
+	if len(acts) != 1 {
+		t.Fatalf("got %d actions, want 1", len(acts))
+	}
+	for _, k := range kinds(globalOn(), acts[0]) {
+		if k == "global-add" {
+			t.Fatalf("the loop joined a repository that was never a member: %v",
+				kinds(globalOn(), acts[0]))
+		}
+	}
+}
+
+// The ordering rule, which is the whole reason this lives in Plan rather than
+// in heal.For: the re-merge has to run AFTER the steps that rewrite graph.json
+// (it exists to pick up what they wrote) and BEFORE `graft build` (which is
+// unrelated to both and must not be what stops either).
+func TestReMergeRunsAfterTheRebuildAndBeforeGraft(t *testing.T) {
+	e, _ := fixed(t)
+	c := drifted("/a", "a")
+	c.Global = globalgraph.Member{In: true, Tag: "a"}
+	c.Graft = graftstate.Index{State: graftstate.StateStale, DriftChanged: 3}
+
+	pol := globalOn()
+	pol.Graft = true
+	acts, _ := e.Plan([]Candidate{c}, pol)
+	if len(acts) != 1 {
+		t.Fatalf("got %d actions, want 1", len(acts))
+	}
+	got := kinds(pol, acts[0])
+	iGraph, iGlobal, iGraft := -1, -1, -1
+	for n, k := range got {
+		switch k {
+		case "update":
+			iGraph = n
+		case "global-add":
+			iGlobal = n
+		case "graft-build":
+			iGraft = n
+		}
+	}
+	if iGraph < 0 || iGlobal < 0 || iGraft < 0 {
+		t.Fatalf("plan = %v, want an update, a global-add and a graft-build", got)
+	}
+	if !(iGraph < iGlobal && iGlobal < iGraft) {
+		t.Fatalf("plan = %v, want update → global-add → graft-build", got)
+	}
+}
+
+// A member whose graph is rebuilt is a member whose copy is about to be stale,
+// even though nothing on the row says so yet. Closing that in the same chain
+// is what keeps the global graph from trailing the board by a whole cooldown.
+func TestARebuiltMemberIsReMergedInTheSameChain(t *testing.T) {
+	e, _ := fixed(t)
+	c := drifted("/a", "a")
+	c.Global = globalgraph.Member{In: true, Tag: "a"} // not stale YET
+	acts, _ := e.Plan([]Candidate{c}, globalOn())
+	if len(acts) != 1 {
+		t.Fatalf("got %d actions, want 1", len(acts))
+	}
+	got := kinds(globalOn(), acts[0])
+	if got[len(got)-1] != "global-add" {
+		t.Fatalf("plan = %v, want it to end with global-add", got)
+	}
+}
+
+// The signature carries the third index too, so a repository whose graph was
+// repaired and whose membership is now stale gets a fresh budget rather than
+// being written off on the old defect's count.
+func TestGlobalStalenessIsAFreshSignature(t *testing.T) {
+	if a, b := candSig(healthy("/a", "a"), globalOn()),
+		candSig(staleMember("/a", "a"), globalOn()); a == b {
+		t.Fatalf("a healthy row and a stale member share the signature %q", a)
+	}
+	if got := candSig(staleMember("/a", "a"), globalOn()); got != globalgraph.IssueStale {
+		t.Fatalf("candSig = %q, want %q", got, globalgraph.IssueStale)
+	}
+	// And with the switch off it is not a defect at all.
+	if got := candSig(staleMember("/a", "a"), on()); got != "" {
+		t.Fatalf("candSig with global off = %q, want empty", got)
+	}
+}
+
+// One attempt, like behind-HEAD: a re-add either moves the manifest entry past
+// the graph or it does not, and repeating it cannot change that.
+func TestAStaleMemberGetsOneAttempt(t *testing.T) {
+	e, now := fixed(t)
+	pol := globalOn()
+	for i := 0; i < 3; i++ {
+		acts, _ := e.Plan([]Candidate{staleMember("/a", "a")}, pol)
+		for _, act := range acts {
+			e.Done(act, "")
+		}
+		if i > 0 && len(acts) != 0 {
+			t.Fatalf("attempt %d planned again; want one attempt only", i+1)
+		}
+		*now = now.Add(24 * time.Hour)
+	}
+	stuck := e.Declare([]Candidate{staleMember("/a", "a")}, pol)
+	if len(stuck) != 1 {
+		t.Fatalf("got %d stuck, want 1", len(stuck))
+	}
+	if !strings.Contains(stuck[0].Why, "global graph") {
+		t.Fatalf("give-up reason = %q, want it to name the global graph", stuck[0].Why)
 	}
 }

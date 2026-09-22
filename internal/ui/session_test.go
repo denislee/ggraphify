@@ -38,10 +38,59 @@ func TestRestoredJobHoldPolicy(t *testing.T) {
 				e.Local = true
 				return e
 			}(), true},
+		// The deep graft pass has no --backend in its argv, so where it ran
+		// is read off the sidecar's own Local flag. A local one is free; the
+		// same kind pointed at a vendor is not, and a restart must not be the
+		// moment that distinction is lost.
+		{"a local deep graft index restores free",
+			func() store.JobEntry {
+				e := base
+				e.Kind = gfy.GraftDeepKind
+				e.Cost = "free"
+				e.Local = true
+				return e
+			}(), true},
+		{"a metered deep graft index restores metered",
+			func() store.JobEntry {
+				e := base
+				e.Kind = gfy.GraftDeepKind
+				e.Cost = "metered"
+				return e
+			}(), true},
 		{"a job that was already held stays held",
 			func() store.JobEntry { e := base; e.Kind = "update"; e.Cost = "free"; e.Held = true; return e }(), true},
-		{"a job that was mid-flight comes back held",
-			func() store.JobEntry { e := base; e.Kind = "update"; e.Cost = "free"; e.Status = "running"; return e }(), true},
+		// The interrupted ones. A window that closed over a running job is not
+		// a decision about that job, so the board picks it up again — unless
+		// picking it up means spending money, or unless the job had been
+		// stopped by hand before the window closed.
+		{"a job that was mid-flight resumes on its own",
+			func() store.JobEntry { e := base; e.Kind = "update"; e.Cost = "free"; e.Status = "running"; return e }(), false},
+		{"a local extraction that was mid-flight resumes — it costs hours, not money",
+			func() store.JobEntry {
+				e := base
+				e.Kind = "extract"
+				e.Cost = "metered"
+				e.Local = true
+				e.Status = "running"
+				return e
+			}(), false},
+		{"a billed extraction that was mid-flight waits for a click",
+			func() store.JobEntry {
+				e := base
+				e.Kind = "extract"
+				e.Cost = "metered"
+				e.Status = "running"
+				return e
+			}(), true},
+		{"a job paused by hand stays stopped across a restart",
+			func() store.JobEntry {
+				e := base
+				e.Kind = "update"
+				e.Cost = "free"
+				e.Status = "running"
+				e.Paused = true
+				return e
+			}(), true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -54,6 +103,15 @@ func TestRestoredJobHoldPolicy(t *testing.T) {
 			}
 			if j.Held != c.held {
 				t.Fatalf("held=%v, want %v", j.Held, c.held)
+			}
+			if c.e.Kind == gfy.GraftDeepKind {
+				want := gfy.Metered
+				if c.e.Local {
+					want = gfy.Free
+				}
+				if j.Cost != want {
+					t.Fatalf("cost=%v, want %v", j.Cost, want)
+				}
 			}
 		})
 	}
@@ -184,7 +242,11 @@ func TestDeriveScopeOf(t *testing.T) {
 		{"export-html", "/r", scopeRepo},
 		{"graft-init", "/r", scopeGraft},
 		{"install", "", scopeBoard},
-		{"global-list", "", scopeNone},  // reads, writes nothing
+		{"global-list", "", scopeNone}, // reads, writes nothing
+		// Membership changes write ~/.graphify and nothing a row is derived
+		// from, so they drop the membership memo and nothing else.
+		{"global-add", "/r", scopeGlobal},
+		{"global-remove", "/r", scopeGlobal},
 		{"merge-graphs", "", scopeNone}, // writes a file of its own, not an output dir
 		{"query", "/r", scopeNone},      // reads the graph
 		{"nonesuch", "/r", scopeNone},   // unknown kinds are not assumed to mutate
@@ -193,5 +255,57 @@ func TestDeriveScopeOf(t *testing.T) {
 		if got := deriveScopeOf(c.kind, c.repo); got != c.want {
 			t.Errorf("deriveScopeOf(%q, %q) = %d, want %d", c.kind, c.repo, got, c.want)
 		}
+	}
+}
+
+// A resumed job says in its own log where the interrupted run had got to, and
+// that the command starts again rather than picking up there. Both halves
+// matter: "4/19" is the only trace of the work that was lost, and a row that
+// said "resumed" without the second sentence would promise a checkpoint
+// graphify does not have.
+func TestAResumedJobSaysWhereItWasAndThatItStartsOver(t *testing.T) {
+	st := testStore(t)
+	dir := t.TempDir()
+	e := store.JobEntry{
+		Kind: "extract", Repo: dir, Dir: dir, Status: "running", Local: true,
+		Cost: "metered", Argv: []string{"graphify", "extract", dir},
+		Log: "extract: chunk [4/19] internal/ui/dock.go\n",
+	}
+
+	j := restoredJob(e, st, "")
+	if j == nil {
+		t.Fatal("the job was dropped")
+	}
+	if j.Held {
+		t.Fatal("a local extraction interrupted by the last session came back held")
+	}
+	log := j.Log.Tail(40)
+	for _, want := range []string{"4/19", "runs again from the start"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("the restored log does not mention %q:\n%s", want, log)
+		}
+	}
+}
+
+// The same entry, paused: no restart, and the log says which of the two
+// reasons it is being held for.
+func TestAPausedJobIsHeldRatherThanResumed(t *testing.T) {
+	st := testStore(t)
+	dir := t.TempDir()
+	e := store.JobEntry{
+		Kind: "extract", Repo: dir, Dir: dir, Status: "running", Local: true,
+		Cost: "metered", Paused: true, Argv: []string{"graphify", "extract", dir},
+		Log: "extract: chunk [4/19] internal/ui/dock.go\n",
+	}
+
+	j := restoredJob(e, st, "")
+	if j == nil {
+		t.Fatal("the job was dropped")
+	}
+	if !j.Held {
+		t.Fatal("a job paused by hand restarted itself after a reopen")
+	}
+	if log := j.Log.Tail(40); !strings.Contains(log, "stopped by hand") {
+		t.Fatalf("the restored log does not say why it is held:\n%s", log)
 	}
 }

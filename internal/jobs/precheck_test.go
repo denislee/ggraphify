@@ -1,6 +1,9 @@
 package jobs
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,5 +80,94 @@ func TestPrecheckCoversEveryGraphReadingKind(t *testing.T) {
 func TestPrecheckIgnoresUnknownKinds(t *testing.T) {
 	if err := RequireGraph(&Job{Kind: "no-such-kind", Out: filepath.Join(t.TempDir(), "nope")}); err != nil {
 		t.Errorf("an unknown kind was gated: %v", err)
+	}
+}
+
+// ollamaJob is a job as SubmitCmd would have built it for the local backend:
+// the argv is what RequireLocalServer reads, not the Params.
+func ollamaJob(t *testing.T) *Job {
+	t.Helper()
+	repo := t.TempDir()
+	p := gfy.Params{Repo: repo, Backend: gfy.OllamaBackend}
+	return &Job{
+		Kind:  "extract",
+		Repo:  repo,
+		Local: true,
+		Argv:  gfy.Argv("extract", p),
+	}
+}
+
+// deadOllama points the backend at a port nothing is listening on, which is
+// exactly the state the regression happened in: the server is configured, and
+// it is not answering.
+func deadOllama(t *testing.T) {
+	t.Helper()
+	t.Setenv(gfy.OllamaHostVar, "http://127.0.0.1:1")
+	gfy.InvalidateLocalProbe()
+	t.Cleanup(gfy.InvalidateLocalProbe)
+}
+
+// The refusal that this gate exists for, in the one arm that needs no systemd
+// to reproduce: the server is down and the board is not going to start it, so
+// running the job could only produce a log full of connection errors.
+func TestRequireLocalServerRefusesADownServerTheBoardWillNotStart(t *testing.T) {
+	deadOllama(t)
+	err := RequireLocalServer(func() bool { return false })(ollamaJob(t))
+	if err == nil {
+		t.Fatal("a local job was queued against a server nothing was going to start")
+	}
+	for _, want := range []string{"127.0.0.1:1", "lifecycle"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q: %v", want, err)
+		}
+	}
+}
+
+// And it stays out of the way of every job it is not about: a metered backend
+// talks to nobody's ollama, and a down server it is not using must not stop it.
+func TestRequireLocalServerIgnoresAMeteredJob(t *testing.T) {
+	deadOllama(t)
+	repo := t.TempDir()
+	j := &Job{Kind: "extract", Repo: repo,
+		Argv: gfy.Argv("extract", gfy.Params{Repo: repo, Backend: gfy.ClaudeCLIBackend})}
+	if err := RequireLocalServer(func() bool { return false })(j); err != nil {
+		t.Errorf("a claude-cli job was refused for the local server's sake: %v", err)
+	}
+	if err := RequireLocalServer(nil)(nil); err != nil {
+		t.Errorf("a nil job was refused: %v", err)
+	}
+}
+
+// A server that answers is a server that answers, whoever started it — the
+// gate has nothing to say and must say nothing.
+func TestRequireLocalServerAllowsAServerThatIsUp(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"qwen2.5-coder:7b"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv(gfy.OllamaHostVar, srv.URL)
+	gfy.InvalidateLocalProbe()
+	t.Cleanup(gfy.InvalidateLocalProbe)
+
+	if err := RequireLocalServer(func() bool { return false })(ollamaJob(t)); err != nil {
+		t.Errorf("a job was refused against a server that was answering: %v", err)
+	}
+}
+
+// Checks stops at the first refusal and reports it verbatim: two gates whose
+// messages were concatenated would be a sentence about neither.
+func TestChecksStopsAtTheFirstRefusal(t *testing.T) {
+	ran := 0
+	boom := errors.New("first")
+	err := Checks(nil,
+		func(*Job) error { ran++; return nil },
+		func(*Job) error { ran++; return boom },
+		func(*Job) error { ran++; return errors.New("second") },
+	)(&Job{})
+	if err != boom {
+		t.Errorf("Checks returned %v, want the first refusal", err)
+	}
+	if ran != 2 {
+		t.Errorf("%d checks ran; the one after the refusal should not have", ran)
 	}
 }

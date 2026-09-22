@@ -353,6 +353,8 @@ type usagePane struct {
 	tiles    *gtk.FlowBox
 	recs     *gtk.Box
 	recsSec  gtk.Widgetter
+	fixAll   *gtk.Button
+	targets  []string
 	fails    *gtk.Box
 	failsSec gtk.Widgetter
 	timeline *gtk.Label
@@ -467,7 +469,11 @@ func (a *App) newUsagePane() *usagePane {
 	p.timeline.AddCSSClass("argv")
 
 	p.recs = gtk.NewBox(gtk.OrientationVertical, 4)
-	p.recsSec = usageSection("Worth doing next", p.recs)
+	p.fixAll = gtk.NewButtonWithLabel("Fix all automatically")
+	p.fixAll.AddCSSClass("flat")
+	p.fixAll.ConnectClicked(func() { p.a.autoFixNow(p.targets) })
+	p.recsSec = usageSectionAction("Worth doing next", p.fixAll, p.recs)
+	p.syncFixAll()
 
 	p.fails = gtk.NewBox(gtk.OrientationVertical, 4)
 	p.failsSec = usageSection("Asked, and got nothing", p.fails)
@@ -693,6 +699,9 @@ func (p *usagePane) fillRecs(s usage.Summary, repo string) {
 		}
 	}
 
+	p.targets = autoFixTargets(recs)
+	p.syncFixAll()
+
 	clearBox(p.recs)
 	if len(recs) == 0 {
 		switch {
@@ -707,6 +716,52 @@ func (p *usagePane) fillRecs(s usage.Summary, repo string) {
 	}
 	for _, r := range recs {
 		p.recs.Append(p.recRow(r))
+	}
+}
+
+// syncFixAll states what the section-wide button can do about the list under
+// it right now.
+//
+// It is insensitive rather than hidden when there is nothing to fix, because
+// a control that comes and goes with a two-second live refresh is a control
+// that moves under the pointer; the tooltip carries the reason instead. The
+// label says what it will spend, and that comes from the settings rather than
+// from the click: the metered switch is the only thing that lets this reach a
+// billed backend, exactly as it is for the unattended loop.
+func (p *usagePane) syncFixAll() {
+	if p.fixAll == nil {
+		return
+	}
+	metered := false
+	if p.a.opts.Store != nil {
+		metered = p.a.opts.Store.Settings().AutoFixMetered
+	}
+	switch {
+	case metered:
+		p.fixAll.SetLabel("Fix all automatically  $")
+		p.fixAll.AddCSSClass("metered")
+	default:
+		p.fixAll.SetLabel("Fix all automatically")
+		p.fixAll.RemoveCSSClass("metered")
+	}
+
+	can := len(p.targets) > 0 && p.a.runner != nil && p.a.autofix != nil
+	p.fixAll.SetSensitive(can)
+	switch {
+	case !can:
+		p.fixAll.SetTooltipText("Nothing on this list the auto-fix loop can do on its own — " +
+			"adding a scan root is a decision about which checkouts the board watches, not a repair.")
+	case metered:
+		p.fixAll.SetTooltipText("Runs the auto-fix loop over " +
+			plural(len(p.targets), "repository", "repositories") +
+			" on this list, now. Metered fixes are ON in settings, so the LLM steps may run " +
+			"against the billed backend.")
+	default:
+		p.fixAll.SetTooltipText("Runs the auto-fix loop over " +
+			plural(len(p.targets), "repository", "repositories") +
+			" on this list, now — the same plan the board would run on its own. Free steps, " +
+			"plus a local model if one is up; it never reaches a billed backend unless the " +
+			"metered switch in settings says it may.")
 	}
 }
 
@@ -931,10 +986,11 @@ func (p *usagePane) tick(visible bool) {
 	p.a.refreshUsage()
 }
 
-// The window's two pages.
+// The window's three pages.
 const (
-	pageBoard     = "board"
-	pageUsageName = "usage"
+	pageBoard      = "board"
+	pageUsageName  = "usage"
+	pageGlobalName = "global"
 )
 
 // pageUsage maps the header toggle's state to a page name.
@@ -946,8 +1002,19 @@ func pageUsage(on bool) string {
 }
 
 // onUsagePage reports whether the dashboard is the page on screen.
-func (a *App) onUsagePage() bool {
-	return a.main != nil && a.main.VisibleChildName() == pageUsageName
+func (a *App) onUsagePage() bool { return a.onPage(pageUsageName) }
+
+// onGlobalPage reports whether the Global screen is the page on screen.
+func (a *App) onGlobalPage() bool { return a.onPage(pageGlobalName) }
+
+// onBoardPage is the question the key dispatcher asks: are the rows on screen
+// at all? Every binding that acts on a row is inert when they are not.
+func (a *App) onBoardPage() bool {
+	return a.main == nil || a.main.VisibleChildName() == pageBoard
+}
+
+func (a *App) onPage(name string) bool {
+	return a.main != nil && a.main.VisibleChildName() == name
 }
 
 // setMainPage switches the window between the board and the dashboard.
@@ -963,14 +1030,22 @@ func (a *App) setMainPage(name string) {
 	if a.filterBar != nil {
 		a.filterBar.SetVisible(name == pageBoard)
 	}
-	a.usageGuard = true
+	// Both header toggles are set from here and nowhere else, so leaving one
+	// page for another cannot leave two buttons looking active.
+	a.pageGuard = true
 	if a.usageBtn != nil {
 		a.usageBtn.SetActive(name == pageUsageName)
 	}
-	a.usageGuard = false
+	if a.globalBtn != nil {
+		a.globalBtn.SetActive(name == pageGlobalName)
+	}
+	a.pageGuard = false
 	if name == pageUsageName && a.usagePane != nil {
 		a.usagePane.show(a.current())
 		a.refreshUsage()
+	}
+	if name == pageGlobalName && a.globalPane != nil {
+		a.globalPane.reload()
 	}
 	a.refreshStatus()
 }
@@ -1001,6 +1076,22 @@ func usageSection(title string, child gtk.Widgetter) gtk.Widgetter {
 	lbl.AddCSSClass("heading")
 	box := gtk.NewBox(gtk.OrientationVertical, 6)
 	box.Append(lbl)
+	box.Append(child)
+	return box
+}
+
+// usageSectionAction is usageSection with a control on the title row: one
+// button that acts on everything listed under it, rather than one per line.
+func usageSectionAction(title string, action gtk.Widgetter, child gtk.Widgetter) gtk.Widgetter {
+	lbl := gtk.NewLabel(title)
+	lbl.SetXAlign(0)
+	lbl.SetHExpand(true)
+	lbl.AddCSSClass("heading")
+	head := gtk.NewBox(gtk.OrientationHorizontal, 6)
+	head.Append(lbl)
+	head.Append(action)
+	box := gtk.NewBox(gtk.OrientationVertical, 6)
+	box.Append(head)
 	box.Append(child)
 	return box
 }

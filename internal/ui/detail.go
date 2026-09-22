@@ -45,6 +45,13 @@ type detailPane struct {
 	// fixRow is the Fix action, kept so its subtitle can name this row's
 	// actual defects instead of describing the button in the abstract.
 	fixRow *adw.ActionRow
+	// The global-graph membership switch: one row that adds or removes,
+	// re-worded per repository. See reloadGlobalRow.
+	globalRow *adw.ActionRow
+	globalBtn *gtk.Button
+	// globalBtnClass is the class currently on that button, because it moves
+	// between flat and destructive as the row does. See setClass.
+	globalBtnClass string
 
 	// Report.
 	report *gtk.TextView
@@ -280,6 +287,7 @@ func (d *detailPane) buildOverview() gtk.Widgetter {
 
 	for _, r := range []*adw.EntryRow{d.ovBackend, d.ovModel, d.ovOut, d.ovExtra} {
 		row := r
+		row.SetShowApplyButton(true)
 		row.ConnectApply(func() { d.saveOverride() })
 		ov.Add(row)
 	}
@@ -316,6 +324,7 @@ func (d *detailPane) syncActions(r *board.Row) {
 	if d.fixRow != nil {
 		d.fixRow.SetSubtitle(fixSubtitle(r))
 	}
+	d.reloadGlobalRow(r)
 	has := r != nil && d.a.hasGraph(*r)
 	for _, a := range d.actRows {
 		a.btn.SetSensitive(has)
@@ -403,7 +412,20 @@ func (d *detailPane) buildActionGroups() *adw.PreferencesGroup {
 	add("Check for pending re-extraction", "Reads the needs_update flag. Free.", "check-update", d.a.actCheckUpdate, false)
 	add("Extract", "Full AST + semantic extraction. METERED — dispatches LLM requests.", "extract", d.a.actExtract, true)
 	add("Label communities", "Name the communities with an LLM. METERED.", "label", d.a.actLabel, true)
-	add("Add to global graph", "Merge this graph into ~/.graphify/global-graph.json. Free.", "global-add", d.a.actGlobalAdd, false)
+	// One row for both directions. Membership is a switch, and a pane that
+	// offered "Add" to a repository already in the global graph would be
+	// offering the button that silently replaces its nodes. The title says
+	// which way it will go — see reloadGlobalRow.
+	d.globalRow = adw.NewActionRow()
+	d.globalRow.SetTitle("Add to global graph")
+	d.globalRow.SetSubtitle(globalRowSub(board.Row{}))
+	d.globalBtn = gtk.NewButtonWithLabel("Add")
+	d.globalBtn.SetVAlign(gtk.AlignCenter)
+	d.globalBtn.AddCSSClass("flat")
+	d.globalBtn.ConnectClicked(func() { d.a.actGlobalToggle() })
+	d.globalRow.AddSuffix(d.globalBtn)
+	d.globalRow.SetActivatableWidget(d.globalBtn)
+	g.Add(d.globalRow)
 	add("Sync graft index", "Rebuild this checkout's graft/ — graft's wiring graph, the one agents query. Free, tree-sitter only.", "graft-build", d.a.actGraftBuild, false)
 	add("Deep graft index", "Add graft's concept map and per-symbol summaries — the prose tier agents read. Runs on THIS machine's local model: no key and no bill, but slow.", gfy.GraftDeepKind, d.a.actGraftDeep, false)
 	add("Install git hooks", "graphify writes post-commit/post-checkout hooks into this repository.", "hook-install", d.a.actHookInstall, false)
@@ -511,6 +533,9 @@ func (d *detailPane) loadOverview() {
 	// column renders a bare ring for it.
 	fact("Graft", graftFact(r.Graft), graftClass(r.Graft.State))
 	fact("", graftExposureNote(r.Graft), "st-stale")
+	// The third index, and the only one that is not a file in or beside this
+	// checkout: whether these nodes are also in the cross-repo graph.
+	fact("Global", globalFact(r.Global), globalClass(r.Global))
 	if s := d.a.jobFor(r.Path); s != nil {
 		fact("Last job", jobHeadline(s), "")
 	}
@@ -850,7 +875,10 @@ func jobHeadline(s *jobs.Snapshot) string {
 		b.WriteString(shortDur(s.Elapsed()))
 		b.WriteString(")")
 	}
-	if s.Cost == gfy.Metered {
+	switch {
+	case s.Local:
+		b.WriteString("  [local model]")
+	case s.Cost == gfy.Metered:
 		b.WriteString("  [metered]")
 	}
 	if s.Status.Done() && s.Exit != 0 {
@@ -875,4 +903,49 @@ func (a *App) opener() openConfig {
 		c.Editor = set.Editor
 	}
 	return c
+}
+
+// reloadGlobalRow words the membership row for the selected repository. The
+// button is one control for two commands, so what it will do has to be legible
+// before it is pressed rather than inside the confirm that follows.
+func (d *detailPane) reloadGlobalRow(r *board.Row) {
+	if d.globalRow == nil || d.globalBtn == nil {
+		return
+	}
+	var row board.Row
+	if r != nil {
+		row = *r
+	}
+	in := row.Global.In
+
+	d.globalRow.SetTitle(map[bool]string{
+		true:  "Remove from global graph",
+		false: "Add to global graph",
+	}[in])
+	d.globalRow.SetSubtitle(globalRowSub(row))
+
+	d.globalBtn.SetLabel(map[bool]string{true: "Remove", false: "Add"}[in])
+	setClass(d.globalBtn, &d.globalBtnClass, map[bool]string{
+		true:  "destructive-action",
+		false: "flat",
+	}[in])
+	// An add needs a graph to merge; a remove does not — the nodes it drops
+	// are in the global graph, not in this checkout.
+	d.globalBtn.SetSensitive(r != nil && (in || d.a.hasGraph(row)))
+}
+
+// globalRowSub is the membership row's explanation: the command it runs, and
+// the one thing about it that is not obvious — a re-add replaces rather than
+// duplicates.
+func globalRowSub(r board.Row) string {
+	switch {
+	case r.Global.In && r.Global.Stale:
+		return "Merged as “" + r.Global.Tag + "”, and re-extracted since. " +
+			"Press m to re-add it and replace what the global graph holds. Free."
+	case r.Global.In:
+		return "Merged as “" + r.Global.Tag + "”. Removing drops its nodes from " +
+			"~/.graphify/global-graph.json; this checkout is not touched. Free."
+	}
+	return "Merge this graph into ~/.graphify/global-graph.json, so a cross-repo " +
+		"question can reach it. Free."
 }

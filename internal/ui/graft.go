@@ -156,7 +156,7 @@ func (a *App) confirmSyncGraft(rows []board.Row, inStep int) {
 }
 
 // actSyncGraftDeep is the deep sweep: graft's LLM tier over every repository in
-// the folder in force, on the model already running on this machine.
+// the folder in force, on whatever Heavy work is pinned to.
 //
 // Its target is wider than the free sweep's by exactly one state. NeedsBuild
 // skips StateRaw — a wiring graph in step with the tree — because `graft
@@ -169,8 +169,7 @@ func (a *App) actSyncGraftDeep() {
 		return
 	}
 
-	set := a.opts.Store.Settings()
-	backend, model, ok, why := gfy.GraftDeepReady(set.Backend, set.Model)
+	backend, model, ok, why := a.graftDeepPin()
 	if !ok {
 		// Not a dialog. Nothing about this one is a choice the person still
 		// has: there is no model to run it on, and the sentence says which
@@ -198,8 +197,10 @@ func (a *App) actSyncGraftDeep() {
 
 // confirmSyncGraftDeep is the gate. It differs from the free sweep's in the
 // two things that are actually different: this one dispatches LLM requests,
-// and it says where they go — because "free" here is a claim about an endpoint
-// on this machine, and a reader is entitled to check it.
+// and it says where they go — because "free" is a claim about an endpoint and
+// not about this command, a reader is entitled to check it, and since the deep
+// pass started following the Heavy work pin the claim is sometimes the
+// opposite one.
 func (a *App) confirmSyncGraftDeep(rows []board.Row, inStep int, backend, model string) {
 	set := a.opts.Store.Settings()
 
@@ -211,15 +212,35 @@ func (a *App) confirmSyncGraftDeep(rows []board.Row, inStep int, backend, model 
 	}
 	body.WriteString("\n\n")
 	body.WriteString(graftDeepPlanSummary(rows))
+	// Where it runs is Heavy work's answer, so what it costs is too — and the
+	// two halves of this paragraph are the two answers, never both.
+	local := gfy.IsLocalBackend(backend)
 	body.WriteString("\n\nThis runs graft's LLM pass — a concept map and a per-symbol " +
-		"summary and crux — on " + model + " at " + gfy.LocalBaseURL(backend) + ".\n" +
-		"No key and no bill: the corpus and every request stay on this machine. " +
-		"It is far slower than the free wiring build, and it writes graft/ inside " +
-		"each checkout the same way that one does.\n\n" +
-		"A partial result is kept rather than discarded (--allow-partial): the " +
-		"per-symbol crux needs a model that honors tool_choice, which ollama's " +
-		"endpoint does not always pass through, and the concept map is worth " +
-		"having on its own. A later run resumes from what is cached.")
+		"summary and crux — on " + model + " via the " + backend + " pin under Heavy work")
+	if base := gfy.LocalBaseURL(backend); local && base != "" {
+		body.WriteString(", at " + base)
+	}
+	body.WriteString(".\n")
+	if local {
+		body.WriteString("No key and no bill: the corpus and every request stay on this " +
+			"machine. It is far slower than the free wiring build, and it writes graft/ " +
+			"inside each checkout the same way that one does.\n\n" +
+			"A partial result is kept rather than discarded (--allow-partial): the " +
+			"per-symbol crux needs a model that honors tool_choice, which ollama's " +
+			"endpoint does not always pass through, and the concept map is worth " +
+			"having on its own. A later run resumes from what is cached.")
+	} else {
+		// One request per file of every checkout listed above, billed to
+		// whoever owns that key. Said plainly and in the same place the free
+		// case says the opposite, because this dialog used to promise "no
+		// bill" unconditionally and that promise is now a pin away from
+		// being false.
+		body.WriteString("THIS IS METERED: " + backend + " is not a model on this machine, " +
+			"so every file of every repository above is a billed request against your own " +
+			"key. It writes graft/ inside each checkout the same way the free wiring " +
+			"build does.\n\nA run that fails partway is not thrown away — graft caches " +
+			"what it computed and a later run resumes from there.")
+	}
 
 	dlg := adw.NewAlertDialog("Deep graft sweep", body.String())
 	dlg.SetPreferWideLayout(true)
@@ -252,7 +273,13 @@ func (a *App) confirmSyncGraftDeep(rows []board.Row, inStep int, backend, model 
 
 	dlg.AddResponse("cancel", "Cancel")
 	dlg.AddResponse("sync", "Index "+plural(len(rows), "repo", "repos"))
-	dlg.SetResponseAppearance("sync", adw.ResponseSuggested)
+	if local {
+		dlg.SetResponseAppearance("sync", adw.ResponseSuggested)
+	} else {
+		// The same appearance every other metered action gets. A sweep that
+		// spends money must not look like the free one it sits next to.
+		dlg.SetResponseAppearance("sync", adw.ResponseDestructive)
+	}
 	dlg.SetDefaultResponse("cancel")
 	dlg.SetCloseResponse("cancel")
 

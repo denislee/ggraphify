@@ -94,13 +94,14 @@ Exit status is 0 when every invariant holds and 1 when one is broken.
 	defer cancel()
 
 	rep := doctor.Run(doctor.Options{
-		Rows:          rows,
-		OutBase:       doctor.ExpandBase(outBase),
-		Backend:       set.Backend,
-		Model:         set.Model,
-		OpenCodeModel: set.OpenCodeModel,
-		ClaudeAccount: set.ClaudeAccount,
-		Version:       gfy.Probe(ctx),
+		Rows:             rows,
+		OutBase:          doctor.ExpandBase(outBase),
+		Backend:          set.Backend,
+		Model:            set.Model,
+		OpenCodeModel:    set.OpenCodeModel,
+		OpenCodeZenModel: set.OpenCodeZenModel,
+		ClaudeAccount:    set.ClaudeAccount,
+		Version:          gfy.Probe(ctx),
 	})
 
 	if *asJSON {

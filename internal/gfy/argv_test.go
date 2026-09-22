@@ -428,3 +428,45 @@ func TestNeedsGraphCoversEveryGraphReadingArgv(t *testing.T) {
 		t.Error("an unknown kind must not be gated")
 	}
 }
+
+// The weight table is policy, not description: the two Heavy kinds are the
+// same job in two indexers — a request per file of the whole checkout — label
+// is the handful of short prompts, and everything else reaches no model at
+// all.
+func TestWeightOf(t *testing.T) {
+	cases := map[string]Weight{
+		"extract":     Heavy,
+		"label":       Light,
+		"update":      NoLLM,
+		"query":       NoLLM,
+		GraftDeepKind: Heavy,
+		"no-such-cmd": NoLLM,
+	}
+	for kind, want := range cases {
+		if got := WeightOf(kind); got != want {
+			t.Errorf("WeightOf(%q) = %v, want %v", kind, got, want)
+		}
+	}
+}
+
+// LLMKinds and the weights table are two statements of the same fact, and the
+// settings page believes the first one: a kind that reaches a model and is not
+// offered a pin is a command nobody can repoint, and a pin for a kind that
+// talks to no model is a row that does nothing.
+func TestLLMKindsMatchesTheWeightTable(t *testing.T) {
+	listed := map[string]bool{}
+	for _, k := range LLMKinds() {
+		if WeightOf(k) == NoLLM {
+			t.Errorf("LLMKinds offers a pin for %q, which reaches no model", k)
+		}
+		if _, ok := Known[k]; !ok {
+			t.Errorf("LLMKinds offers a pin for %q, which is not a command", k)
+		}
+		listed[k] = true
+	}
+	for kind := range Known {
+		if WeightOf(kind) != NoLLM && !listed[kind] {
+			t.Errorf("kind %q reaches a model and has no pin in LLMKinds", kind)
+		}
+	}
+}

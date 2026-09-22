@@ -50,7 +50,15 @@ func (a *App) buildActivity() *gtk.MenuButton {
 	cancelAll := gtk.NewButtonWithLabel("Cancel all")
 	cancelAll.AddCSSClass("flat")
 	cancelAll.AddCSSClass("destructive-action")
-	cancelAll.ConnectClicked(func() { a.runner.CancelAll() })
+	cancelAll.SetTooltipText("Cancel every running and queued job. Running jobs can be " +
+		"re-run from their rows; a large queue is asked about first.")
+	cancelAll.ConnectClicked(func() {
+		// The popover goes away first: the confirm dialog is modal on the
+		// window, and a popover left open underneath it would be a menu
+		// somebody has to dismiss after answering.
+		a.activity.Popdown()
+		a.cancelAll(nil)
+	})
 
 	foot := gtk.NewBox(gtk.OrientationHorizontal, 6)
 	foot.SetMarginStart(6)
@@ -163,12 +171,7 @@ func (a *App) activityRow(s jobs.Snapshot) *gtk.Box {
 	l.SetTooltipText(s.Command())
 	row.Append(l)
 
-	if s.Cost == gfy.Metered {
-		m := gtk.NewLabel("$")
-		m.AddCSSClass("metered")
-		m.SetTooltipText("This job dispatches LLM requests against your API key.")
-		row.Append(m)
-	}
+	appendCostMark(row, s)
 
 	status := gtk.NewLabel(text)
 	status.AddCSSClass("dim-label")

@@ -105,6 +105,9 @@ func (a *App) claudeAccountRow() *adw.ComboRow {
 
 	row := adw.NewComboRow()
 	row.SetTitle("Account")
+	// An account label is a plan and an email; shortened it is neither.
+	row.SetListFactory(&wideTextFactory(nil).ListItemFactory)
+	row.SetFactory(&valueFactory().ListItemFactory)
 	row.SetSubtitle("Which Claude Code login jobs run as: the plan a claude-cli extraction " +
 		"is billed to, and the ~/.claude* the skill is installed into. Passed as " +
 		gfy.ClaudeConfigDirVar + " on every job.")

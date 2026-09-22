@@ -117,6 +117,21 @@ var columns = []colSpec{
 		},
 	},
 	{
+		// The third index: is this repository in graphify's cross-repo graph,
+		// ~/.graphify/global-graph.json. It is a column rather than a
+		// footnote in the detail pane because membership is invisible from
+		// inside a checkout — nothing in graphify-out/ says whether those
+		// nodes were also merged somewhere else — and because the half-filled
+		// state, "merged, then re-extracted", is silent work that only a
+		// board over every repository can see.
+		ID: "global", Title: "Global", Width: 100,
+		cmp: func(a *App, x, y *board.Row) int { return globalWeight(x) - globalWeight(y) },
+		render: func(a *App, l *gtk.Label, r *board.Row) (string, string) {
+			l.SetTooltipText(globalTooltip(*r))
+			return globalCell(r.Global, r.Name)
+		},
+	},
+	{
 		// Whether anything actually READS the two indexes the columns to the
 		// left describe. A fresh graph nothing has opened is a cost with no
 		// return, and a repository queried all week with no graph at all is
@@ -239,6 +254,20 @@ func graftWeight(r *board.Row) int {
 		return 3
 	}
 	return 4 // StateNone
+}
+
+// globalWeight orders the Global column by how much attention the row wants,
+// the same way graftWeight does: the members carrying a superseded extraction
+// first, then the members that are current, then everything that is not in the
+// global graph at all — which on a fresh machine is every row.
+func globalWeight(r *board.Row) int {
+	switch {
+	case r.Global.In && r.Global.Stale:
+		return 0
+	case r.Global.In:
+		return 1
+	}
+	return 2
 }
 
 // stateWeight orders the state column by how much attention a row wants,
@@ -512,7 +541,9 @@ func (a *App) matches(r *board.Row) bool {
 	case filterBehind:
 		// Also not a state: a row is behind when its graph's commit is not the
 		// checkout's HEAD, which is orthogonal to every state chip beside it.
-		if !r.Behind {
+		// It reads NeedsRebuild so the chip and the sweep button behind it
+		// select the same rows — a row with no HEAD answers this on drift.
+		if !r.NeedsRebuild() {
 			return false
 		}
 	case filterGap:

@@ -19,6 +19,7 @@ import (
 	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/discover"
 	"github.com/dns/ggraphify/internal/gfy"
+	"github.com/dns/ggraphify/internal/globalgraph"
 	"github.com/dns/ggraphify/internal/graphstate"
 	"github.com/dns/ggraphify/internal/knowledge"
 	"github.com/dns/ggraphify/internal/store"
@@ -69,6 +70,11 @@ func main() {
 	outNameV, outBaseV := resolveOut(set, setFlags, *outName, *outBase)
 
 	opts := board.Options{Depth: *depth, SkipDrift: *skipDrift, OutName: outNameV, OutBase: outBaseV, ShowHidden: *hidden}
+	// Membership of graphify's cross-repo graph, read once for the whole
+	// scan. It is in the headless output for the same reason every other
+	// derived fact is: what the board renders as a column, `ggraphify-scan`
+	// has to be able to print.
+	opts.Global = globalgraph.Load(globalgraph.ManifestPath())
 	if !setFlags["depth"] && set.Depth > 0 {
 		opts.Depth = set.Depth
 	}
@@ -156,8 +162,9 @@ func main() {
 	if *behind {
 		// Not a state, so it cannot be spelled -state: a graph can be behind
 		// HEAD and `fresh` at the same time, which is precisely why this is
-		// worth asking about separately.
-		rows = filter(rows, func(r board.Row) bool { return r.Behind })
+		// worth asking about separately. A row with no git answers it on
+		// drift instead — see board.Row.NeedsRebuild.
+		rows = filter(rows, func(r board.Row) bool { return r.NeedsRebuild() })
 	}
 	if *gap {
 		// The same join the board's Used ✕ chip makes, over the same window:

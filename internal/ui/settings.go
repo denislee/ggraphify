@@ -72,6 +72,10 @@ func (a *App) settingsGeneral() *adw.PreferencesPage {
 		rootList = a.opts.Roots
 	}
 	roots.SetText(strings.Join(rootList, ", "))
+	// Without this the apply signal never fires — libadwaita only emits
+	// entryrow::apply from the apply button, and Enter alone emits
+	// entry-activated. A root typed here would silently go nowhere.
+	roots.SetShowApplyButton(true)
 	roots.ConnectApply(func() {
 		s := a.opts.Store.Settings()
 		s.Roots = splitList(roots.Text())
@@ -222,6 +226,7 @@ func (a *App) settingsGeneral() *adw.PreferencesPage {
 	term := adw.NewEntryRow()
 	term.SetTitle("Terminal (blank = $TERMINAL, then foot/alacritty/kitty)")
 	term.SetText(set.Terminal)
+	term.SetShowApplyButton(true)
 	term.ConnectApply(func() {
 		s := a.opts.Store.Settings()
 		s.Terminal = strings.TrimSpace(term.Text())
@@ -231,6 +236,7 @@ func (a *App) settingsGeneral() *adw.PreferencesPage {
 	ed := adw.NewEntryRow()
 	ed.SetTitle("Editor (blank = $VISUAL, $EDITOR, then nvim/vim)")
 	ed.SetText(set.Editor)
+	ed.SetShowApplyButton(true)
 	ed.ConnectApply(func() {
 		s := a.opts.Store.Settings()
 		s.Editor = strings.TrimSpace(ed.Text())
@@ -362,12 +368,20 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 		desc += " With " + gfy.OpenCodeKeyVar + " exported and no vendor API key, auto-detect " +
 			"resolves to " + gfy.OpenCodeBackend + ": graphify has no built-in backend by that " +
 			"name, so the board names it outright and registers it as a custom provider. Its " +
-			"model is chosen in its own group below, not in the Model field here."
+			"model is chosen in its own group below, not in the Model field here. The same key " +
+			"also reaches " + gfy.OpenCodeZenBackend + " — the pay-as-you-go gateway, and the " +
+			"one with free models — but that is a different bill, so it is never auto-detected: " +
+			"pick it here to use it."
 	}
 	llm.SetDescription(desc)
 
 	backend := adw.NewComboRow()
 	backend.SetTitle("Backend")
+	// Every entry here is a name plus the parenthesis that says what choosing
+	// it costs, and the parenthesis is the half Adw's single ellipsized line
+	// throws away — in the popup and in the row alike.
+	backend.SetListFactory(&wideTextFactory(nil).ListItemFactory)
+	backend.SetFactory(&valueFactory().ListItemFactory)
 	names := make([]string, len(gfy.Backends))
 	for i, b := range gfy.Backends {
 		switch b {
@@ -382,6 +396,12 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 			names[i] = b + " (a model on this machine — free, slow, no API key)"
 		case gfy.OpenCodeBackend:
 			names[i] = b + " (OpenCode Go — a $10/month subscription, " + gfy.OpenCodeKeyVar + ")"
+		case gfy.OpenCodeZenBackend:
+			// Named as its own bill rather than as a mode of the line above:
+			// same key, different endpoint, pay-as-you-go — and the only one
+			// of the two that serves models at no charge at all.
+			names[i] = b + " (OpenCode Zen — pay-as-you-go on the same " + gfy.OpenCodeKeyVar +
+				", including its free models)"
 		default:
 			names[i] = b
 			// openai is the OpenAI API until OPENAI_BASE_URL says otherwise,
@@ -409,6 +429,7 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 	// mechanisms; the row says so because a setting that appeared to do
 	// nothing is what sent extractions to Opus for a JSON-shaped job.
 	model.SetText(set.Model)
+	model.SetShowApplyButton(true)
 	model.ConnectApply(func() {
 		s := a.opts.Store.Settings()
 		s.Model = strings.TrimSpace(model.Text())
@@ -419,22 +440,25 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 	})
 	llm.Add(model)
 
-	// The Model field is one field for every backend, and opencode-go is the
-	// one backend it does not reach: that plan's model is a pick from a list
-	// with prices attached, kept in its own group so the cost estimate can
-	// move with it. Saying so on this row, as it happens, is the difference
+	// The Model field is one field for every backend, and the two OpenCode
+	// plans are the backends it does not reach: their models are a pick from
+	// a list with prices attached, kept in their own group so the cost
+	// estimate can move with them. Saying so on this row, as it happens, is the difference
 	// between a dropdown nobody finds and a dropdown that is where the user
 	// already is.
 	syncBackend := func(b string) {
-		if gfy.EffectiveBackend(b) == gfy.OpenCodeBackend {
+		if eff := gfy.EffectiveBackend(b); gfy.IsOpenCodeBackend(eff) {
 			model.SetSensitive(false)
-			model.SetTitle("Model — chosen under OpenCode Go, below")
+			model.SetTitle("Model — chosen under " + gfy.OpenCodePlanFor(eff).Name + ", below")
 		} else {
 			model.SetSensitive(true)
 			model.SetTitle("Model (blank = the backend's default)")
 		}
 		if a.ocApply != nil {
 			a.ocApply(gfy.EffectiveBackend(b))
+		}
+		if a.weightApply != nil {
+			a.weightApply(b)
 		}
 	}
 	backend.NotifyProperty("selected", func() {
@@ -455,7 +479,8 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 		sub := "An API key is visible in this environment. It is passed through to " +
 			"graphify and is never written to ggraphify's state file."
 		if gfy.HasOpenCodeKey() {
-			sub += " That includes " + gfy.OpenCodeKeyVar + " — see the OpenCode Go group below."
+			sub += " That includes " + gfy.OpenCodeKeyVar + ", which reaches both OpenCode " +
+				"plans — see the group below for whichever one is selected."
 		}
 		key.SetSubtitle(sub)
 	} else if gfy.HasClaudeCLI() {
@@ -497,6 +522,15 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 	llm.Add(cli)
 
 	page.Add(llm)
+
+	// Straight after the pin it splits, and before the OpenCode group, so a
+	// user who has just chosen a backend reads the "…except for this half of
+	// the work" qualifier in the next group rather than four groups down.
+	page.Add(a.settingsWeights())
+	// Immediately under the group it refines, for the same reason that group
+	// sits under the pin IT refines: each tier is read as an exception to the
+	// one above it, and an exception four groups away is one nobody finds.
+	page.Add(a.settingsKindPins())
 
 	page.Add(a.settingsOpenCode())
 	// After the group exists, so the first call reaches it rather than the
@@ -556,6 +590,7 @@ func (a *App) rebuildOverlayRows() {
 			row.SetTooltipText("This value looks like a credential, so it is masked. " +
 				"Delete and re-add it to change it.")
 		} else {
+			row.SetShowApplyButton(true)
 			row.ConnectApply(func() {
 				s := a.opts.Store.Settings()
 				s.Overlay[name] = row.Text()
@@ -579,6 +614,7 @@ func (a *App) rebuildOverlayRows() {
 	// The add row, always last.
 	add := adw.NewEntryRow()
 	add.SetTitle("Add a variable: NAME=value")
+	add.SetShowApplyButton(true)
 	add.ConnectApply(func() {
 		name, value, ok := strings.Cut(strings.TrimSpace(add.Text()), "=")
 		name = strings.TrimSpace(name)
@@ -794,6 +830,8 @@ func (a *App) settingsStorage() *adw.PreferencesGroup {
 
 	where := adw.NewComboRow()
 	where.SetTitle("Location")
+	where.SetListFactory(&wideTextFactory(nil).ListItemFactory)
+	where.SetFactory(&valueFactory().ListItemFactory)
 	where.SetModel(gtk.NewStringList([]string{
 		"Inside each checkout",
 		"In one directory, outside the checkouts",
@@ -835,6 +873,8 @@ func (a *App) settingsStorage() *adw.PreferencesGroup {
 		a.refresh(true)
 	}
 
+	name.SetShowApplyButton(true)
+	base.SetShowApplyButton(true)
 	name.ConnectApply(func() { apply() })
 	base.ConnectApply(func() { apply() })
 	where.NotifyProperty("selected", func() { apply() })
@@ -1001,6 +1041,31 @@ func (a *App) settingsAutoFix() *adw.PreferencesGroup {
 	g.Add(metered)
 	dependents = append(dependents, metered)
 
+	global := adw.NewSwitchRow()
+	global.SetTitle("Keep the global graph up to date")
+	global.SetSubtitleLines(0)
+	global.SetSubtitle("A repository already in the global graph is re-merged once its own " +
+		"graph has been rebuilt, so cross-repo queries stop answering from the previous " +
+		"extraction. Free, and it never ADDS a repository — which checkouts belong in the " +
+		"global graph stays a decision you make on the Global screen.")
+	global.SetActive(set.AutoFixGlobal())
+	g.Add(global)
+	dependents = append(dependents, global)
+
+	enroll := adw.NewSwitchRow()
+	enroll.SetTitle("Keep the fleet roots' membership up to date")
+	enroll.SetSubtitleLines(0)
+	enroll.SetSubtitle(a.autoFixEnrollSubtitle(set))
+	enroll.SetActive(set.AutoFixEnroll())
+	g.Add(enroll)
+	dependents = append(dependents, enroll)
+
+	fleetRow := adw.NewEntryRow()
+	fleetRow.SetTitle("Fleet roots")
+	fleetRow.SetText(strings.Join(set.Fleets(), ", "))
+	g.Add(fleetRow)
+	dependents = append(dependents, fleetRow)
+
 	maxRow := adw.NewSpinRow(
 		gtk.NewAdjustment(float64(autoFixOr(set.AutoFixMax, autofix.DefaultMax)), 1, 16, 1, 1, 0), 1, 0)
 	maxRow.SetTitle("Repositories at once")
@@ -1067,6 +1132,34 @@ func (a *App) settingsAutoFix() *adw.PreferencesGroup {
 		if on {
 			a.toast("automatic fixes may now use the billed backend")
 		}
+	})
+	global.NotifyProperty("active", func() {
+		on := global.Active()
+		save(func(s *store.Settings) { s.NoAutoFixGlobal = !on })
+		if on {
+			a.toast("stale global-graph members will be re-merged automatically")
+		} else {
+			a.toast("global graph left alone — re-add from the Global screen")
+		}
+	})
+	enroll.NotifyProperty("active", func() {
+		on := enroll.Active()
+		save(func(s *store.Settings) { s.NoAutoFixEnroll = !on })
+		if on {
+			a.toast("new checkouts under the fleet roots will be enrolled automatically")
+		} else {
+			a.toast("fleet membership left alone — enrol from the Global screen")
+		}
+	})
+	fleetRow.ConnectApply(func() {
+		roots := splitList(fleetRow.Text())
+		save(func(s *store.Settings) { s.FleetRoots = roots })
+		// Read back through Fleets so the field shows what the loop will
+		// actually use: a cleared entry means the default, and a field that
+		// went blank while ~/git stayed enrolled would be a lie.
+		set := a.opts.Store.Settings()
+		fleetRow.SetText(strings.Join(set.Fleets(), ", "))
+		enroll.SetSubtitle(a.autoFixEnrollSubtitle(set))
 	})
 	maxRow.NotifyProperty("value", func() {
 		save(func(s *store.Settings) { s.AutoFixMax = int(maxRow.Value()) })

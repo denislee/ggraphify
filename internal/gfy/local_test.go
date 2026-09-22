@@ -2,6 +2,7 @@ package gfy
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -425,6 +426,50 @@ func TestContextTokenBudget(t *testing.T) {
 	}
 }
 
+// derivedContext answers the question /api/ps cannot when no model is loaded.
+// Its arithmetic is the other half of the chunk budget, so it is pinned too:
+// OllamaContextVar buys a TOTAL that ollama splits across its slots, and a
+// board that read it as per-slot would send a chunk twice the size of the slot
+// that has to hold it — the truncation this whole path exists to prevent,
+// reintroduced by the fix for it.
+func TestDerivedContext(t *testing.T) {
+	local := "http://127.0.0.1:11434/v1"
+
+	t.Run("stated wins and is per-slot already", func(t *testing.T) {
+		setEnv(t, OllamaContextSlotVar, "8192")
+		if got, why := derivedContext(local, 4); got != 8192 || !strings.Contains(why, OllamaContextSlotVar) {
+			t.Errorf("derivedContext = %d (%s), want 8192 stated verbatim", got, why)
+		}
+	})
+
+	t.Run("a remote server is not guessed at", func(t *testing.T) {
+		setEnv(t, OllamaContextSlotVar, "-")
+		got, why := derivedContext("http://ollama.example.com:11434/v1", 1)
+		if got != 0 {
+			t.Errorf("derivedContext = %d, want 0 for a host whose unit is not on this disk", got)
+		}
+		if !strings.Contains(why, OllamaContextSlotVar) {
+			t.Errorf("the refusal has to name its escape hatch: %q", why)
+		}
+	})
+
+	// Whatever the source, the answer is a slot a chunk can be sized to: a
+	// positive number that survives the budget, or a 0 that leaves graphify's
+	// own default alone. Never a negative, and never a slot per slot count.
+	t.Run("every answer is usable", func(t *testing.T) {
+		setEnv(t, OllamaContextSlotVar, "-")
+		for _, slots := range []int{0, 1, 2, 4} {
+			got, why := derivedContext(local, slots)
+			if got < 0 || (got == 0 && why == "") {
+				t.Errorf("derivedContext(slots=%d) = %d (%q)", slots, got, why)
+			}
+			if got > 0 && got > WantOllamaContext {
+				t.Errorf("derivedContext(slots=%d) = %d, wider than a slot this board asks for", slots, got)
+			}
+		}
+	})
+}
+
 // ProbeLocal has to read the context slot off ollama's NATIVE api: /v1/models
 // does not carry it, and /v1 is also the surface that drops the num_ctx
 // graphify sends, which is why the slot has to be measured at all.
@@ -451,15 +496,46 @@ func TestProbeContext(t *testing.T) {
 		}
 	})
 
-	t.Run("nothing loaded is not measured", func(t *testing.T) {
+	// A server with nothing loaded is the moment a job is submitted against a
+	// cold server, and it used to leave the argv with no --token-budget at
+	// all — which is graphify's 60_000-token chunk against whatever slot the
+	// server turns out to have. The slot is derived from the configuration
+	// there rather than left unknown.
+	t.Run("nothing loaded is derived from the configuration", func(t *testing.T) {
+		setEnv(t, OllamaSlotsVar, "2")
+		setEnv(t, OllamaContextSlotVar, "16384")
 		setEnv(t, OllamaBaseURLVar, ctxModelServer(t, 0, 32768, "qwen2.5-coder:7b")+"/v1")
 		InvalidateLocalProbe()
 
 		p := ProbeLocal(OllamaBackend)
-		if p.Ctx != 0 {
-			t.Fatalf("a server with nothing loaded cannot report a slot: %d", p.Ctx)
+		if p.Ctx != 16384 {
+			t.Fatalf("stated per-slot context = %d, want 16384", p.Ctx)
 		}
-		// Unknown must not become a guess: graphify's own default has to stand.
+		if p.CtxModel != "" {
+			t.Errorf("no model is loaded to measure on, so none may be named: %q", p.CtxModel)
+		}
+		// The derivation is not a measurement and has to say so, so the UI can
+		// tell the two apart.
+		if !strings.Contains(p.CtxWhy, OllamaContextSlotVar) {
+			t.Errorf("CtxWhy must name where the number came from: %q", p.CtxWhy)
+		}
+		if got := LocalTokenBudget(OllamaBackend); got != contextTokenBudget(16384) {
+			t.Errorf("LocalTokenBudget = %d, want the slot's budget", got)
+		}
+	})
+
+	// A server on another host is the one case the derivation genuinely
+	// cannot cover: its unit file is not on this disk. There, and only there,
+	// unknown stays unknown and graphify's own default stands.
+	t.Run("a remote server with nothing loaded stays unknown", func(t *testing.T) {
+		setEnv(t, OllamaContextSlotVar, "-")
+		setEnv(t, OllamaBaseURLVar, "http://ollama.example.com:11434/v1")
+		InvalidateLocalProbe()
+
+		p := ProbeLocal(OllamaBackend)
+		if p.Ctx != 0 {
+			t.Fatalf("a server this board cannot read the configuration of = %d", p.Ctx)
+		}
 		if p.ContextTooSmall() || p.ContextAdvice() != "" {
 			t.Error("unmeasured must not be reported as narrow")
 		}
@@ -862,5 +938,36 @@ func TestInvalidateLocalProbeBeatsAnInFlightRefresh(t *testing.T) {
 	probeCache.Unlock()
 	if present {
 		t.Error("a refresh from before the invalidation re-populated the cache")
+	}
+}
+
+// NeedsRoot has to see through a wrapper. The precheck that refuses a local
+// job wraps this sentinel in a sentence about the job, and the UI on the other
+// end decides whether to put `sudo systemctl start ollama` on the clipboard by
+// asking NeedsRoot about that wrapped error — an == comparison answers no, and
+// the one actionable thing about the refusal is dropped.
+func TestNeedsRootSeesAWrappedSentinel(t *testing.T) {
+	if !NeedsRoot(errNeedsRoot) {
+		t.Fatal("NeedsRoot said no to its own sentinel")
+	}
+	if !NeedsRoot(fmt.Errorf("Extract needs the local model server: %w", errNeedsRoot)) {
+		t.Error("NeedsRoot said no to a wrapped sentinel; the sudo command would never reach the clipboard")
+	}
+	if NeedsRoot(errNoOllama) || NeedsRoot(nil) {
+		t.Error("NeedsRoot said yes to something that is not about privileges")
+	}
+}
+
+// CanStartOllama answers about the ROUTE and never about the port: a server
+// that is down but startable is the ordinary state between two jobs in a
+// sweep, and a gate built on this must not refuse it. Whatever this machine's
+// systemd looks like, the two functions must agree — one switch, read twice.
+func TestCanStartOllamaAgreesWithTheRouteStartOllamaWouldTake(t *testing.T) {
+	route, err := ollamaRoute()
+	if got := CanStartOllama(); got != err {
+		t.Fatalf("CanStartOllama() = %v, ollamaRoute() = %v; the two readings have drifted", got, err)
+	}
+	if err == nil && route == startedNot {
+		t.Error("a usable route was reported as no route at all")
 	}
 }

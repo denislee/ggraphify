@@ -386,6 +386,40 @@ func laneOf(cost gfy.Cost, local bool) lane {
 	return laneMetered
 }
 
+// globalKey is the reservation every job that writes the global graph takes,
+// instead of its own repository's.
+//
+// The leading NUL keeps it out of the namespace of real paths, so it can never
+// collide with a checkout, and Busy — which is asked about repositories —
+// cannot accidentally report it.
+const globalKey = "\x00global"
+
+// holdKey is the resource a job must hold exclusively while it runs, and
+// whether it needs one at all.
+//
+// For an ordinary mutating job that is its own output directory. For `graphify
+// global add` and `global remove` it is the global graph, shared by every
+// repository: those commands read ~/.graphify/global-manifest.json, edit it in
+// memory and write it back, with no lock of their own, so two of them running
+// at once means the second one's write silently drops the first one's
+// repository. One reservation for all of them makes the queue serialise what
+// the CLI does not.
+//
+// This was invisible while the only way to reach those commands was the Global
+// screen, which submits every tick as ONE chain and therefore runs them one
+// after another. The auto-fix loop submits a chain per repository, several in
+// flight at once, and would have hit it on the first board with two stale
+// members.
+func holdKey(j *Job) (string, bool) {
+	if gfy.Global(j.Kind) {
+		return globalKey, true
+	}
+	if gfy.Known[j.Kind].Mutates && j.Repo != "" {
+		return j.Repo, true
+	}
+	return "", false
+}
+
 // DefaultKillGrace is how long a subprocess has to exit on its own after
 // SIGTERM. graphify flushes graph.json on the way out, and killing it mid-write
 // is how an output directory ends up in StateBroken — so the grace is generous
@@ -401,9 +435,10 @@ type Runner struct {
 	queue   []*Job
 	running map[uint64]*Job
 	history []*Job
-	// busyRepo is the set of repositories with a mutating job in flight. Two
+	// busyRepo is the set of resources with a mutating job in flight. Two
 	// mutating jobs against one output directory would race each other's
-	// graph.json; read-only jobs are unaffected and run freely.
+	// graph.json; read-only jobs are unaffected and run freely. The global
+	// graph is in here too, under globalKey — see holdKey.
 	busyRepo map[string]uint64
 
 	events chan Event
@@ -523,7 +558,8 @@ func (r *Runner) SubmitCmd(kind, repo, label string, p gfy.Params, env gfy.Env) 
 	if argv == nil {
 		return nil, errors.New("jobs: no command builder for kind " + kind)
 	}
-	// OpenCode Go is a custom provider, and `--backend opencode-go` means
+	// Each OpenCode plan is a custom provider, and `--backend opencode-go`
+	// (or `opencode-zen`) means
 	// nothing to graphify until it is written to ~/.graphify/providers.json.
 	// Doing it here rather than at the call site is the same reason the env
 	// overlays are composed here: ggraphify-job submits through this function
@@ -541,10 +577,10 @@ func (r *Runner) SubmitCmd(kind, repo, label string, p gfy.Params, env gfy.Env) 
 		return nil, errors.New("jobs: " + err.Error())
 	}
 	if path, wrote, err := gfy.EnsureOpenCodeProvider(p.Backend, p.Model); err != nil {
-		return nil, errors.New("jobs: cannot register the " + gfy.OpenCodeBackend +
+		return nil, errors.New("jobs: cannot register the " + p.Backend +
 			" provider in " + path + ": " + err.Error())
 	} else if wrote {
-		applog.Infof("registered the %s provider in %s (model %s)", gfy.OpenCodeBackend, path, p.Model)
+		applog.Infof("registered the %s provider in %s (model %s)", p.Backend, path, p.Model)
 	}
 	dir := p.Repo
 	if dir == "" {
@@ -554,7 +590,10 @@ func (r *Runner) SubmitCmd(kind, repo, label string, p gfy.Params, env gfy.Env) 
 		Kind:  kind,
 		Repo:  repo,
 		Label: label,
-		Cost:  gfy.CostOf(kind),
+		// CostFor and not CostOf: the deep graft pass is free on a model on
+		// this machine and a bill on anything else, and this is where the
+		// backend it was built for is still in hand.
+		Cost: gfy.CostFor(kind, p.Backend),
 		// Which lane this takes is decided here, from the backend the argv was
 		// built for, rather than read back out of the argv later. The two can
 		// only disagree if somebody rewrites one of them.
@@ -800,6 +839,19 @@ func (r *Runner) Cancel(id uint64) bool {
 // is up to about ten seconds on a cold start. Call it off any thread that
 // draws.
 //
+// A pause also gives the job's LANE up — see pick, which does not count a
+// paused job against any limit, and handOverLane, which releases the hold on
+// the one job waiting for that lane — so the next job queued behind it starts
+// while this one is stopped, click or no click. The lane is the scarce thing a
+// local extraction holds, and a pause that kept it would free the weights and
+// still leave the queue exactly as stuck as it was.
+//
+// The one cost of that is on the way back: resuming a job whose lane has since
+// been taken puts the lane one over its limit until one of them finishes. That
+// is deliberate and bounded — it can only happen once per resumed job, and the
+// alternative is a Resume that silently does nothing, or one that blocks for
+// however long the job that took the lane runs.
+//
 // Only a running job can be paused — a queued one is not consuming anything, and
 // pausing it would mean "hold a lane", which is Cancel's job, not this one.
 // Both report whether they changed anything.
@@ -882,8 +934,88 @@ func (r *Runner) setPaused(id uint64, want bool) bool {
 		j.Log.WriteString("ggraphify: resumed — SIGCONT to the process group\n")
 	}
 	r.emit(Event{ID: snap.ID, Job: snap, Pause: true})
+	if want {
+		// The lane this job was holding is free as of now. Hand it to whoever
+		// is queued for it and wake the dispatcher, rather than leaving the
+		// job behind it to wait out the poll interval: somebody who pauses an
+		// extraction is waiting at the screen for exactly that to happen.
+		r.handOverLane(j)
+		r.kick()
+	}
 	return true
 }
+
+// handOverLane gives the lane a just-paused job released to the next job
+// queued for it — releasing that job's hold, if it has one.
+//
+// Releasing a hold is normally a click, and this is the one place the runner
+// does it by itself. It is not a hole in the consent gate, because pausing IS
+// the click: the only job occupying a lane has just been stopped by hand, with
+// a queue behind it, and there is no reading of that gesture under which the
+// answer is "now leave the lane empty". Freeing the model server and then
+// refusing to let anything use it is the outcome nobody asked for.
+//
+// Four things keep it bounded:
+//
+//   - ONE job, not the whole held queue. The lane that opened has room for
+//     one, and releasing the rest would start work on a lane that is full.
+//   - The SAME lane only. A paused local extraction hands the local lane to
+//     local work; it says nothing about the other two.
+//   - NEVER the metered lane. That one spends money, and a pause is consent
+//     to move this machine's work along, not to open a vendor bill.
+//   - Only a job that can actually start: one whose repository is not already
+//     reserved by a mutating job, and only when nothing unheld is ahead of it
+//     in that lane — an unheld job takes the lane on the next dispatch by
+//     itself, and releasing a held one behind it would put the lane over.
+//
+// Called without the lock held. It reports the job the lane went to.
+func (r *Runner) handOverLane(paused *Job) (Snapshot, bool) {
+	l := laneOf(paused.Cost, paused.Local)
+	if l == laneMetered {
+		return Snapshot{}, false
+	}
+
+	r.mu.Lock()
+	var snap Snapshot
+	found := false
+	for _, j := range r.queue {
+		if laneOf(j.Cost, j.Local) != l {
+			continue
+		}
+		if key, needs := holdKey(j); needs {
+			if _, busy := r.busyRepo[key]; busy {
+				continue
+			}
+		}
+		if !j.Held {
+			// Runnable already: it takes the lane on the next dispatch by
+			// itself, and there is nothing here to release.
+			break
+		}
+		j.Held = false
+		snap = snapshot(j)
+		found = true
+		break
+	}
+	r.mu.Unlock()
+	if !found {
+		return Snapshot{}, false
+	}
+
+	applog.Infof("pause: %s handed the %s lane to %s (job %d), which was held",
+		paused.Label, laneNames[l], snap.Label, snap.ID)
+	paused.Log.WriteString("ggraphify: the " + laneNames[l] + " lane this job was using " +
+		"went to " + snap.Label + ", which was waiting for it\n")
+	if snap.Log != nil {
+		snap.Log.WriteString("ggraphify: started without a click — the " + laneNames[l] +
+			" lane was handed over by pausing " + paused.Label + "\n")
+	}
+	r.emit(Event{ID: snap.ID, Job: snap})
+	return snap, true
+}
+
+// laneNames is what each lane is called in a log line, indexed by lane.
+var laneNames = [3]string{"free", "metered", "local"}
 
 // CancelAll cancels everything queued and running. The window's close handler
 // calls it: a watcher started from the UI must not outlive the UI.
@@ -895,7 +1027,9 @@ func (r *Runner) CancelAll() {
 	}
 }
 
-// Busy reports the id of the mutating job holding a repository, if any.
+// Busy reports the id of the mutating job holding a repository, if any. It is
+// asked about checkouts only; the global graph's reservation is held under a
+// key no path can spell.
 func (r *Runner) Busy(repo string) (uint64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1073,8 +1207,8 @@ func (r *Runner) dispatch() {
 		ctx, cancel := context.WithCancel(context.Background())
 		j.cancel = cancel
 		r.running[j.ID] = j
-		if gfy.Known[j.Kind].Mutates && j.Repo != "" {
-			r.busyRepo[j.Repo] = j.ID
+		if key, needs := holdKey(j); needs {
+			r.busyRepo[key] = j.ID
 		}
 		snap := snapshot(j)
 		r.mu.Unlock()
@@ -1095,6 +1229,15 @@ func (r *Runner) pick() *Job {
 	}
 	var busy [3]int
 	for _, j := range r.running {
+		// A paused job occupies no lane. Its process group is stopped and its
+		// lease is suspended — the model server it was using is already back —
+		// so counting it against the limit would hold a lane open for a
+		// process that is, by the user's own instruction, not working. Pausing
+		// the one local extraction to let the next one through is the whole
+		// point of the button.
+		if j.paused {
+			continue
+		}
 		busy[laneOf(j.Cost, j.Local)]++
 	}
 	limit := [3]int{r.opts.FreeLanes, r.opts.MeteredLanes, r.opts.LocalLanes}
@@ -1109,8 +1252,8 @@ func (r *Runner) pick() *Job {
 		if l := laneOf(j.Cost, j.Local); busy[l] >= limit[l] {
 			continue
 		}
-		if gfy.Known[j.Kind].Mutates && j.Repo != "" {
-			if _, held := r.busyRepo[j.Repo]; held {
+		if key, needs := holdKey(j); needs {
+			if _, held := r.busyRepo[key]; held {
 				continue
 			}
 		}
@@ -1235,8 +1378,10 @@ func (r *Runner) run(j *Job, ctx context.Context, cancel context.CancelFunc) {
 	j.finish()
 	r.retire(j)
 	delete(r.running, j.ID)
-	if id, ok := r.busyRepo[j.Repo]; ok && id == j.ID {
-		delete(r.busyRepo, j.Repo)
+	if key, needs := holdKey(j); needs {
+		if id, ok := r.busyRepo[key]; ok && id == j.ID {
+			delete(r.busyRepo, key)
+		}
 	}
 	snap := snapshot(j)
 	r.mu.Unlock()

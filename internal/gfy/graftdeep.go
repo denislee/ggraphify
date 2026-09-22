@@ -15,15 +15,20 @@ import (
 // the bill first, and graft's deep pass has no --no-label half to offer.
 //
 // A model already running on this machine removes the bill rather than
-// describing it. graft speaks the OpenAI wire format against any base URL, and
-// ollama serves that format on /v1 — so the deep pass against the local server
-// is the same free-lane job the rest of the board's local work is, and it is
-// wired here on exactly that condition: ggraphify runs `--deep` against a
-// local model, and against nothing else. A vendor key is still reachable from
-// a terminal, where the person typing it has said what they meant.
+// describing it, and that is where this started: for a long time the board
+// would build `--deep` for a local server and for nothing else.
 //
-// The whole coupling is this file, the `graft-deep` arm of Argv, and the env
-// line in jobs.SubmitCmd.
+// It now follows the Heavy work pin instead — the same pin `extract` follows,
+// because these are the same job in two indexers: one request per file of the
+// whole checkout. A pin that named a metered backend used to be refused; it is
+// now honored, and the price is carried rather than hidden — CostFor reports
+// the kind as Metered the moment it is not local, which is what puts it in the
+// metered lane, behind the confirm that names the bill, and held on restore.
+// Free is a claim about an endpoint, so it is made about the endpoint and not
+// about the kind.
+//
+// The whole coupling is this file, the `graft-deep` arm of Argv, the weight
+// table in argv.go, and the env line in jobs.SubmitCmd.
 
 const (
 	// GraftDeepKind is the job kind. It is a constant rather than a literal
@@ -39,6 +44,22 @@ const (
 	GraftModelVar    = "GRAFT_MODEL"
 	GraftKeyVar      = "GRAFT_API_KEY"
 
+	// GraftRetriesVar is how many times graft re-sends a request its transport
+	// gave up on; its own default is 4, so five attempts in all.
+	GraftRetriesVar = "GRAFT_LLM_RETRIES"
+
+	// GraftLocalRetries is what that budget is worth against a server on this
+	// machine, and it is one.
+	//
+	// graft gives each request the OpenAI SDK's default ten-minute timeout and
+	// exposes no knob to change it. A synthesis batch a local model cannot
+	// finish inside ten minutes cannot finish inside the next ten either —
+	// nothing about the machine changed — so the default budget spends forty
+	// minutes arriving at the answer the first attempt already had. One retry
+	// keeps the case retries exist for, an ollama that was reloading a model
+	// or briefly wedged, and caps the rest.
+	GraftLocalRetries = "1"
+
 	// GraftOpenAIProvider is graft's name for the OpenAI wire format, which is
 	// what ollama's /v1 endpoint and llama-server, vLLM and LM Studio all
 	// speak. graft has no "ollama" provider of its own; this is how a local
@@ -53,14 +74,106 @@ const (
 	GraftLocalKey = "local"
 )
 
-// GraftProvider is graft's wire-format name for one of graphify's backends, or
-// "" for a backend graft has no way to talk to.
-func GraftProvider(backend string) string {
-	switch strings.TrimSpace(backend) {
-	case OllamaBackend, OpenAIBackend:
-		return GraftOpenAIProvider
+// GraftAnthropicProvider is graft's name for the Anthropic wire format, which
+// is how the `claude` backend — the API one, not the CLI — is reached. graft
+// speaks four formats in all (openai, anthropic, litellm, orcarouter); these
+// two are the ones a graphify backend maps onto.
+const GraftAnthropicProvider = "anthropic"
+
+// GraftTarget is one of graphify's backends restated in graft's own terms: the
+// wire format, the endpoint it is served on (blank = the provider's default),
+// the variable its credential is read from, and whether the whole exchange
+// stays on this machine.
+//
+// It exists because the deep pass now follows the Heavy pin wherever it
+// points, and "where does that backend live" is then four questions rather
+// than one — asked in Argv, in the readiness check, in the env overlay and in
+// the confirm dialog, which must all get the same answer.
+type GraftTarget struct {
+	Backend  string
+	Provider string
+	BaseURL  string
+	// KeyVar is the variable holding the credential. Its VALUE is copied into
+	// GRAFT_API_KEY when the job is built; nothing in this board stores it.
+	KeyVar string
+	Local  bool
+}
+
+// GraftTargetFor resolves a backend for graft, or says in a sentence why graft
+// cannot be pointed at it. Every refusal names the fix, because a fan-out of
+// forty jobs that all die on the same missing key is a worse way to learn it.
+//
+// The OpenCode plans go through this board's own loopback proxy, for the
+// reason opencodeproxy.go documents: the gateway requires a session header
+// that neither graphify nor graft sends, and the proxy is what adds it.
+func GraftTargetFor(backend string) (GraftTarget, string) {
+	b := EffectiveBackend(backend)
+	if b == "" {
+		// Nothing detected and nothing pinned. The old behaviour, and still
+		// the right one: a board with no credential anywhere means the local
+		// server, or a sentence about the local server.
+		b = OllamaBackend
 	}
-	return ""
+	switch {
+	case IsLocalBackend(b):
+		base := LocalBaseURL(b)
+		if base == "" {
+			return GraftTarget{}, "no local endpoint is configured for " + b +
+				" — export " + OllamaBaseURLVar + " or " + OllamaHostVar + "."
+		}
+		return GraftTarget{Backend: b, Provider: GraftOpenAIProvider, BaseURL: base,
+			KeyVar: OllamaKeyVar, Local: true}, ""
+
+	case IsOpenCodeBackend(b):
+		if !HasOpenCodeKey() {
+			return GraftTarget{}, OpenCodeKeyVar + " is not set in this environment, so " +
+				b + " has no credential to run graft's deep pass on."
+		}
+		base, err := StartOpenCodeProxy(b)
+		if err != nil {
+			return GraftTarget{}, err.Error()
+		}
+		return GraftTarget{Backend: b, Provider: GraftOpenAIProvider, BaseURL: base,
+			KeyVar: OpenCodeKeyVar}, ""
+
+	case b == ClaudeAPIBackend:
+		if strings.TrimSpace(os.Getenv(AnthropicKeyVar)) == "" {
+			return GraftTarget{}, AnthropicKeyVar + " is not set in this environment, so " +
+				"the deep pass has no credential for " + b + "."
+		}
+		return GraftTarget{Backend: b, Provider: GraftAnthropicProvider,
+			KeyVar: AnthropicKeyVar}, ""
+
+	case b == OpenAIBackend:
+		// Not local: IsLocalBackend took that arm above, so OPENAI_BASE_URL is
+		// either unset or points at the vendor. graft's own default endpoint
+		// is the right one, so no --base-url is passed.
+		if strings.TrimSpace(os.Getenv(OpenAIKeyVar)) == "" {
+			return GraftTarget{}, OpenAIKeyVar + " is not set in this environment, so " +
+				"the deep pass has no credential for " + b + "."
+		}
+		return GraftTarget{Backend: b, Provider: GraftOpenAIProvider, KeyVar: OpenAIKeyVar}, ""
+	}
+
+	// gemini, kimi, deepseek, claude-cli. Three of them are behind wire
+	// formats graft does not speak or endpoints this board does not know the
+	// URL of, and claude-cli is a subscription reached by launching a binary,
+	// which graft has no way to do at all. Guessing a base URL for any of them
+	// would send the corpus somewhere nobody named.
+	return GraftTarget{}, b + " is not a backend graft can be pointed at. Its deep pass " +
+		"speaks the OpenAI and Anthropic wire formats, so Heavy work has to name " +
+		OllamaBackend + ", a local OpenAI-compatible server, " + ClaudeAPIBackend + ", " +
+		OpenAIBackend + ", or one of the two OpenCode plans."
+}
+
+// GraftProvider is graft's wire-format name for a backend, or "" for one graft
+// has no way to talk to.
+func GraftProvider(backend string) string {
+	t, why := GraftTargetFor(backend)
+	if why != "" {
+		return ""
+	}
+	return t.Provider
 }
 
 // LocalRun resolves the backend and model an unattended local run should use,
@@ -94,27 +207,40 @@ func GraftDeepReady(backend, model string) (b, m string, ok bool, why string) {
 	if ok, why := GraftReady(); !ok {
 		return "", "", false, why
 	}
-	b, m, ok, why = LocalRun(backend, model)
-	if !ok {
+	t, why := GraftTargetFor(backend)
+	if why != "" {
 		return "", "", false, why
 	}
-	if GraftProvider(b) == "" {
-		return "", "", false, b + " is not a server graft can be pointed at; " +
-			"the deep pass needs an OpenAI-compatible endpoint."
+	if t.Local {
+		// The local half keeps the answer LocalRun gives: the board's model
+		// setting is a preference when the backend it was typed under is this
+		// one, and the server's own default otherwise — a claude model id is
+		// not a name ollama has ever heard.
+		return LocalRun(t.Backend, model)
 	}
-	if LocalBaseURL(b) == "" {
-		return "", "", false, "no local endpoint is configured for " + b +
-			" — export " + OllamaBaseURLVar + " or " + OllamaHostVar + "."
+	m = strings.TrimSpace(model)
+	if m == "" {
+		// Each OpenCode plan has a default worth naming; a vendor API does
+		// not, and graft's own fallback is an id for some other catalogue.
+		// Better to ask for one than to dispatch a run that 404s per file.
+		m = DefaultModelFor(t.Backend)
 	}
-	return b, m, true, ""
+	if m == "" {
+		return "", "", false, "Heavy work has no model: " + t.Backend + " needs one by name, " +
+			"and graft's own default belongs to a different catalogue. Type one in the " +
+			"Heavy work model field."
+	}
+	return t.Backend, m, true, ""
 }
 
-// GraftDeepParams fits a Params for the deep pass: a local backend, a model
-// that server actually serves, and the concurrency its slots can hold.
+// GraftDeepParams fits a Params for the deep pass: the backend Heavy work
+// names, a model that backend actually serves, and — on a local server — the
+// concurrency its slots can hold.
 //
-// It refuses rather than falling back. A deep build submitted with a metered
-// backend still in p.Backend would spend real money from a button labelled
-// free, which is the one outcome this whole file exists to prevent.
+// It refuses rather than falling back. A backend graft cannot be pointed at
+// leaves the argv unbuildable, which SubmitCmd reports per repository, rather
+// than being silently swapped for one that would run: a corpus sent somewhere
+// nobody named is the one outcome this file exists to prevent.
 func GraftDeepParams(p *Params) (ok bool, why string) {
 	if p == nil {
 		return false, "no parameters"
@@ -124,6 +250,15 @@ func GraftDeepParams(p *Params) (ok bool, why string) {
 		return false, why
 	}
 	p.Backend, p.Model, p.Deep = b, m, true
+	if !IsLocalBackend(b) {
+		// A metered gateway's ceiling is its own rate limit, not this
+		// machine's slots, and LocalConcurrency would be measuring the wrong
+		// server. Zero leaves graft's default of 5, and the partial-result
+		// concession below is local-only for the same reason: it is there to
+		// survive ollama's tool_choice gap, and a vendor endpoint that fails
+		// has failed at something worth exiting 1 over.
+		return true, ""
+	}
 	// graft summarizes files in parallel with -j, and the ceiling is the same
 	// one graphify's chunks have: the server's own slot count. Asking for more
 	// than that does not make it faster — the surplus queues inside ollama,
@@ -148,12 +283,29 @@ func GraftDeepParams(p *Params) (ok bool, why string) {
 	// was written for. Nothing is lost by it — graft caches what it computed,
 	// and the next run resumes from there, so a better model later fills the
 	// tier in rather than starting over.
+	//
+	// What it does NOT cover is the concept pass's second half. graft
+	// summarizes every file, then synthesizes those summaries into the
+	// concept map in batches of 48 KB — and that synthesis call is not behind
+	// --allow-partial at all: it throws out of buildContext, and the flag is
+	// only consulted afterwards, on the degraded-tier path it never reaches.
+	// A batch that big is one ~12k-token prompt with a forced tool call, and
+	// a 7B model on this machine does not finish one inside the OpenAI SDK's
+	// fixed ten-minute request timeout, which graft exposes no knob for.
+	// pulumi — 444 files, seven batches — therefore fails on batch 1 with
+	// "Request timed out." after the summaries it just computed were all
+	// cached successfully. So a local deep build of a large checkout is a
+	// capacity limit rather than a misconfiguration, and this flag cannot
+	// turn it green.
 	p.AllowPartial = true
 	return true, ""
 }
 
-// GraftDeepEnv puts the placeholder credential in the job's environment when
-// the job is a local deep build, and leaves every other job untouched.
+// GraftDeepEnv puts the deep build's credential in the job's environment —
+// the placeholder one against a local server, and the value of the backend's
+// own key variable against a metered one — and leaves every other job
+// untouched. The value is read here and handed to the child process; it is
+// never written to the board's state file, which holds variable names only.
 //
 // Composed in jobs.SubmitCmd rather than at the call site, for the reason the
 // other overlays are: ggraphify-job submits through that function too, and an
@@ -161,21 +313,53 @@ func GraftDeepParams(p *Params) (ok bool, why string) {
 // An explicit value in the user's own overlay wins outright — a proxied server
 // that does check the key is theirs to describe, not this board's to guess at.
 func GraftDeepEnv(e Env, kind, backend string) Env {
-	if kind != GraftDeepKind || !IsLocalBackend(backend) {
+	if kind != GraftDeepKind {
 		return e
 	}
-	if _, ok := e[GraftKeyVar]; ok {
+	t, why := GraftTargetFor(backend)
+	if why != "" {
 		return e
 	}
+	c := e
+
+	// The retry budget comes first, and independently of the credential: an
+	// overlay that carries its own key is a proxied local server, which is
+	// still a server on this machine and still has nothing to gain from four
+	// ten-minute attempts at the same request. An explicit value — in the
+	// overlay or exported into the session — is the user describing their own
+	// endpoint, and wins.
+	if t.Local {
+		_, pinned := c[GraftRetriesVar]
+		if !pinned && strings.TrimSpace(os.Getenv(GraftRetriesVar)) == "" {
+			c = setVar(c, GraftRetriesVar, GraftLocalRetries)
+		}
+	}
+
+	if _, ok := c[GraftKeyVar]; ok {
+		return c
+	}
+	key := strings.TrimSpace(os.Getenv(t.KeyVar))
+	if key == "" {
+		if !t.Local {
+			// GraftTargetFor already refused a metered backend with no
+			// credential; reaching here means it was unset between that check
+			// and this one. Leave the variable out and let graft say so.
+			return c
+		}
+		key = GraftLocalKey
+	}
+	return setVar(c, GraftKeyVar, key)
+}
+
+// setVar returns e with name set to value, copied rather than mutated: the
+// overlay handed in belongs to the caller, and a job's environment composed
+// for one repository must not follow the next one.
+func setVar(e Env, name, value string) Env {
 	c := e.Clone()
 	if c == nil {
 		c = Env{}
 	}
-	key := strings.TrimSpace(os.Getenv(OllamaKeyVar))
-	if key == "" {
-		key = GraftLocalKey
-	}
-	c[GraftKeyVar] = key
+	c[name] = value
 	return c
 }
 

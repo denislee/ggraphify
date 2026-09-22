@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dns/ggraphify/internal/discover"
+	"github.com/dns/ggraphify/internal/globalgraph"
 	"github.com/dns/ggraphify/internal/graftstate"
 	"github.com/dns/ggraphify/internal/graphstate"
 )
@@ -26,6 +27,13 @@ type Row struct {
 	// the graphify one, because "which of my repositories does an agent
 	// actually have a map of" is one question, not two.
 	Graft graftstate.Index `json:"graft"`
+
+	// Global is whether this repository's graph has been merged into
+	// graphify's cross-repo graph, and whether what is in there is still what
+	// this repository has. It is a third index alongside the two above and
+	// the same kind of question: which of my checkouts can an agent reach
+	// from one graph.
+	Global globalgraph.Member `json:"global"`
 
 	// Behind is true when the graph was built at a commit that is not HEAD.
 	// It is a different question from drift — a branch switch moves it without
@@ -41,6 +49,21 @@ type Row struct {
 // Key is the row's stable identity: the checkout path. Names collide, output
 // directories can be shared, paths do not.
 func (r Row) Key() string { return r.Path }
+
+// NeedsRebuild is what the update sweep acts on: a graph that no longer
+// answers for the tree under it.
+//
+// For a checkout that question is Behind — HEAD moved, and a commit of
+// already-extracted files moves it without touching a single mtime. A row
+// with no git has no commit to be behind, so Behind is permanently false on
+// it and a sweep keyed on Behind alone would skip it forever. There drift is
+// not a weaker signal, it is the only one.
+func (r Row) NeedsRebuild() bool {
+	if r.NoGit {
+		return r.Graph.Drift()
+	}
+	return r.Behind
+}
 
 // Options configures a scan.
 type Options struct {
@@ -69,6 +92,10 @@ type Options struct {
 	// declined to graph as drift on every tick. It may be nil, which is the raw
 	// walk — what `ggraphify-scan` shows.
 	Baseline func(path string) graphstate.Baseline
+	// Global, when non-nil, is the membership record of graphify's cross-repo
+	// graph, read once per scan rather than once per row. Nil means the
+	// question is not being asked and every row reports "not a member".
+	Global *globalgraph.Manifest
 	// Cache, when non-nil, memoises the discovery walk between ticks.
 	Cache *discover.Cache
 	// Graphs, when non-nil, memoises the per-repository derivation on the
@@ -205,6 +232,8 @@ func derive(repo discover.Repo, opts Options) Row {
 	}
 	r.Graft = gr
 
+	r.Global = opts.Global.MemberOf(globalgraph.GraphFor(r.Graph.Out), g.BuiltAt)
+
 	r.Behind = g.Behind()
 	return r
 }
@@ -224,6 +253,12 @@ type Counts struct {
 	// here rather than in the UI so `ggraphify-scan` reports them too.
 	Grafted    int `json:"grafted"`
 	GraftStale int `json:"graft_stale"`
+	// InGlobal is how many checkouts are in graphify's cross-repo graph, and
+	// GlobalStale how many of those have been re-extracted since they were
+	// merged into it — the second is the work the Global screen exists to
+	// make visible.
+	InGlobal    int `json:"in_global"`
+	GlobalStale int `json:"global_stale"`
 }
 
 // Summarize counts the rows by state.
@@ -233,6 +268,12 @@ func Summarize(rows []Row) Counts {
 	for _, r := range rows {
 		if r.Behind {
 			c.Behind++
+		}
+		if r.Global.In {
+			c.InGlobal++
+			if r.Global.Stale {
+				c.GlobalStale++
+			}
 		}
 		switch r.Graft.State {
 		case graftstate.StateFresh, graftstate.StateRaw:

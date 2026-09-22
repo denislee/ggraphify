@@ -301,6 +301,20 @@ func (a *App) describeAutoFix(set store.Settings) string {
 	} else {
 		s += "; graft indexes left alone (" + why + ")"
 	}
+	if set.AutoFixGlobal() {
+		s += "; global graph re-merged too"
+	} else {
+		s += "; global graph left alone"
+	}
+	if roots := set.Fleets(); set.AutoFixEnroll() && len(roots) > 0 {
+		names := make([]string, 0, len(roots))
+		for _, r := range roots {
+			names = append(names, board.Tilde(r))
+		}
+		s += "; enrolling under " + strings.Join(names, ", ")
+	} else {
+		s += "; membership left alone"
+	}
 	if set.AutoFixMetered {
 		s += "; METERED fixes allowed"
 	} else {

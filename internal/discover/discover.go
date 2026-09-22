@@ -46,6 +46,10 @@ type Repo struct {
 	HeadSHA    string `json:"head_sha"`    // resolved HEAD, full hex
 	GitDir     string `json:"git_dir"`     // the real .git directory
 	Out        string `json:"out"`         // absolute graphify output dir in effect
+	// NoGit marks a row boarded on its graph alone: a directory that carries
+	// graphify knowledge but is not a checkout. It has no HEAD, so it is
+	// never Behind, and drift is the only staleness signal it has.
+	NoGit bool `json:"no_git"`
 }
 
 // ShortSHA is the seven-character form the board shows next to the branch.
@@ -232,7 +236,7 @@ func Walk(opts Options) ([]Repo, error) {
 		if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
 			continue
 		}
-		walkRoot(abs, abs, 0, opts, seen, &out)
+		walkRoot(abs, abs, 0, opts, spec, seen, &out)
 	}
 	resolve(out, spec)
 	disambiguate(out)
@@ -245,7 +249,7 @@ func Walk(opts Options) ([]Repo, error) {
 	return out, nil
 }
 
-func walkRoot(root, dir string, depth int, opts Options, seen map[string]bool, out *[]Repo) {
+func walkRoot(root, dir string, depth int, opts Options, spec OutSpec, seen map[string]bool, out *[]Repo) {
 	if depth > opts.Depth {
 		return
 	}
@@ -262,10 +266,12 @@ func walkRoot(root, dir string, depth int, opts Options, seen map[string]bool, o
 	// like ~/tmp can be a checkout of its own while holding a hundred
 	// unrelated ones, and stopping at it would find exactly one repository on
 	// this machine and call that the answer.
+	gitSeen := false
 	for _, e := range ents {
 		if e.Name() != ".git" {
 			continue
 		}
+		gitSeen = true
 		if r, ok := repoAt(root, dir, e); ok && !seen[r.Path] {
 			seen[r.Path] = true
 			*out = append(*out, r)
@@ -274,6 +280,23 @@ func walkRoot(root, dir string, depth int, opts Options, seen map[string]bool, o
 			return
 		}
 		break
+	}
+	// A directory with no .git but a graph of its own is still a row. Something
+	// already built knowledge here, and keeping built knowledge current is the
+	// whole job — but a .git-gated walk never sees it, so that graph ages
+	// forever with nothing on the board admitting it exists. The case this was
+	// written for is a plan-doc corpus that is deliberately not a checkout.
+	//
+	// It is opt-in by construction: only a directory that already holds a
+	// graph qualifies, so this boards what is already graphed and never
+	// invents a row for an arbitrary directory. Like a checkout it is a leaf —
+	// one graph, one row — and like a checkout the root itself is exempt.
+	if !gitSeen && depth > 0 {
+		if r, ok := graphOnlyAt(root, dir, spec); ok && !seen[r.Path] {
+			seen[r.Path] = true
+			*out = append(*out, r)
+			return
+		}
 	}
 	for _, e := range ents {
 		if !isDirEntry(e, dir) {
@@ -290,7 +313,7 @@ func walkRoot(root, dir string, depth int, opts Options, seen map[string]bool, o
 		if strings.HasPrefix(name, ".") && !opts.ShowHidden {
 			continue
 		}
-		walkRoot(root, filepath.Join(dir, name), depth+1, opts, seen, out)
+		walkRoot(root, filepath.Join(dir, name), depth+1, opts, spec, seen, out)
 	}
 }
 
@@ -306,6 +329,43 @@ func isDirEntry(e os.DirEntry, parent string) bool {
 	}
 	fi, err := os.Stat(filepath.Join(parent, e.Name()))
 	return err == nil && fi.IsDir()
+}
+
+// graphOnlyAt boards a directory that carries a graph but no .git.
+//
+// It looks in both places a graph can be. The spec is where a job would put
+// one, and in central-out mode that is the only place worth looking for most
+// rows. But a corpus that predates the central layout keeps its graph in-tree,
+// and the spec points at a directory that was never built — so checking the
+// spec alone finds nothing and the corpus stays invisible, which is the exact
+// bug this function exists to fix. When the graph is found in-tree the row
+// carries that location itself, because resolving it through the spec later
+// would send every read to the empty central path.
+func graphOnlyAt(root, dir string, spec OutSpec) (Repo, bool) {
+	out, ok := graphDir(spec.For(dir)), true
+	if out == "" {
+		out, ok = graphDir(filepath.Join(dir, spec.OutName())), false
+	}
+	if out == "" {
+		return Repo{}, false
+	}
+	r := Repo{Path: dir, Root: root, Name: filepath.Base(dir), NoGit: true}
+	if !ok {
+		r.Out = out
+	}
+	if rel, err := filepath.Rel(root, filepath.Dir(dir)); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+		r.Group = rel
+	}
+	return r, true
+}
+
+// graphDir returns out when it holds a readable graph.json, else "".
+func graphDir(out string) string {
+	fi, err := os.Stat(filepath.Join(out, "graph.json"))
+	if err != nil || fi.IsDir() {
+		return ""
+	}
+	return out
 }
 
 func repoAt(root, dir string, git os.DirEntry) (Repo, bool) {
@@ -461,7 +521,12 @@ func hexOnly(s string) string {
 // the sidecar, so the board layers that on afterwards (see board.derive).
 func resolve(repos []Repo, spec OutSpec) {
 	for i := range repos {
-		out := spec.For(repos[i].Path)
+		// A row that already knows where its graph is keeps it: the walk only
+		// pins Out when it found a graph somewhere the spec does not point.
+		out := repos[i].Out
+		if out == "" {
+			out = spec.For(repos[i].Path)
+		}
 		if real, err := filepath.EvalSymlinks(out); err == nil {
 			out = real
 		}

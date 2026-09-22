@@ -43,11 +43,17 @@ const BuiltAgainst = "0.9.58"
 // Claude Code CLI already installed and logged in on this machine, which needs
 // no key of its own.
 //
-// "opencode" is the one name here graphify does not ship: it is a custom
-// provider this board registers in ~/.graphify/providers.json, which is a
-// first-class backend name to graphify once written. See opencode.go for why
-// that rather than a repointed openai backend.
-var Backends = []string{"", "gemini", "kimi", "claude", ClaudeCLIBackend, "openai", "deepseek", OpenCodeBackend, "ollama"}
+// The two opencode names are the ones here graphify does not ship: they are
+// custom providers this board registers in ~/.graphify/providers.json, which
+// are first-class backend names to graphify once written. See opencode.go for
+// why that rather than a repointed openai backend — and why the two plans are
+// two names rather than one name and a switch: they are two different bills.
+// ClaudeAPIBackend is the Anthropic API — the metered one, the key-based one,
+// the one that is not the CLI. Named because two files now have to tell the
+// two apart in a switch rather than in prose.
+const ClaudeAPIBackend = "claude"
+
+var Backends = []string{"", "gemini", "kimi", ClaudeAPIBackend, ClaudeCLIBackend, "openai", "deepseek", OpenCodeBackend, OpenCodeZenBackend, "ollama"}
 
 // Platforms is what `graphify install --platform P` accepts. The Integrations
 // view offers install/uninstall per platform.

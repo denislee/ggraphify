@@ -168,10 +168,11 @@ var Known = map[string]Spec{
 	// which is why Mutates is true and why the board confirms it.
 	"graft-build": {Kind: "graft-build", Title: "Sync graft index", Cost: Free, Mutates: true},
 	// `graft build --deep` is the same build plus graft's LLM tier: a concept
-	// map and a per-symbol summary/crux. It is Free here and only here,
-	// because ggraphify runs it against a model on this machine and refuses to
-	// build the argv for anything else — see GraftDeepParams.
-	"graft-deep": {Kind: GraftDeepKind, Title: "Deep graft index (local LLM)", Cost: Free, Mutates: true},
+	// map and a per-symbol summary/crux. It follows the Heavy work pin, so its
+	// price is a property of the run and not of the kind: Metered here is the
+	// answer for a backend nobody has resolved yet, and CostFor downgrades it
+	// to Free for the local server — never the other way round.
+	"graft-deep": {Kind: GraftDeepKind, Title: "Deep graft index (LLM)", Cost: Metered, Mutates: true},
 	// `graft init` is the installer: it writes the Claude Code wiring, both
 	// the user-level copy in ~/.claude and the repo-level one in the checkout
 	// it is pointed at. Free, and never run without the dialog that lists
@@ -183,6 +184,15 @@ var Known = map[string]Spec{
 // two binaries are resolved differently and a job's Out means nothing to the
 // graft ones, so the board has to be able to tell them apart.
 func Graft(kind string) bool { return strings.HasPrefix(kind, "graft-") }
+
+// Global reports whether a kind CHANGES which repositories are in graphify's
+// cross-repo graph. Those two commands write one file in ~/.graphify and
+// nothing inside any checkout, so the board invalidates a different memo for
+// them than for anything else — see deriveScopeOf.
+//
+// `global list` is deliberately not one of them: it reads, and a read that
+// invalidated the membership memo would make the listing button a rescan.
+func Global(kind string) bool { return kind == "global-add" || kind == "global-remove" }
 
 // Argv builds the command line for a kind. The returned slice starts with the
 // graphify binary, so it is exec-ready and also copy-pasteable verbatim — the
@@ -419,20 +429,21 @@ func Argv(kind string, p Params) []string {
 
 	case GraftDeepKind:
 		// graft's global flags come BEFORE the subcommand, and these three are
-		// the whole of how a local server is named: the OpenAI wire format,
-		// the endpoint it is served on, and a model that endpoint actually
-		// has. The key is the one part that travels in the environment.
+		// the whole of how a server is named: the wire format, the endpoint
+		// (omitted when it is the provider's own — a vendor API), and a model
+		// that endpoint actually has. The key is the one part that travels in
+		// the environment.
 		//
-		// A backend with no local endpoint yields no --base-url, which would
-		// send the corpus to api.openai.com on the user's key from a button
-		// the board calls free. So the argv is not built at all unless the
-		// endpoint is local: nil is what an unrunnable kind returns, and the
-		// dialog has already said why in GraftDeepReady's words.
-		if !IsLocalBackend(p.Backend) || LocalBaseURL(p.Backend) == "" {
+		// A backend GraftTargetFor cannot resolve builds no argv at all —
+		// guessing an endpoint would send the corpus somewhere nobody named.
+		// nil is what an unrunnable kind returns, and the dialog has already
+		// said why in GraftDeepReady's words.
+		t, why := GraftTargetFor(p.Backend)
+		if why != "" {
 			return nil
 		}
-		flag("--provider", GraftProvider(p.Backend))
-		flag("--base-url", LocalBaseURL(p.Backend))
+		flag("--provider", t.Provider)
+		flag("--base-url", t.BaseURL)
 		flag("--model", p.Model)
 		add("build", "--deep", p.Repo)
 		num("-j", p.MaxConcurrency)
@@ -488,6 +499,25 @@ func CostOf(kind string) Cost {
 	return Metered
 }
 
+// CostFor is CostOf once the backend the job will actually run against is
+// known. One kind changes price with its backend — graft's deep pass, which is
+// free against a model on this machine and a real bill anywhere else — and
+// this is the only place that is decided.
+func CostFor(kind, backend string) Cost {
+	return CostForLocal(kind, IsLocalBackend(EffectiveBackend(backend)))
+}
+
+// CostForLocal is CostFor for a caller that has already resolved whether the
+// run stays on this machine: the session restore, which reads that off the
+// sidecar rather than out of an argv that names no backend at all — graft's
+// flags are a provider and a URL.
+func CostForLocal(kind string, local bool) Cost {
+	if kind == GraftDeepKind && local {
+		return Free
+	}
+	return CostOf(kind)
+}
+
 // rescansTree are the commands that walk the checkout and reconcile graphify's
 // manifest against it. They are the three that read source files; everything
 // else in Known reads or rewrites an existing graph.
@@ -531,3 +561,79 @@ func JobLabel(kind, repo string) string {
 	}
 	return t + " · " + filepath.Base(repo)
 }
+
+// Weight is how much LLM work a command dispatches once it starts, which is a
+// different question from Cost.
+//
+// Cost asks whether a command bills at all; Weight asks how much of the model
+// it eats when it does. `extract` walks every source file in the checkout and
+// sends each chunk to the model — the run that takes hours and empties a
+// quota. `label` sends one short prompt per community, a few dozen requests
+// for a whole repository. Sending both to the same backend is the default
+// nobody chose: it either pays frontier prices for community names, or asks a
+// 7B local model for the extraction that the whole graph is built out of.
+//
+// The board splits them so each can be pinned to its own backend — see
+// store.Settings.HeavyBackend.
+type Weight int
+
+const (
+	NoLLM Weight = iota // the command never talks to a model
+	Light               // a handful of short prompts
+	Heavy               // a request per chunk of the whole tree
+)
+
+func (w Weight) String() string {
+	switch w {
+	case Heavy:
+		return "heavy"
+	case Light:
+		return "light"
+	}
+	return "none"
+}
+
+// weights is every kind that reaches a model, and how hard.
+//
+// The two Heavy ones are the same job in two indexers: a request per file of
+// the whole checkout, the pass the index is built out of. graft's deep pass
+// used to be absent from this table — it was pinned to a model on this machine
+// and refused everything else — and it is here now because that pin was the
+// board making the choice rather than the person: Heavy work is where "which
+// backend does the expensive pass run on" is answered, and the deep index is
+// nothing if not the expensive pass. What it costs follows from where it then
+// points; see CostFor.
+//
+// Everything else that reaches a model is Light: `label` names communities
+// from a list of symbols it already has, a few dozen short prompts.
+var weights = map[string]Weight{
+	"extract":     Heavy,
+	GraftDeepKind: Heavy,
+	"label":       Light,
+}
+
+// LLMKinds is every kind that reaches a model, heaviest first. It is the list
+// the settings page offers a per-command pin for, and the order is the order
+// the rows appear in: the two passes that read every file, then the one that
+// reads a list of symbols.
+//
+// Written out rather than derived from the weights map: a map has no order,
+// and a settings page whose rows moved between launches would be a settings
+// page nobody could learn.
+func LLMKinds() []string { return []string{"extract", GraftDeepKind, "label"} }
+
+// AutoBackend is what a weight pin holds when it explicitly means
+// auto-detect.
+//
+// It exists because the two meanings collide otherwise: a blank weight pin
+// means "whatever the general Backend says", and the general Backend's own
+// blank means "let graphify detect one from the environment". A pin that
+// stored the second as "" would be indistinguishable from the first, and
+// every state file written before the pins existed is full of that "".
+// store.Settings.BackendFor translates this back to "" before it reaches an
+// argv, so graphify never sees the word.
+const AutoBackend = "auto"
+
+// WeightOf is a kind's weight. Anything not in the table talks to no model at
+// all, which is true of every Free command in Known bar the graft ones.
+func WeightOf(kind string) Weight { return weights[kind] }

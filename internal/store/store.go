@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,6 +52,49 @@ type Settings struct {
 	Backend string `json:"backend"`
 	Model   string `json:"model"`
 
+	// HeavyBackend and LightBackend split the pin above in two, along the
+	// line gfy.Weight draws: the extraction that sends a request per chunk of
+	// the whole tree, and the community labelling that sends a few dozen
+	// short prompts. One backend for both is the setting nobody chose — it
+	// either pays frontier prices for community names, or hands the
+	// extraction the entire graph is built out of to a 7B model.
+	//
+	// Blank means "whatever Backend says", so a state file written before
+	// this existed reads back as the single-pin behaviour it was saved under.
+	// A fresh install gets ollama on both — see Defaults — because a model on
+	// this machine is the only backend that is free to be wrong about.
+	//
+	// A repository's own Backend override still wins over both: it was typed
+	// for that repository, and it is the more specific statement.
+	HeavyBackend string `json:"heavy_backend,omitempty"`
+	LightBackend string `json:"light_backend,omitempty"`
+	// HeavyModel and LightModel are the model that goes with each pin. They
+	// exist because Model is one field shared by every backend and a model id
+	// is not portable between them: the moment the two pins name different
+	// backends, one shared id is wrong for one of them. Blank means Model,
+	// and Model blank means the backend's own default.
+	HeavyModel string `json:"heavy_model,omitempty"`
+	LightModel string `json:"light_model,omitempty"`
+
+	// KindBackend and KindModel are the third tier, keyed by job kind: one
+	// command's own pin, overriding the weight class it belongs to.
+	//
+	// The weight split answers "expensive pass here, cheap pass there", which
+	// is the question most people have. It cannot answer the one the two
+	// heavy kinds raise: `extract` and graft's deep pass are the same SHAPE
+	// of job — a request per file of the whole checkout — and still not the
+	// same job. One fills a graph graphify's own commands read; the other
+	// writes prose an agent reads. A 7B model on this machine is a fine
+	// answer for one of those and a poor one for the other, and which way
+	// round that falls is not the board's to decide.
+	//
+	// Blank, absent, or an absent map means "whatever the weight class says",
+	// so every state file written before this existed reads back as the
+	// two-pin behaviour it was saved under. Nothing is written here until
+	// somebody picks something: the maps stay nil on a fresh install.
+	KindBackend map[string]string `json:"kind_backend,omitempty"`
+	KindModel   map[string]string `json:"kind_model,omitempty"`
+
 	// OpenCodeModel is the model the opencode-go backend runs, kept apart
 	// from Model because Model is one field shared by every backend and a
 	// model id is not portable between them: "qwen2.5-coder:7b" is a real
@@ -58,6 +102,14 @@ type Settings struct {
 	// override still wins over this one — that was typed for that repository.
 	// Blank means gfy.DefaultOpenCodeModel.
 	OpenCodeModel string `json:"opencode_model,omitempty"`
+
+	// OpenCodeZenModel is the same field for the other OpenCode plan, and is
+	// separate from OpenCodeModel for the same reason OpenCodeModel is
+	// separate from Model: the two gateways serve different catalogues, and an
+	// id from one is a 404 on the other. Blank means the plan's own default —
+	// for Zen, the cheapest model it is currently serving, which is usually a
+	// free one.
+	OpenCodeZenModel string `json:"opencode_zen_model,omitempty"`
 
 	// ClaudeAccount is the Claude Code configuration directory jobs run
 	// against — one of this machine's ~/.claude* logins. Blank means the
@@ -118,6 +170,41 @@ type Settings struct {
 	NoAutoFixLocal bool `json:"no_auto_fix_local,omitempty"`
 	AutoFixMetered bool `json:"auto_fix_metered,omitempty"`
 
+	// NoAutoFixGlobal turns off the third index's half of the loop: re-merging
+	// a repository into the global graph after its own graph is rebuilt. Off
+	// flag, on by default, for the same reason as the two above — the work is
+	// free and the alternative is a cross-repo graph that answers from an
+	// extraction nobody has seen in weeks.
+	NoAutoFixGlobal bool `json:"no_auto_fix_global,omitempty"`
+
+	// NoAutoFixEnroll turns off the half of the loop that keeps the MEMBERSHIP
+	// current rather than the members: merging a repository under a fleet root
+	// into the global graph for the first time, dropping a member whose graph
+	// has been deleted, and re-federating graft's workspace.json at each root
+	// so a query there covers the checkouts that are actually present.
+	//
+	// Off flag, on by default, like the three above — but it is the one whose
+	// default deserves an argument, because unlike them it changes the set of
+	// repositories the user assembled rather than refreshing a derived copy.
+	// The argument is FleetRoots: nothing is enrolled that is not under a
+	// directory nominated there, so the judgement "which repositories do I
+	// want to query across" is still the user's. It is made once, about a
+	// directory, instead of once per clone forever — and a fleet root whose
+	// new checkouts never join is a cross-repo graph that silently answers
+	// about last quarter's estate.
+	NoAutoFixEnroll bool `json:"no_auto_fix_enroll,omitempty"`
+
+	// FleetRoots are the directories whose checkouts belong together: the
+	// roots graft federates with a workspace.json and whose repositories the
+	// loop keeps in the global graph. Empty means the default, ~/git — the
+	// working tree of record on a machine set up like this one.
+	//
+	// It is deliberately NOT discover.DefaultRoots. That list includes ~/tmp
+	// and ~/.graphify/repos, which are a scratch area and a clone cache;
+	// boarding what is in them is right, and merging every experiment in them
+	// into a cross-repo graph is not.
+	FleetRoots []string `json:"fleet_roots,omitempty"`
+
 	// AutoFixMax is how many repositories the loop keeps in flight,
 	// AutoFixCooldown the minimum seconds before it attempts the same one
 	// again, and AutoFixAttempts how many times the same set of defects may
@@ -160,6 +247,116 @@ type Settings struct {
 	SortDesc bool   `json:"sort_desc"`
 }
 
+// BackendFor is the backend and model one command's weight class should run
+// against: the heavy or light pin when it is set, and the general Backend and
+// Model pair when it is not.
+//
+// gfy.NoLLM commands get the general pair too. They talk to no model, so the
+// answer is only ever read by a dialog that wants something to print, and
+// printing the pin the user would recognise beats printing a weight class
+// that never applied to them.
+func (s Settings) BackendFor(w gfy.Weight) (backend, model string) {
+	backend, model = s.Backend, s.Model
+	var b, m string
+	switch w {
+	case gfy.Heavy:
+		b, m = s.HeavyBackend, s.HeavyModel
+	case gfy.Light:
+		b, m = s.LightBackend, s.LightModel
+	}
+	if strings.TrimSpace(b) == "" {
+		return backend, model
+	}
+	if b == gfy.AutoBackend {
+		// An explicit auto-detect, which is a different answer from the blank
+		// above: this pin was set, and it was set to "let graphify choose".
+		b = ""
+	}
+	// The model follows the backend it was typed under, and only it: a heavy
+	// pin on a different backend from the general one must not inherit the
+	// general Model, which is an id for some other provider's catalogue.
+	return b, m
+}
+
+// BackendForKind is the backend and model ONE command runs against: its own
+// pin when it has one, and its weight class's answer when it does not.
+//
+// This is the function every caller that knows the kind should ask; BackendFor
+// is the tier below it, for a caller that has a weight and nothing finer.
+func (s Settings) BackendForKind(kind string) (backend, model string) {
+	b, m := s.KindPin(kind)
+	if strings.TrimSpace(b) == "" {
+		return s.BackendFor(gfy.WeightOf(kind))
+	}
+	if b == gfy.AutoBackend {
+		// An explicit auto-detect, which is a different answer from the blank
+		// above — the same distinction gfy.AutoBackend exists for one tier up.
+		b = ""
+	}
+	// The model follows the backend it was typed under, and only it: a pin on
+	// a different backend from its weight class must not inherit that class's
+	// model, which is an id for some other provider's catalogue.
+	return b, m
+}
+
+// KindPin is what this kind's own pin holds, unresolved — the raw pair the
+// settings page edits. Blank backend means the pin is not set.
+func (s Settings) KindPin(kind string) (backend, model string) {
+	return s.KindBackend[kind], s.KindModel[kind]
+}
+
+// SetKindPin writes one command's pin, and removes it when the backend is
+// blank so that "follow the weight class" is an absent key rather than a
+// remembered empty string.
+//
+// Both maps are rebuilt rather than written through. Settings is handed out by
+// value and a map inside it is shared with every copy, so writing in place
+// would change what a caller holding an older copy sees — including the copy
+// the board is about to save.
+func (s *Settings) SetKindPin(kind, backend, model string) {
+	s.KindBackend = withKey(s.KindBackend, kind, strings.TrimSpace(backend))
+	s.KindModel = withKey(s.KindModel, kind, strings.TrimSpace(model))
+}
+
+// withKey is a copy of m with k set to v, or with k removed when v is blank.
+// A map that ends up empty comes back nil, which is what keeps the two
+// omitempty tags honest.
+func withKey(m map[string]string, k, v string) map[string]string {
+	out := make(map[string]string, len(m)+1)
+	for key, val := range m {
+		if key != k {
+			out[key] = val
+		}
+	}
+	if v != "" {
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// OpenCodeModelFor is the model setting that belongs to an OpenCode plan, and
+// SetOpenCodeModelFor writes it. Two fields, one per plan, reached through the
+// backend name so that no caller has to remember which field goes with which
+// gateway — forgetting that is how a Go id ends up being sent to Zen.
+func (s Settings) OpenCodeModelFor(backend string) string {
+	if gfy.OpenCodePlanFor(backend).Backend == gfy.OpenCodeZenBackend {
+		return s.OpenCodeZenModel
+	}
+	return s.OpenCodeModel
+}
+
+// SetOpenCodeModelFor is the writer half.
+func (s *Settings) SetOpenCodeModelFor(backend, model string) {
+	if gfy.OpenCodePlanFor(backend).Backend == gfy.OpenCodeZenBackend {
+		s.OpenCodeZenModel = model
+		return
+	}
+	s.OpenCodeModel = model
+}
+
 // AutoFix reports whether the auto-fix loop runs at all, and AutoFixLocal
 // whether it may use a model on this machine for the LLM steps. Both are
 // stored inverted so that "not written down" means "on"; these two readers are
@@ -199,6 +396,52 @@ const DefaultOllamaIdleStop = 5 * time.Minute
 // nothing, so the loop can finish a repository rather than stopping at the
 // free half of it.
 func (s Settings) AutoFixLocal() bool { return !s.NoAutoFixLocal }
+
+// AutoFixGlobal reports whether the loop keeps the global graph's members up
+// to date. Stored inverted, like AutoFix and AutoFixLocal: not written down
+// has to mean on.
+//
+// It only ever re-merges repositories that are ALREADY members — it never
+// joins one — so switching it on cannot change what the global graph is about,
+// only how old the copy is.
+func (s Settings) AutoFixGlobal() bool { return !s.NoAutoFixGlobal }
+
+// AutoFixEnroll reports whether the loop keeps the global graph's membership
+// and graft's workspace federations current, not just their contents. Stored
+// inverted, like the switches above: not written down has to mean on.
+//
+// It is bounded by Fleets below — with no fleet roots it does nothing at all,
+// which is what keeps "on by default" from meaning "merges every checkout on
+// the machine".
+func (s Settings) AutoFixEnroll() bool { return !s.NoAutoFixEnroll }
+
+// Fleets is the configured fleet roots, cleaned and with ~ expanded, or the
+// default when none are set.
+//
+// A root is returned whether or not it exists: a directory that is missing
+// today is a mount that is not up rather than a setting that is wrong, and
+// silently dropping it here would turn "my fleet is not being maintained"
+// into a question with no visible answer.
+func (s Settings) Fleets() []string {
+	out := make([]string, 0, len(s.FleetRoots))
+	seen := map[string]bool{}
+	for _, r := range s.FleetRoots {
+		r = discover.Expand(r)
+		if r == "" || seen[r] {
+			continue
+		}
+		seen[r] = true
+		out = append(out, filepath.Clean(r))
+	}
+	if len(out) > 0 {
+		return out
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil
+	}
+	return []string{filepath.Join(home, "git")}
+}
 
 // RepoOverride is the per-repository half of the settings: what this one
 // checkout does differently from the board's defaults.
@@ -248,16 +491,23 @@ type Geometry struct {
 // so this file keeps holding variable names and never a credential's value,
 // which is the rule the package doc states.
 type JobEntry struct {
-	Kind    string    `json:"kind"`
-	Repo    string    `json:"repo"`
-	Label   string    `json:"label,omitempty"`
-	Argv    []string  `json:"argv"`
-	Cost    string    `json:"cost"`
-	Local   bool      `json:"local,omitempty"`
-	Dir     string    `json:"dir,omitempty"`
-	Out     string    `json:"out,omitempty"`
-	Status  string    `json:"status"`
-	Held    bool      `json:"held,omitempty"`
+	Kind   string   `json:"kind"`
+	Repo   string   `json:"repo"`
+	Label  string   `json:"label,omitempty"`
+	Argv   []string `json:"argv"`
+	Cost   string   `json:"cost"`
+	Local  bool     `json:"local,omitempty"`
+	Dir    string   `json:"dir,omitempty"`
+	Out    string   `json:"out,omitempty"`
+	Status string   `json:"status"`
+	Held   bool     `json:"held,omitempty"`
+	// Paused is whether the job was stopped by hand when this was written. It
+	// travels because it is the difference between an interrupted job and an
+	// abandoned one: a running job that the session ended under is work the
+	// next session picks up, and a paused one is work somebody deliberately
+	// stopped. Restoring both the same way would restart the extraction the
+	// user had just parked.
+	Paused  bool      `json:"paused,omitempty"`
 	Exit    int       `json:"exit"`
 	Queued  time.Time `json:"queued,omitempty"`
 	Started time.Time `json:"started"`
@@ -416,11 +666,16 @@ func Defaults() Settings {
 		MeteredLanes:   1,
 		LocalLanes:     0, // 0 → the runner's own jobs.DefaultLocalLanes
 		ConfirmBatchAt: 3,
-		Overlay:        map[string]string{},
-		LogBytes:       0,
-		SortCol:        "state",
-		BottomHeight:   220,
-		BottomPage:     "jobs",
+		// Local on both, for a first run that cannot surprise anybody with a
+		// bill. Only a fresh state file takes these: Open leaves a loaded
+		// blank alone, where blank means "follow Backend".
+		HeavyBackend: gfy.OllamaBackend,
+		LightBackend: gfy.OllamaBackend,
+		Overlay:      map[string]string{},
+		LogBytes:     0,
+		SortCol:      "state",
+		BottomHeight: 220,
+		BottomPage:   "jobs",
 	}
 }
 

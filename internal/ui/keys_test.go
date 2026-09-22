@@ -56,8 +56,8 @@ func accelNames(keys string) []string {
 		return []string{"j"}
 	case "k / ↑":
 		return []string{"k"}
-	case "g / G":
-		return []string{"g", "G"}
+	case "g":
+		return []string{"g"}
 	case "Enter", "Ctrl+Q", "Ctrl+H", "Ctrl+G", "Ctrl+L", "Ctrl+U", "Ctrl+F / Ctrl+B":
 		return nil // handled by the view's activate signal / the ctrl branch
 	case "/":
@@ -122,7 +122,8 @@ func TestColumnIDsAreUnique(t *testing.T) {
 // the board offers a button that cannot run.
 func TestEveryActionKindIsKnown(t *testing.T) {
 	src := readSource(t, "detail.go") + readSource(t, "actions.go") +
-		readSource(t, "viz.go") + readSource(t, "graft.go")
+		readSource(t, "viz.go") + readSource(t, "graft.go") +
+		readSource(t, "globalpane.go")
 	for _, kind := range kindsNamedIn(src) {
 		if _, ok := gfy.Known[kind]; !ok {
 			t.Errorf("the UI names the kind %q, which internal/gfy does not know", kind)
@@ -135,7 +136,12 @@ func TestEveryActionKindIsKnown(t *testing.T) {
 // string it collects has to be a real kind anyway.
 func kindsNamedIn(src string) []string {
 	var out []string
-	for _, marker := range []string{`a.run("`, `d.a.run("`, `SubmitCmd("`} {
+	for _, marker := range []string{
+		`a.run("`, `d.a.run("`, `SubmitCmd("`,
+		// The membership commands are submitted as a chain rather than
+		// through a.run — see globalAdd — so their kind is named here.
+		`runGlobalChain("`, `p.a.runGlobalChain("`, `Kind:   "`,
+	} {
 		rest := src
 		for {
 			i := strings.Index(rest, marker)

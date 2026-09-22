@@ -33,21 +33,32 @@ type BackendChoice struct {
 // exported is not an alternative, it is a second thing to go and set up, and a
 // list of six of those buries the one that would actually work. What is
 // offered is auto-detect (when something is detectable), the Claude Code CLI
-// (when installed), OpenCode Go (when its key is exported) and a local model
-// server (when one answers) — the four that need nothing bought.
+// (when installed), both OpenCode plans (when the key is exported) and a local
+// model server (when one answers) — the ones that need nothing bought.
 //
-// model is the board's model setting, which matters to two of the verdicts:
-// OpenCode Go's model has to exist on the plan, and a local server has to have
-// pulled the one being asked for.
+// owner is the backend the model setting belongs to, and model is that
+// setting. Both matter to two of the verdicts: an OpenCode model has to exist
+// on the plan it was chosen for, and a local server has to have pulled the one
+// being asked for.
 //
 // It probes ports and reads the filesystem, so it belongs off a UI thread.
-func BackendChoices(model string) []BackendChoice {
+func BackendChoices(owner, model string) []BackendChoice {
 	var out []BackendChoice
 	add := func(name, label string) {
 		c := BackendChoice{Name: name, Label: label, Local: IsLocalBackend(name)}
 		switch {
-		case name == OpenCodeBackend:
-			c.Ready, c.Why = OpenCodeReady(model)
+		case IsOpenCodeBackend(name):
+			// The model only means anything to the plan it was chosen for: a
+			// Go id checked against Zen's catalogue reads as "the gateway does
+			// not serve this", which would strike a perfectly ready backend
+			// off the list of alternatives. Asked about the other plan, the
+			// question is "would this plan work at all", and blank is what
+			// asks it.
+			m := ""
+			if name == OpenCodePlanFor(owner).Backend && IsOpenCodeBackend(owner) {
+				m = model
+			}
+			c.Ready, c.Why = OpenCodeReady(name, m)
 		case IsLocalBackend(name):
 			c.Ready, c.Why = LocalReady(name, model)
 		default:
@@ -64,6 +75,8 @@ func BackendChoices(model string) []BackendChoice {
 	}
 	if HasOpenCodeKey() {
 		add(OpenCodeBackend, OpenCodeBackend+" — the OpenCode Go subscription ("+OpenCodeKeyVar+")")
+		add(OpenCodeZenBackend, OpenCodeZenBackend+" — OpenCode Zen, pay-as-you-go on the same "+
+			OpenCodeKeyVar+", including the models it serves free")
 	}
 	if p := ProbeLocal(OllamaBackend); p.Reach {
 		add(OllamaBackend, OllamaBackend+" — a model on this machine: free, slower, no key")
@@ -77,7 +90,7 @@ func BackendChoices(model string) []BackendChoice {
 func ReadyBackends(except, model string) []BackendChoice {
 	except = strings.TrimSpace(except)
 	var out []BackendChoice
-	for _, c := range BackendChoices(model) {
+	for _, c := range BackendChoices(except, model) {
 		if !c.Ready || c.Name == except {
 			continue
 		}
@@ -96,8 +109,8 @@ func ReadyBackends(except, model string) []BackendChoice {
 func BackendVerdict(backend, model string) (eff string, ready bool, why string) {
 	eff = EffectiveBackend(backend)
 	switch {
-	case eff == OpenCodeBackend:
-		ready, why = OpenCodeReady(model)
+	case IsOpenCodeBackend(eff):
+		ready, why = OpenCodeReady(eff, model)
 	case IsLocalBackend(eff):
 		ready, why = LocalReady(eff, model)
 	default:

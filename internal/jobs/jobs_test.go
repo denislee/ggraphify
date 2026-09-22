@@ -1319,3 +1319,201 @@ func TestAClaudeCLIJobLogsItsAccount(t *testing.T) {
 		t.Errorf("a free AST job carries notes: %q", n)
 	}
 }
+
+// `graphify global add` reads the global manifest, edits it in memory and
+// writes it back, with no lock of its own — so two of them at once means the
+// second one's write drops the first one's repository. Different repositories
+// are not the excuse they are for every other mutating job: the file they
+// contend for is one file in the home directory.
+func TestGlobalGraphWritersAreSerializedAcrossRepositories(t *testing.T) {
+	fakeGraphify(t, `sleep 0.3`)
+	r := New(Options{FreeLanes: 8})
+	defer r.Close()
+
+	one, two := repoDir(t), repoDir(t)
+	a, err := r.SubmitCmd("global-add", one, "a", gfy.Params{Repo: one, Out: one, Tag: "a"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := r.SubmitCmd("global-remove", two, "b", gfy.Params{Repo: two, Tag: "b"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	if _, running := r.Active(); running != 1 {
+		t.Fatalf("%d global-graph jobs running at once, want 1", running)
+	}
+	// The reservation is not a repository's: neither checkout reads as busy,
+	// so the rest of the board can still be worked on while a merge runs.
+	if _, held := r.Busy(one); held {
+		t.Error("a global-graph job should not hold its repository")
+	}
+	wait(t, r, a.ID)
+	wait(t, r, b.ID)
+
+	// And the hold is released, or the second job would never have run.
+	if _, running := r.Active(); running != 0 {
+		t.Fatal("a job is still running after both finished")
+	}
+}
+
+// The other half of the same rule: a merge and an ordinary rebuild are about
+// different files and must not block each other.
+func TestAGlobalWriterDoesNotBlockAnOrdinaryJob(t *testing.T) {
+	fakeGraphify(t, `sleep 0.3`)
+	r := New(Options{FreeLanes: 8})
+	defer r.Close()
+
+	one, two := repoDir(t), repoDir(t)
+	a, _ := r.SubmitCmd("global-add", one, "a", gfy.Params{Repo: one, Out: one, Tag: "a"}, nil)
+	b, _ := r.SubmitCmd("update", two, "b", gfy.Params{Repo: two}, nil)
+	time.Sleep(150 * time.Millisecond)
+
+	if _, running := r.Active(); running != 2 {
+		t.Fatalf("%d jobs running, want 2 — a merge must not hold up a rebuild", running)
+	}
+	// Drained by count rather than by id: these two finish within a
+	// millisecond of each other in either order, and waiting for one by id
+	// discards the other's terminal event off the shared channel.
+	if !waitFor(20*time.Second, func() bool {
+		queued, running := r.Active()
+		return queued+running == 0
+	}) {
+		t.Fatal("timed out waiting for both jobs")
+	}
+	_, _ = a, b
+}
+
+// Pausing a job gives its lane back, so the next job queued behind it starts
+// while it is stopped. With one local lane and two local extractions, the
+// second one is waiting on exactly that lane — and a pause that freed the
+// model server but kept the lane would leave it waiting forever.
+func TestPausingAJobFreesItsLane(t *testing.T) {
+	fakeGraphify(t, `sleep 5`)
+	r := New(Options{FreeLanes: 4, LocalLanes: 1})
+	defer r.Close()
+
+	first, second := repoDir(t), repoDir(t)
+	a, err := r.SubmitCmd("extract", first, "Extract "+first,
+		gfy.Params{Repo: first, Backend: gfy.OllamaBackend}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := r.SubmitCmd("extract", second, "Extract "+second,
+		gfy.Params{Repo: second, Backend: gfy.OllamaBackend}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRunning(t, r, a.ID)
+
+	// The lane is the only thing holding the second one: different
+	// repositories, so no reservation is in the way.
+	if s, ok := r.Get(b.ID); !ok || s.Status != Queued {
+		t.Fatalf("the second job is %v, want queued behind the single local lane", s.Status)
+	}
+
+	if !r.Pause(a.ID) {
+		t.Fatal("Pause reported no change on a running job")
+	}
+	if !waitFor(5*time.Second, func() bool {
+		s, ok := r.Get(b.ID)
+		return ok && s.Status == Running
+	}) {
+		t.Fatal("the queued job never started, so the pause did not free the lane")
+	}
+
+	// And the paused one is still there, still paused — freeing the lane is
+	// not cancelling the job.
+	if s, ok := r.Get(a.ID); !ok || s.Status != Running || !s.Paused {
+		t.Fatalf("the paused job is %v paused=%v, want running and paused", s.Status, s.Paused)
+	}
+
+	r.CancelAll()
+}
+
+// The case from the board: one local lane, a local extraction running, and a
+// local job queued behind it that is HELD — restored from a previous session
+// and waiting for a click. Pausing the extraction has to start it anyway.
+// Freeing the lane and then leaving it empty is the outcome nobody asked for.
+func TestPausingHandsTheLaneToAHeldJob(t *testing.T) {
+	fakeGraphify(t, `sleep 5`)
+	r := New(Options{FreeLanes: 4, LocalLanes: 1})
+	defer r.Close()
+
+	first, second := repoDir(t), repoDir(t)
+	a, err := r.SubmitCmd("extract", first, "Extract "+first,
+		gfy.Params{Repo: first, Backend: gfy.OllamaBackend}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := r.SubmitCmd("extract", second, "Label "+second,
+		gfy.Params{Repo: second, Backend: gfy.OllamaBackend}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRunning(t, r, a.ID)
+
+	// Hold the queued one the way a restored job is held.
+	r.mu.Lock()
+	for _, j := range r.queue {
+		if j.ID == b.ID {
+			j.Held = true
+		}
+	}
+	r.mu.Unlock()
+
+	if !r.Pause(a.ID) {
+		t.Fatal("Pause reported no change on a running job")
+	}
+	if !waitFor(5*time.Second, func() bool {
+		s, ok := r.Get(b.ID)
+		return ok && s.Status == Running
+	}) {
+		t.Fatal("the held job never started, so the freed lane went to nobody")
+	}
+	if s, _ := r.Get(b.ID); s.Held {
+		t.Fatal("it is running while still marked held")
+	}
+	r.CancelAll()
+}
+
+// The lane a pause hands over is its OWN, and never the metered one. A paused
+// vendor extraction must not be the thing that opens a bill nobody clicked.
+func TestPausingAMeteredJobHandsNothingOver(t *testing.T) {
+	fakeGraphify(t, `sleep 5`)
+	r := New(Options{FreeLanes: 4, MeteredLanes: 1, LocalLanes: 1})
+	defer r.Close()
+
+	first, second := repoDir(t), repoDir(t)
+	a, err := r.SubmitCmd("extract", first, "Extract "+first,
+		gfy.Params{Repo: first, Backend: "openai"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := r.SubmitCmd("extract", second, "Extract "+second,
+		gfy.Params{Repo: second, Backend: "openai"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRunning(t, r, a.ID)
+
+	r.mu.Lock()
+	for _, j := range r.queue {
+		if j.ID == b.ID {
+			j.Held = true
+		}
+	}
+	r.mu.Unlock()
+
+	if !r.Pause(a.ID) {
+		t.Fatal("Pause reported no change on a running job")
+	}
+	// Long enough for a dispatch to have happened if one were coming.
+	time.Sleep(500 * time.Millisecond)
+	if s, _ := r.Get(b.ID); s.Status != Queued || !s.Held {
+		t.Fatalf("a held metered job is %v held=%v after a pause, want queued and held",
+			s.Status, s.Held)
+	}
+	r.CancelAll()
+}

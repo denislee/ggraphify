@@ -59,6 +59,15 @@ const (
 	// share with or a stranger to refuse.
 	openCodeProbePath = "/__ggraphify/opencode"
 	openCodeProbeBody = "ggraphify opencode-go proxy"
+
+	// openCodeProbePlans is appended to the probe body, and is the whole
+	// reason the body is parsed rather than only prefix-matched. A proxy
+	// bound by an OLDER ggraphify serves the Go path and 404s the Zen one, so
+	// a board that inherited it and wrote a Zen entry pointing at it would
+	// have produced a run that failed every chunk on a path that does not
+	// exist. Sharing is still right when the other end can serve the plan
+	// being asked for; it is refused, by name, when it cannot.
+	openCodeProbePlans = " plans=go,zen"
 )
 
 // AppVersion is ggraphify's own version, set by main from the value the
@@ -69,7 +78,8 @@ var AppVersion = "dev"
 
 var proxyState struct {
 	sync.Mutex
-	base    string // what the provider entry should point at
+	root    string // http://127.0.0.1:port — the proxy, without a plan's path
+	base    string // root + the Go plan's path, which is what Activity reports
 	session string
 	// owned is true when THIS process bound the port. A proxy inherited from
 	// another ggraphify is served by that process and outlives this one, so
@@ -138,15 +148,25 @@ func OpenCodeProxyPort() int {
 	return DefaultOpenCodePort
 }
 
+// OpenCodeProxyBase is the URL a plan's provider entry should carry, given
+// the proxy's root. One port, one path per plan: the handler reads the path to
+// know which gateway to forward to, so the two plans cannot be confused by
+// anything the client does or does not send.
+func OpenCodeProxyBase(root, backend string) string {
+	return strings.TrimSuffix(root, "/") + OpenCodePlanFor(backend).ProxyPath
+}
+
 // StartOpenCodeProxy brings the proxy up if it is not already, and returns the
-// base URL the provider entry should carry. It is idempotent: the second call
-// in a process returns the first call's answer, and a port already held by
-// another ggraphify's proxy is shared rather than fought over.
-func StartOpenCodeProxy() (string, error) {
+// base URL a provider entry for this plan should carry. It is idempotent: the
+// second call in a process returns the first call's answer, and a port already
+// held by another ggraphify's proxy is shared rather than fought over.
+func StartOpenCodeProxy(backend string) (string, error) {
+	plan := OpenCodePlanFor(backend)
 	proxyState.Lock()
-	if proxyState.base != "" {
-		defer proxyState.Unlock()
-		return proxyState.base, nil
+	if proxyState.root != "" {
+		root := proxyState.root
+		proxyState.Unlock()
+		return OpenCodeProxyBase(root, plan.Backend), nil
 	}
 	proxyState.Unlock()
 
@@ -157,11 +177,18 @@ func StartOpenCodeProxy() (string, error) {
 		// Something has the port. If it is another ggraphify, that is not a
 		// conflict — its proxy adds the same headers to the same upstream, so
 		// sharing it is correct and costs nothing.
-		if base, ok := probeOpenCodeProxy(addr); ok {
+		if root, plans, ok := probeOpenCodeProxy(addr); ok {
+			if !strings.Contains(plans, "zen") && plan.Backend == OpenCodeZenBackend {
+				return "", errors.New("the proxy on " + addr + " belongs to an older ggraphify " +
+					"that only serves the OpenCode Go path, so it cannot carry an " +
+					OpenCodeZenBackend + " run. Quit that board, or set " + OpenCodePortVar +
+					" to another port for this one")
+			}
 			proxyState.Lock()
-			proxyState.base = base
+			proxyState.root = root
+			proxyState.base = OpenCodeProxyBase(root, OpenCodeBackend)
 			proxyState.Unlock()
-			return base, nil
+			return OpenCodeProxyBase(root, plan.Backend), nil
 		}
 		return "", errors.New("the OpenCode Go proxy cannot bind " + addr + " (" + err.Error() +
 			") and what is listening there is not one of ours. Free the port, or set " +
@@ -169,7 +196,7 @@ func StartOpenCodeProxy() (string, error) {
 	}
 
 	actual := ln.Addr().(*net.TCPAddr).Port
-	base := "http://127.0.0.1:" + Itoa(actual) + "/v1"
+	root := "http://127.0.0.1:" + Itoa(actual)
 
 	srv := &http.Server{
 		Handler: openCodeProxyHandler(),
@@ -186,27 +213,51 @@ func StartOpenCodeProxy() (string, error) {
 	}()
 
 	proxyState.Lock()
-	proxyState.base = base
+	proxyState.root = root
+	proxyState.base = OpenCodeProxyBase(root, OpenCodeBackend)
 	proxyState.owned = true
 	proxyState.Unlock()
-	return base, nil
+	return OpenCodeProxyBase(root, plan.Backend), nil
+}
+
+// openCodeRoute maps a request path to the plan it belongs to and the part of
+// the path the gateway should see after its own /v1.
+//
+// Zen is matched first and by its longer prefix, because "/v1" is a prefix of
+// nothing here but is the fallback: a path that is neither is refused rather
+// than guessed at.
+func openCodeRoute(path string) (plan OpenCodePlan, rest string, ok bool) {
+	for _, p := range []OpenCodePlan{OpenCodePlanFor(OpenCodeZenBackend), OpenCodePlanFor(OpenCodeBackend)} {
+		if path == p.ProxyPath {
+			return p, "", true
+		}
+		if strings.HasPrefix(path, p.ProxyPath+"/") {
+			return p, strings.TrimPrefix(path, p.ProxyPath), true
+		}
+	}
+	return OpenCodePlan{}, "", false
 }
 
 // probeOpenCodeProxy asks whatever holds an address whether it is a ggraphify
 // proxy. Anything else — a different application, a silent socket — answers
 // no, and the caller refuses rather than sending a corpus to it.
-func probeOpenCodeProxy(addr string) (string, bool) {
+func probeOpenCodeProxy(addr string) (root, plans string, ok bool) {
 	c := &http.Client{Timeout: 2 * time.Second}
 	resp, err := c.Get("http://" + addr + openCodeProbePath) // #nosec G107 -- loopback, address composed here
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 256))
 	if err != nil || !strings.HasPrefix(string(body), openCodeProbeBody) {
-		return "", false
+		return "", "", false
 	}
-	return "http://" + addr + "/v1", true
+	// "plans=…" is absent from an older proxy's body, which is precisely the
+	// answer the caller needs: it serves the Go path only.
+	if _, rest, found := strings.Cut(string(body), "plans="); found {
+		plans, _, _ = strings.Cut(rest, " ")
+	}
+	return "http://" + addr, plans, true
 }
 
 // proxyTransport is shared so a sweep's requests reuse connections to the
@@ -222,23 +273,31 @@ var proxyTransport = &http.Transport{
 func openCodeProxyHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(openCodeProbePath, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, openCodeProbeBody+" "+AppVersion)
+		_, _ = io.WriteString(w, openCodeProbeBody+" "+AppVersion+openCodeProbePlans)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// One upstream, and only the paths it serves. A loopback proxy that
-		// forwarded an arbitrary absolute URL would be an open relay for
-		// anything else running on this machine.
-		if !strings.HasPrefix(r.URL.Path, "/v1/") && r.URL.Path != "/v1" {
-			http.Error(w, "this proxy forwards /v1 to "+OpenCodeUpstream()+" and nothing else", http.StatusNotFound)
+		// Two upstreams, one per plan, and only the paths they serve. Which
+		// plan a request belongs to is read off the path rather than from any
+		// board-wide state: the path was written into that provider entry when
+		// the plan was chosen, so a request cannot arrive here meaning one
+		// plan and be billed to the other. A loopback proxy that forwarded an
+		// arbitrary absolute URL would be an open relay for anything else
+		// running on this machine.
+		plan, rest, ok := openCodeRoute(r.URL.Path)
+		if !ok {
+			http.Error(w, "this proxy forwards "+OpenCodeBackend+"'s /v1 to "+
+				OpenCodeUpstream(OpenCodeBackend)+" and "+OpenCodeZenBackend+"'s /zen/v1 to "+
+				OpenCodeUpstream(OpenCodeZenBackend)+", and nothing else", http.StatusNotFound)
 			return
 		}
-		up, err := url.Parse(strings.TrimSuffix(OpenCodeUpstream(), "/v1"))
+		upstream := OpenCodeUpstream(plan.Backend)
+		up, err := url.Parse(strings.TrimSuffix(upstream, "/v1"))
 		if err != nil {
 			http.Error(w, "bad upstream: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		target := *up
-		target.Path = strings.TrimSuffix(up.Path, "/") + r.URL.Path
+		target.Path = strings.TrimSuffix(up.Path, "/") + "/v1" + rest
 		target.RawQuery = r.URL.RawQuery
 
 		req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), r.Body)

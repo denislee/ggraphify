@@ -55,6 +55,7 @@ rather than remembered.
 | Branch | branch and short SHA; `≠` when the graph was built at a different commit |
 | Graph | `2047n / 4835e` |
 | Graft | the *other* index: `● 951n`, plus `~12 −3` when the tree has moved under it |
+| Global | whether this repository is in the cross-repo graph: `○` out, `●` in, `◐` in but re-extracted since — plus the tag when it is not the repository's own name |
 | Used | whether an agent actually *read* either index here: a week of daily calls as a sparkline, and the count. A red **✕** means the row was used and has no graph to have answered with |
 | Comm. | community count, or "83 unnamed" when the LLM labelling pass has not run |
 | Drift | `+12 ~30 −3` added / changed / removed versus `manifest.json`, or `needs-extract` |
@@ -130,6 +131,74 @@ mirroring graft's extension table, its gitignore handling and its `--only-dir` w
 a moving target in another project, and getting it wrong pins a row to "stale" that no
 rebuild can clear. Changed and removed are measured against what graft itself recorded, so
 they are answerable.
+
+## The global graph, and the screen that manages it
+
+graphify can merge any number of repositories' graphs into one file,
+`~/.graphify/global-graph.json`, and that is the index an agent asks a *cross-repo*
+question of: which service calls this endpoint, where else does this type appear, what
+would this rename touch two repositories over. A repository that has not been merged into
+it cannot be an answer to any of those questions — and from inside that checkout there is
+nothing to see: `graphify-out/` looks identical whether or not its nodes are also in the
+global graph.
+
+So membership is a column. `○` out, `●` in, `◐` in but re-extracted since — the same
+alphabet as the state dot and the Graft column, with the tag appended when a repository
+was merged under a name that is not its directory's. Sorting by it puts the `◐` rows
+first, because those are the silent ones: the repository was extracted again last week and
+the global graph still answers with the extraction before it.
+
+**m** adds the selected repository, or takes it out again. With rows ticked in select mode
+(**v**, **Space**) it does the same for all of them, and a mixed selection *adds* — an add
+is free and reversible, a remove throws away nodes an extraction paid for, so "some in,
+some out" cannot silently mean remove.
+
+**G** — or the header's network button — opens the **Global screen**, which is a page of
+the window rather than a dialog, on the same footing as the Usage dashboard. It is two
+lists:
+
+- **In the global graph** — every member the manifest records: its tag, the `graph.json`
+  it was built from, what it contributed, when it was merged, and a chip when the
+  repository has been re-extracted since. *Stale* ticks exactly those, and *Re-add*
+  re-merges them. Members whose repository is not on this board at all — a checkout that
+  was moved, renamed or deleted after it was merged — are listed too and say so, and they
+  can only be removed from here: they have no row to act on.
+- **On the board, not in it** — every checkout with a graph that has never been merged,
+  with *All* / *None* / *Add*.
+
+Both lists are narrowed by the same two controls: a **folder dropdown** — the same
+`~/git`, `~/git/nova`, `~/tmp` list the board's header carries, derived from the same
+rows — and a text box. "Which of `~/git/nova` is in the global graph, and add the rest"
+is one folder selection and one click, which on a board of two hundred checkouts under
+four roots is the reason this screen exists. **F** steps through the folders here exactly
+as it does on the board, and the filter is this page's own: narrowing the Global screen
+does not move what the board is showing underneath it.
+
+A member whose repository is not on this board — a checkout moved, renamed or deleted
+after it was merged — belongs to no folder, so it is hidden while one is selected and a
+line says how many are waiting under *All folders*. Those are the entries most worth
+removing; a filter that dropped them silently would hide exactly the wrong list.
+
+The headings read `5 of 12` when something is filtered, and the ticks **survive** a
+filter change — assembling a batch across two folders is a thing people do — so each
+action button carries its own count (*Add (12)*, *Remove (3)*) and is dimmed when nothing
+is ticked. What is listed and what will be acted on are different sets, and the buttons
+are where that is said.
+
+Every button on that screen runs `graphify global add` or `graphify global remove`, and
+they run **one at a time, in sequence**. That is not politeness about load: `global add`
+is a read-modify-write of one shared file with no cross-process lock, so two of them in
+two free lanes would race and one repository's nodes would vanish into the loser's copy.
+Removing is always behind a confirm that names the tags. Adding under a tag that is
+already taken by a *different* graph is too, because a tag is the only handle the global
+graph has on a repository and graphify prunes whatever is under that tag before it merges.
+
+Membership itself is read from `~/.graphify/global-manifest.json` — the record graphify
+writes beside the graph — and never by parsing the graph, which runs to hundreds of
+megabytes. The manifest is a few kilobytes and carries exactly the facts the board needs;
+it is read once per scan, not once per row, and staleness is its `added_at` against the
+repository's `graph.json` mtime. Nothing in ggraphify writes that file: like drift, this
+is derived state, and changing it is a graphify command like any other.
 
 ## Free versus metered
 
@@ -260,6 +329,23 @@ four rules rather than by hope:
    lanes still apply underneath, so the loop cannot become a way to run twelve extractions
    at once.
 
+It repairs **three** indexes, and only where repairing is unattended work. graphify's own
+`graph.json` is the first. graft's index under `<repo>/graft` is the second — it goes stale
+for the same reason, and `graft build` fixes it for free, so a stale or unreadable one is
+rebuilt in the same chain. The third is the **global graph**: a repository already merged
+into `~/.graphify` whose own graph has since been rebuilt is re-merged with `graphify global
+add`, so cross-repo queries stop answering from the previous extraction. That step is
+appended *after* the rebuild that makes it necessary — the loop closes the drift it causes
+itself, in one pass, rather than noticing it a cooldown later.
+
+What the loop will not do is create any of the three where none exists: it never builds a
+first graft index (that writes a directory into somebody's checkout), never runs graft's
+`--deep` pass, and never **joins** a repository to the global graph. Which checkouts belong
+there is a judgement, not a defect, and it stays a decision you make on the Global screen.
+Because `graphify global add` has no lock of its own, the job runner serialises every
+command that writes the global manifest against every other one, across repositories — two
+merges at once would mean the second one's write silently dropped the first one's repository.
+
 Which model it uses is resolved per tick, not stored: when the board's backend is already
 local, its own model setting is the preference; when the backend is `claude-cli` or an API,
 the model setting names a model the local server has never heard of, so `gfy.AutoLocalModel`
@@ -268,7 +354,8 @@ server actually serves. An embedding-only server is a refusal rather than a bad 
 extraction sent to `nomic-embed-text` is a 400 per chunk of every repository.
 
 Everything is under **Settings → Jobs → Automatic fixes**: the master switch, the local
-model switch, the metered switch, how many repositories at once, the cooldown, and how many
+model switch, the global-graph switch, the metered switch, how many repositories at once,
+the cooldown, and how many
 attempts before it gives up. Changing any of them clears the loop's memory, so a setting
 changed to unblock a repository actually unblocks it. The diagnostics page (`Ctrl+D`) prints
 the whole resolved policy — including which model the LLM steps would go to right now — in
@@ -291,6 +378,7 @@ g          top             E  Extract (METERED)      v Space A  batch select
 r          rescan          l  Label (METERED)        X          exclude from batch
 Enter      open detail     e w  export html / wiki
 t          colour scheme   W  watch on/off           U y        usage dashboard, copy it
+                            m  global graph on/off
                                                       ,  ?       settings, help
 Ctrl+F/B   page down / up  x  cancel this row's job   b  L       bottom panel, its log
 Ctrl+H     free fix, board  Ctrl+U  update every row behind HEAD (free)

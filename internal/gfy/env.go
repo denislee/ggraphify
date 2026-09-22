@@ -196,11 +196,21 @@ func HasAPIKey() bool {
 	return hasVendorAPIKey()
 }
 
+// AnthropicKeyVar and OpenAIKeyVar are the two vendor credentials this board
+// has to name rather than merely count: graft's deep pass copies one of them
+// into GRAFT_API_KEY, so the variable holding it is part of the answer to
+// "can this backend run it at all". The rest of the list below is only ever
+// asked the yes/no question.
+const (
+	AnthropicKeyVar = "ANTHROPIC_API_KEY"
+	OpenAIKeyVar    = "OPENAI_API_KEY"
+)
+
 // hasVendorAPIKey is the narrower question EffectiveBackend asks: is there a
 // key for a backend graphify can detect on its own, with no help from here.
 func hasVendorAPIKey() bool {
 	for _, k := range []string{
-		"GRAPHIFY_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+		"GRAPHIFY_API_KEY", AnthropicKeyVar, OpenAIKeyVar,
 		"GEMINI_API_KEY", "GOOGLE_API_KEY", "DEEPSEEK_API_KEY", "MOONSHOT_API_KEY",
 	} {
 		if strings.TrimSpace(os.Getenv(k)) != "" {

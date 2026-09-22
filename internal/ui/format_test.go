@@ -299,3 +299,39 @@ func TestJobWeightOrdersByAttention(t *testing.T) {
 		t.Error("a cancelled job must sort above a row with no job")
 	}
 }
+
+// The per-row Retry is offered on failures and nowhere else. The two
+// exclusions are the point of the test: a succeeded job re-run from a row is
+// money or hours spent on a mis-click, and a cancelled job re-run from the
+// row it was cancelled in undoes the click that stopped it.
+func TestJobRetryable(t *testing.T) {
+	if jobRetryable(nil) {
+		t.Error("no job is not a retryable job")
+	}
+	now := time.Now()
+	cases := []struct {
+		s    jobs.Snapshot
+		want bool
+	}{
+		{jobs.Snapshot{Kind: "extract", Status: jobs.Failed, Exit: 1, Started: now, Ended: now}, true},
+		{jobs.Snapshot{Kind: "extract", Status: jobs.Succeeded, Started: now, Ended: now}, false},
+		{jobs.Snapshot{Kind: "extract", Status: jobs.Canceled, Started: now, Ended: now}, false},
+		{jobs.Snapshot{Kind: "extract", Status: jobs.Running, Started: now}, false},
+		{jobs.Snapshot{Kind: "extract", Status: jobs.Queued}, false},
+		{jobs.Snapshot{Kind: "extract", Status: jobs.Queued, Held: true}, false},
+	}
+	for _, c := range cases {
+		s := c.s
+		if got := jobRetryable(&s); got != c.want {
+			t.Errorf("jobRetryable(%v) = %v, want %v", s.Status, got, c.want)
+		}
+	}
+	// Whatever it says yes to, retryJob has to be willing to run: the button
+	// exists only where the action behind it does.
+	for _, st := range []jobs.Status{jobs.Queued, jobs.Running, jobs.Succeeded, jobs.Failed, jobs.Canceled} {
+		s := jobs.Snapshot{Kind: "extract", Status: st}
+		if jobRetryable(&s) && !s.Status.Done() {
+			t.Errorf("%v is offered a Retry but retryJob ignores it", st)
+		}
+	}
+}

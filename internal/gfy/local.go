@@ -2,6 +2,7 @@ package gfy
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
@@ -69,6 +70,14 @@ const (
 	// Somebody who administers that server knows the number; nothing here
 	// could ever discover it.
 	OllamaSlotsVar = "GGRAPHIFY_OLLAMA_SLOTS"
+
+	// OllamaContextSlotVar is OllamaSlotsVar's sibling for the context slot:
+	// it states the PER-SLOT context outright, for the case the derivation
+	// below cannot cover — a server on another host, or one started by hand
+	// from a shell whose environment this process never saw. It is stated
+	// per-slot and used verbatim, because somebody who knows the number knows
+	// which number it is.
+	OllamaContextSlotVar = "GGRAPHIFY_OLLAMA_CONTEXT"
 
 	// DefaultOllamaBaseURL and DefaultOllamaModel are graphify's own defaults
 	// for the backend, restated here only so the UI can say what will happen
@@ -497,8 +506,14 @@ type LocalProbe struct {
 	// the ceiling OllamaContextVar could be raised to. 0 when unknown.
 	CtxMax int
 	// CtxModel names the model Ctx was measured on, which need not be the one
-	// the board is set to run.
+	// the board is set to run. Empty when Ctx was not measured but derived
+	// from the server's configuration, where no model is loaded to name.
 	CtxModel string
+	// CtxWhy is the one-line derivation of Ctx, in SlotsWhy's idiom: a slot
+	// read off a running model and a slot read off the unit file that will
+	// serve it are both usable answers, but they are not equally certain, and
+	// the UI has to be able to say which one it has.
+	CtxWhy string
 
 	// Slots is how many requests the server answers at once — the number that
 	// decides whether an extraction uses this machine or a quarter of it. It
@@ -522,8 +537,10 @@ type LocalProbe struct {
 // `-c 65536 -np 2`, /api/ps answered 32768. So a server configured for
 // concurrency is sized correctly without the caller knowing how many slots it
 // was split into. /api/ps answers
-// only while a model is loaded — a cold server returns an empty list, and the
-// honest answer there is "not measured", not a guess.
+// only while a model is loaded — a cold server returns an empty list, and this
+// function reports that as "not measured" rather than guessing. derivedContext
+// is what answers the question for a cold server, off the configuration the
+// model will be loaded with.
 func fetchOllamaContext(base string) (ctx, ctxMax int, model string) {
 	root := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSpace(base), "/"), "/v1")
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -657,6 +674,92 @@ func derivedSlots(base string) (int, string) {
 		}
 	}
 	return 1, "no " + OllamaParallelVar + " anywhere this board can read, so one at a time"
+}
+
+// derivedContext is fetchOllamaContext's fallback, and the answer to the
+// failure that /api/ps cannot cover: a job is submitted at exactly the moment
+// no model is loaded — a server that has just come up, or one the board is
+// starting for this very job — and the measurement returns nothing.
+//
+// "Nothing" was previously carried all the way through to the argv as "leave
+// graphify's default alone", and graphify's default is a 60_000-token chunk.
+// Against a 32768 slot that is the front-truncated prompt, the prose reply and
+// the failed run LocalTokenBudget exists to prevent, so the board loses the
+// whole run on a five-second timing accident. A slot that has not been
+// measured is not a slot that is unknowable: the server was configured by
+// somebody, and the configuration is on this disk.
+//
+// Three sources, authority first, in derivedSlots' own order and for its
+// reasons. The stated variable is the operator speaking directly; the unit
+// file is what the running server was actually given; this process's
+// environment is what a server started FROM this session would have got.
+//
+// The unit and environment readings are DIVIDED by the slot count: that is
+// the inverse of the arithmetic SizeOllama does when the board starts a server
+// itself, and it is the pessimistic reading of a variable whose split across
+// slots depends on which server is behind the port. Where the server does not
+// in fact divide, the derived slot is merely half of what it could have been —
+// a smaller chunk, never a truncated one — and it is superseded by the
+// measured answer the moment a model is loaded. A measured /api/ps answer is
+// already per-slot and never goes through here.
+//
+// With nothing stated anywhere, a local ollama is running its stock 4096 slot,
+// which is a documented default rather than a guess: that is what a server
+// given no OllamaContextVar allocates, whatever the model was trained for. A
+// remote server gets 0 — its configuration is not on this disk, and inventing
+// a number for it is how somebody's 128k server ends up sending 512-token
+// chunks.
+func derivedContext(base string, slots int) (int, string) {
+	if slots < 1 {
+		slots = 1
+	}
+	perSlot := func(total int) int {
+		n := total / slots
+		if n < 1 {
+			n = 1
+		}
+		return n
+	}
+	if v := strings.TrimSpace(os.Getenv(OllamaContextSlotVar)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n, OllamaContextSlotVar + "=" + strconv.Itoa(n) + ", stated per slot"
+		}
+	}
+	if !IsLocalURL(base) {
+		return 0, "not measurable for a server on another host with nothing loaded — " +
+			"set " + OllamaContextSlotVar + " if you know its per-slot context"
+	}
+	for _, u := range []struct {
+		scope []string
+		what  string
+	}{
+		{[]string{"--user"}, "the per-user ollama.service"},
+		{nil, "the system ollama.service"},
+	} {
+		if u.scope != nil && !unitEnabled("ollama.service", u.scope...) {
+			continue
+		}
+		if u.scope == nil && !unitExists("ollama.service") {
+			continue
+		}
+		if v, ok := unitEnviron("ollama.service", u.scope...)[OllamaContextVar]; ok {
+			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+				return perSlot(n), OllamaContextVar + "=" + strconv.Itoa(n) + " in " + u.what +
+					", across " + strconv.Itoa(slots) + " slot(s)"
+			}
+		}
+		return DefaultOllamaContext, u.what + " sets no " + OllamaContextVar +
+			", so ollama loads every model in its stock " +
+			strconv.Itoa(DefaultOllamaContext) + "-token slot"
+	}
+	if v := strings.TrimSpace(os.Getenv(OllamaContextVar)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return perSlot(n), OllamaContextVar + "=" + strconv.Itoa(n) +
+				" in this session's environment, across " + strconv.Itoa(slots) + " slot(s)"
+		}
+	}
+	return DefaultOllamaContext, "no " + OllamaContextVar + " anywhere this board can read, " +
+		"so ollama's stock " + strconv.Itoa(DefaultOllamaContext) + "-token slot"
 }
 
 // unitEnviron reads a unit's Environment= as a map, without starting anything.
@@ -801,6 +904,12 @@ func memAvailableBytes() int64 {
 // instead. Room = the slot, less what ollama reserves for the reply (it caps
 // a request for more than half the slot at half the slot), less graphify's
 // own system prompt.
+//
+// The slot itself is measured where a model is loaded and derived from the
+// server's configuration where one is not, so that a job submitted against a
+// cold server — the board starting ollama for this very run — is sized like
+// any other. It returns 0 only for a server whose configuration is genuinely
+// unreadable from here, which is a remote one.
 func LocalTokenBudget(backend string) int {
 	return contextTokenBudget(ProbeLocal(backend).Ctx)
 }
@@ -848,7 +957,14 @@ func (p LocalProbe) ContextAdvice() string {
 		want = p.CtxMax
 	}
 	b := &strings.Builder{}
-	b.WriteString("The server is running " + p.CtxModel + " in a " + strconv.Itoa(p.Ctx) +
+	// Named when a model is loaded to name; "every model it loads" when the
+	// slot was read off the configuration instead, which is the honest phrase
+	// for a server that is up with nothing resident.
+	what := "every model it loads"
+	if p.CtxModel != "" {
+		what = p.CtxModel
+	}
+	b.WriteString("The server is running " + what + " in a " + strconv.Itoa(p.Ctx) +
 		"-token context — ollama's default, not the model's")
 	if p.CtxMax > 0 {
 		b.WriteString(", which is " + strconv.Itoa(p.CtxMax))
@@ -1035,9 +1151,26 @@ func probeLocalNow(backend, base, key string) LocalProbe {
 		// on every redraw.
 		if p.Reach {
 			p.Ctx, p.CtxMax, p.CtxModel = fetchOllamaContext(base)
+			if p.Ctx > 0 {
+				p.CtxWhy = "measured on " + p.CtxModel + ", loaded now"
+			}
 			if p.Slots == 0 {
 				p.Slots, p.SlotsWhy = derivedSlots(base)
 			}
+		}
+		// The slot count first, because the context total is divided by it.
+		//
+		// This runs whether or not the server answered, for statedSlots'
+		// reason: a job is submitted at the moment the board is bringing the
+		// server up, and an argv built then is the argv that runs. A slot the
+		// probe declined to derive there is a 60_000-token chunk sent to a
+		// 4096-token server, which is the whole failure.
+		if p.Ctx == 0 {
+			slots := p.Slots
+			if slots == 0 {
+				slots = 1
+			}
+			p.Ctx, p.CtxWhy = derivedContext(base, slots)
 		}
 	}
 
@@ -1215,8 +1348,8 @@ func LocalNotice(backend, model string) string {
 	// that writes a graph and one that spends hours producing prose, so it
 	// goes in the argv AND in the paragraph above it.
 	if n := contextTokenBudget(p.Ctx); n > 0 {
-		b.WriteString("Context slot: " + strconv.Itoa(p.Ctx) + " tokens, so chunks are capped at " +
-			"--token-budget " + strconv.Itoa(n) + " to fit it.\n")
+		b.WriteString("Context slot: " + strconv.Itoa(p.Ctx) + " tokens (" + p.CtxWhy +
+			"), so chunks are capped at --token-budget " + strconv.Itoa(n) + " to fit it.\n")
 	}
 	if a := p.ContextAdvice(); a != "" {
 		b.WriteString("\n" + a + "\n")
@@ -1251,29 +1384,26 @@ func StartOllama() (string, error) {
 		return alreadyRunning, nil
 	}
 	bin := Ollama()
-	if bin == "" {
-		return "", errNoOllama
+	route, err := ollamaRoute()
+	if err != nil {
+		// errNeedsRoot's "how" is the command the caller should show, which
+		// is the one useful thing to say about a route this process cannot
+		// take. The others have no route and so no command.
+		if NeedsRoot(err) {
+			return SudoStartOllama, err
+		}
+		return "", err
 	}
 
 	var how string
-	switch {
-	case unitEnabled("ollama.service", "--user"):
+	switch route {
+	case startedUserUnit:
 		// A per-user unit is the one route this process can take on its own:
 		// no privilege, and systemd keeps supervising the server after the
 		// board exits.
 		how = "systemctl --user start ollama"
 		_ = exec.Command("systemctl", "--user", "start", "ollama").Run()
 		noteOllamaStart(startedUserUnit, 0)
-
-	case unitExists("ollama.service"):
-		// A SYSTEM unit owns ollama on this machine. Starting a user unit
-		// instead would contend for the same port behind systemd's back, and a
-		// detached `ollama serve` would run a second server against a
-		// different model store — which is precisely the shape of confusion
-		// that makes an already-pulled model appear to have vanished. Neither
-		// is a thing to do silently, and the right command needs root, which
-		// this process does not have. Name it and stop.
-		return SudoStartOllama, errNeedsRoot
 
 	default:
 		how = bin + " serve (detached)"
@@ -1365,10 +1495,60 @@ func ollamaServerEnv(s OllamaSizing) []string {
 // rather than reconstructing it out of an error string.
 const SudoStartOllama = "sudo systemctl start ollama"
 
-// NeedsRoot reports whether StartOllama stopped because the right command
-// needs privileges this process has not got. The caller shows the command
-// instead of reporting a failure.
-func NeedsRoot(err error) bool { return err == errNeedsRoot }
+// NeedsRoot reports whether StartOllama — or CanStartOllama, or a precheck
+// that refused a job on its answer — stopped because the right command needs
+// privileges this process has not got. The caller shows the command instead
+// of reporting a failure.
+//
+// errors.Is rather than ==, because the refusal travels: a precheck wraps this
+// sentinel in a sentence about the job it is refusing, and the clipboard help
+// on the other end must still recognise it.
+func NeedsRoot(err error) bool { return errors.Is(err, errNeedsRoot) }
+
+// ollamaRoute is the decision StartOllama acts on, taken without acting on it:
+// which of the two routes this process could use to bring a local ollama up,
+// or the error saying it has none.
+//
+// It is a function rather than three cases inline because the answer is wanted
+// twice — once to start the server, and once to refuse a job that would
+// otherwise spend its whole run failing against a server nobody can start (see
+// CanStartOllama). A second copy of the switch is a second copy that drifts,
+// and the drift would be silent in exactly the direction that hurts: a job let
+// through because the refusal's idea of "startable" had aged.
+func ollamaRoute() (ollamaStartRoute, error) {
+	if Ollama() == "" {
+		return startedNot, errNoOllama
+	}
+	switch {
+	case unitEnabled("ollama.service", "--user"):
+		return startedUserUnit, nil
+	case unitExists("ollama.service"):
+		// A SYSTEM unit owns ollama on this machine. Starting a user unit
+		// instead would contend for the same port behind systemd's back, and a
+		// detached `ollama serve` would run a second server against a
+		// different model store — which is precisely the shape of confusion
+		// that makes an already-pulled model appear to have vanished. Neither
+		// is a thing to do silently, and the right command needs root, which
+		// this process does not have. Name it and stop.
+		return startedNot, errNeedsRoot
+	default:
+		return startedDetached, nil
+	}
+}
+
+// CanStartOllama reports whether this process could bring this machine's
+// ollama up if it were not already answering — and when it could not, the
+// error saying why, which NeedsRoot can read.
+//
+// It asks about the ROUTE and not about the port: a server that is down but
+// startable is the ordinary state between two jobs in a sweep, and answering
+// "no" for it would refuse every local job on a machine whose lifecycle works
+// exactly as designed. The caller pairs this with ProbeLocal's Reach — down
+// AND unstartable is the only combination that is hopeless.
+func CanStartOllama() error {
+	_, err := ollamaRoute()
+	return err
+}
 
 // unitExists asks systemd whether it knows a unit, without starting anything.
 // `systemctl cat` exits non-zero for a unit that does not exist, which is the
@@ -1446,8 +1626,8 @@ var (
 		"and starting it needs root")
 )
 
-// errStr is a string that is an error, so this file needs no errors import for
-// two sentinels.
+// errStr is a string that is an error, so a sentinel here is one line rather
+// than an errors.New in a var block nobody reads.
 type errStr string
 
 func (e errStr) Error() string { return string(e) }

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/dns/ggraphify/internal/board"
+	"github.com/dns/ggraphify/internal/globalgraph"
 	"github.com/dns/ggraphify/internal/graftstate"
 	"github.com/dns/ggraphify/internal/graphstate"
 	"github.com/dns/ggraphify/internal/jobs"
@@ -194,6 +195,99 @@ func graftExposureNote(i graftstate.Index) string {
 		"next extract will index one per source file as if it were source"
 }
 
+// globalGlyph is the shape the Global column leads with, in the same
+// vocabulary the state dot and the Graft column use: an empty ring is "not in
+// the global graph", a filled dot is "in it, and it has what this repository
+// has", a half-filled one is "in it, but carrying the previous extraction".
+func globalGlyph(m globalgraph.Member) string {
+	switch {
+	case !m.In:
+		return "○"
+	case m.Stale:
+		return "◐"
+	}
+	return "●"
+}
+
+// globalClass reuses the state colours: the three verdicts line up with
+// none / stale / fresh one for one.
+func globalClass(m globalgraph.Member) string {
+	switch {
+	case !m.In:
+		return "st-none"
+	case m.Stale:
+		return "st-stale"
+	}
+	return "st-fresh"
+}
+
+// globalWord is the long form, for tooltips and dialogs.
+func globalWord(m globalgraph.Member) string {
+	switch {
+	case !m.In:
+		return "not in the global graph"
+	case m.Stale:
+		return "in the global graph, stale"
+	}
+	return "in the global graph"
+}
+
+// globalCell is what the Global column renders: the shape, and the tag when
+// the repository was added under a name that is not its own. The tag is the
+// only handle `graphify global remove` accepts, so a row whose tag has
+// drifted from its directory name has to say so.
+func globalCell(m globalgraph.Member, name string) (text, class string) {
+	class = globalClass(m)
+	text = globalGlyph(m)
+	if m.In && m.Tag != "" && m.Tag != name {
+		text += " " + m.Tag
+	}
+	return text, class
+}
+
+// globalTooltip is the paragraph behind that glyph.
+func globalTooltip(r board.Row) string {
+	m := r.Global
+	var b strings.Builder
+	fmt.Fprintf(&b, "Global: %s", globalWord(m))
+	if !m.In {
+		if r.Graph.Nodes == 0 {
+			b.WriteString("\n        there is no graph here to add — extract or update this repository first")
+			return b.String()
+		}
+		b.WriteString("\n        `graphify global add` has never been run on this graph")
+		b.WriteString("\n        press m to add it, or open the Global screen (G)")
+		return b.String()
+	}
+	fmt.Fprintf(&b, "\n        tag %s", m.Tag)
+	if m.Nodes > 0 || m.Edges > 0 {
+		fmt.Fprintf(&b, "\n        contributed %d nodes, %d edges", m.Nodes, m.Edges)
+	}
+	if !m.AddedAt.IsZero() {
+		fmt.Fprintf(&b, "\n        merged %s", m.AddedAt.Format("2006-01-02 15:04"))
+	}
+	if m.Stale {
+		b.WriteString("\n        this repository's graph has been rebuilt since — the global graph " +
+			"still holds the previous extraction's nodes. Re-add it to catch up.")
+	}
+	return b.String()
+}
+
+// globalFact is the Global line in the detail pane's fact grid.
+func globalFact(m globalgraph.Member) string {
+	if !m.In {
+		return ""
+	}
+	parts := []string{globalWord(m), "tag " + m.Tag}
+	if m.Nodes > 0 {
+		parts = append(parts, fmt.Sprintf("%d nodes", m.Nodes))
+	}
+	if !m.AddedAt.IsZero() {
+		parts = append(parts, "merged "+board.Age(m.AddedAt))
+	}
+	return strings.Join(parts, " · ")
+}
+
 // commCell is the community count, with a marker when the names are still
 // graphify's placeholders — which is the difference between a graph that has
 // had the expensive labelling pass run over it and one that has not.
@@ -234,6 +328,25 @@ func jobCell(s *jobs.Snapshot) (text, class string) {
 	default:
 		return fmt.Sprintf("%s failed (%d)", s.Kind, s.Exit), "st-broken"
 	}
+}
+
+// jobRetryable reports whether a row in the jobs list carries its own Retry
+// button — which is the FAILED rows and only those.
+//
+// A failure is the one status where re-running the identical command line is
+// the obvious next action, and where the click is worth putting in the row
+// rather than behind a selection: a sweep over the board finishes with a
+// handful of red rows among hundreds, and retrying them one at a time meant
+// select, move to the toolbar, click, select the next.
+//
+// Succeeded is excluded because re-running it is a fresh decision about
+// spending money or hours, which belongs at the board with its cost gate, not
+// on a one-click button. Cancelled is excluded because somebody stopped that
+// job on purpose and a button offering to undo it in the same place they
+// stopped it invites the accident. Both are still reachable from the toolbar
+// Retry, which acts on any finished job.
+func jobRetryable(s *jobs.Snapshot) bool {
+	return s != nil && s.Status == jobs.Failed
 }
 
 // shortDur renders an elapsed time in as few characters as it can: a running

@@ -9,7 +9,7 @@ import (
 	"github.com/dns/ggraphify/internal/gfy"
 )
 
-// The OpenCode Go gateway this board runs on 127.0.0.1:11437 is served by the
+// The OpenCode gateway this board runs on 127.0.0.1:11437 is served by the
 // GUI process itself (gfy.StartOpenCodeProxy). That endpoint is genuinely
 // useful to other tools — a fleet-wide `graft build --deep` can be pointed at
 // it through ~/.graphify/providers.json, and on this machine one has been —
@@ -47,7 +47,8 @@ func (a *App) holdForProxy() bool {
 // confirmProxyQuit is the dialog. It names the endpoint, the traffic and what
 // stops, because "something may break" is not a thing anybody can decide on.
 func (a *App) confirmProxyQuit(base string, requests int, last time.Time) {
-	body := "This board is serving the OpenCode Go gateway at " + base + " itself, and it has " +
+	body := "This board is serving the OpenCode gateway at " + base + " itself — both plans' " +
+		"paths, Go on /v1 and Zen on /zen/v1 — and it has " +
 		"forwarded " + plural(requests, "request", "requests") + " — the last one " +
 		shortDur(time.Since(last)) + " ago.\n\n" +
 		"Quitting stops that endpoint. Anything pointed at it — another tool's " +

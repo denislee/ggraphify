@@ -27,7 +27,7 @@ func TestTheProxyAddsWhatTheGatewayDemands(t *testing.T) {
 	defer upstream.Close()
 	t.Setenv(OpenCodeBaseURLVar, upstream.URL+"/v1")
 
-	base, err := StartOpenCodeProxy()
+	base, err := StartOpenCodeProxy(OpenCodeBackend)
 	if err != nil {
 		t.Fatalf("StartOpenCodeProxy: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestTheProxyAddsWhatTheGatewayDemands(t *testing.T) {
 		t.Error("the session id moved between requests")
 	}
 	// Idempotent: a second submit reuses the running proxy.
-	if again, err := StartOpenCodeProxy(); err != nil || again != base {
+	if again, err := StartOpenCodeProxy(OpenCodeBackend); err != nil || again != base {
 		t.Errorf("StartOpenCodeProxy again = %q, %v; want the same proxy", again, err)
 	}
 }
@@ -93,7 +93,7 @@ func TestTheProxyForwardsNothingButTheGatewaysAPI(t *testing.T) {
 	defer upstream.Close()
 	t.Setenv(OpenCodeBaseURLVar, upstream.URL+"/v1")
 
-	base, err := StartOpenCodeProxy()
+	base, err := StartOpenCodeProxy(OpenCodeBackend)
 	if err != nil {
 		t.Fatalf("StartOpenCodeProxy: %v", err)
 	}
@@ -120,5 +120,73 @@ func TestTheProxyForwardsNothingButTheGatewaysAPI(t *testing.T) {
 	b, _ := io.ReadAll(probe.Body)
 	if !strings.HasPrefix(string(b), openCodeProbeBody) {
 		t.Errorf("probe answered %q", b)
+	}
+}
+
+// One loopback port, two plans, and the path is what tells them apart. This
+// is the test for the claim the provider entries make: a Zen entry points at
+// /zen/v1 and its traffic reaches the Zen gateway, a Go entry points at /v1
+// and reaches the Go one, and neither can be routed to the other by anything
+// the client sends.
+func TestTheProxyKeepsTheTwoPlansApartByPath(t *testing.T) {
+	t.Setenv(OpenCodePortVar, "0")
+	resetProxy(t)
+
+	seen := make(chan string, 4)
+	mk := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen <- name + " " + r.URL.Path
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		}))
+	}
+	goGW, zenGW := mk("go"), mk("zen")
+	defer goGW.Close()
+	defer zenGW.Close()
+	t.Setenv(OpenCodeBaseURLVar, goGW.URL+"/v1")
+	t.Setenv(OpenCodeZenBaseURLVar, zenGW.URL+"/v1")
+
+	goBase, err := StartOpenCodeProxy(OpenCodeBackend)
+	if err != nil {
+		t.Fatalf("StartOpenCodeProxy(go): %v", err)
+	}
+	zenBase, err := StartOpenCodeProxy(OpenCodeZenBackend)
+	if err != nil {
+		t.Fatalf("StartOpenCodeProxy(zen): %v", err)
+	}
+	if !strings.HasSuffix(zenBase, "/zen/v1") {
+		t.Fatalf("zen base = %q, want the plan's own path on the proxy", zenBase)
+	}
+	if strings.TrimSuffix(goBase, "/v1") != strings.TrimSuffix(zenBase, "/zen/v1") {
+		t.Fatalf("the plans bound different proxies: %q and %q", goBase, zenBase)
+	}
+
+	for _, base := range []string{goBase, zenBase} {
+		resp, err := http.Post(base+"/chat/completions", "application/json", // #nosec G107 -- loopback, composed here
+			bytes.NewBufferString(`{"model":"m"}`))
+		if err != nil {
+			t.Fatalf("through %s: %v", base, err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	got := []string{<-seen, <-seen}
+	want := []string{"go /v1/chat/completions", "zen /v1/chat/completions"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("request %d reached %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// The probe says which plans this proxy can serve, because a board that
+	// inherited an older ggraphify's proxy would otherwise write a Zen entry
+	// pointing at a path that 404s every chunk.
+	probe, err := http.Get(strings.TrimSuffix(goBase, "/v1") + openCodeProbePath) // #nosec G107 -- loopback, composed here
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = probe.Body.Close() }()
+	b, _ := io.ReadAll(probe.Body)
+	if !strings.Contains(string(b), "plans=go,zen") {
+		t.Errorf("probe answered %q, want it to advertise both plans", b)
 	}
 }

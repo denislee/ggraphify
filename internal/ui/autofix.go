@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,13 +29,16 @@ import (
 //     time and nothing else. If no local server answers, the loop falls back
 //     to the free plan (AST rebuild, clustering, report) and leaves the
 //     semantic half undone rather than reaching for a billed backend.
-//   - It repairs both indexes, but only where repairing is unattended work.
-//     graft's own index under <repo>/graft goes stale exactly the way
+//   - It repairs all three indexes, but only where repairing is unattended
+//     work. graft's own index under <repo>/graft goes stale exactly the way
 //     graphify's graph does, and `graft build` fixes it for free — so a stale
-//     or unreadable one is rebuilt in the same chain. What the loop will not
-//     do is BUILD a graft index where there has never been one (that writes a
-//     directory into somebody's checkout and appends to its .gitignore) or
-//     run graft's --deep pass (that is the deep sweep, with its own gate).
+//     or unreadable one is rebuilt in the same chain. So does the global
+//     graph's copy of a repository, which `graphify global add` re-merges for
+//     free. What the loop will not do is BUILD a graft index where there has
+//     never been one (that writes a directory into somebody's checkout and
+//     appends to its .gitignore), run graft's --deep pass (that is the deep
+//     sweep, with its own gate), or JOIN a repository to the global graph
+//     (which repositories belong there is a judgement, not a defect).
 //   - It gives up. A repository whose defects survive the fix is tried a
 //     bounded number of times and then left alone, with one line in the log
 //     saying so. A loop that retried forever would be a machine that is busy
@@ -65,6 +69,11 @@ func (a *App) autoFixTick() {
 		// next scan is 30 seconds away and nothing is lost by waiting for it.
 		return
 	}
+
+	// The fleet pass runs alongside the repository one rather than inside it:
+	// its subjects are directories and deleted members, neither of which is a
+	// candidate, and it has its own in-flight accounting.
+	a.fleetTick(set, a.allRows())
 
 	cands := a.autoFixCandidates()
 	if len(cands) == 0 {
@@ -99,6 +108,13 @@ func (a *App) autoFixTick() {
 // depending on what was typed in a text field.
 func (a *App) autoFixCandidates() []autofix.Candidate {
 	rows := a.allRows()
+	// Which roots the user nominated as fleets, as a set — the fact that
+	// turns "not in the global graph" from a choice into a defect. Resolved
+	// once per tick rather than per row: Fleets cleans and expands paths.
+	fleets := map[string]bool{}
+	for _, root := range a.opts.Store.Settings().Fleets() {
+		fleets[root] = true
+	}
 	out := make([]autofix.Candidate, 0, len(rows))
 	for _, r := range rows {
 		job := a.jobFor(r.Path)
@@ -115,12 +131,14 @@ func (a *App) autoFixCandidates() []autofix.Candidate {
 			busy = a.settling[r.Path]
 		}
 		out = append(out, autofix.Candidate{
-			Path:     r.Path,
-			Name:     r.Name,
-			Graph:    r.Graph,
-			Graft:    r.Graft,
-			Excluded: r.Excluded,
-			Busy:     busy,
+			Path:       r.Path,
+			Name:       r.Name,
+			Graph:      r.Graph,
+			Graft:      r.Graft,
+			Global:     r.Global,
+			Enrollable: fleets[filepath.Dir(r.Path)] && !r.NoGit,
+			Excluded:   r.Excluded,
+			Busy:       busy,
 		})
 	}
 	return out
@@ -151,6 +169,18 @@ func autoFixPolicy(set store.Settings) autofix.Policy {
 	} else {
 		applog.Debugf("auto-fix: graft indexes left alone — %s", why)
 	}
+
+	// The third index. Unlike graft this is a preference and nothing else:
+	// `graphify global add` is the same binary every other step runs, so there
+	// is no machine fact to resolve — only whether the user wants the loop
+	// touching the set of repositories they assembled by hand.
+	pol.Global = set.AutoFixGlobal()
+
+	// The membership half, and the workspace federations that go with it.
+	// Also a preference and nothing else — but a narrower one than it looks,
+	// because store.Settings.Fleets bounds what it can ever touch to the
+	// roots the user nominated.
+	pol.Enroll = set.AutoFixEnroll()
 
 	if !set.AutoFixLocal() {
 		return pol
@@ -198,9 +228,18 @@ func (a *App) runAutoFix(actions []autofix.Action, pol autofix.Policy) {
 
 		total := len(act.Plan.Steps)
 		steps := make([]jobs.ChainStep, 0, total)
+		global := false
 		for n, s := range act.Plan.Steps {
-			p := a.params(*row)
+			p := a.paramsFor(s.Kind, *row)
 			s.Apply(&p)
+			if gfy.Global(s.Kind) {
+				// The same tag the Global screen would have sent. Without it
+				// `global add` would merge this graph under a name of its own
+				// choosing and the manifest would grow a second entry for a
+				// repository that already has one.
+				p.Tag = globalTag(*row)
+				global = true
+			}
 			if act.Local && s.Cost() == gfy.Metered {
 				// The whole point of the loop: the step that would have been
 				// a bill is a local run instead. The sizing has to be redone
@@ -234,6 +273,16 @@ func (a *App) runAutoFix(actions []autofix.Action, pol autofix.Policy) {
 			}
 			a.autofix.Done(act, errText)
 			idle(func() {
+				if global {
+					// The memo is keyed on the manifest's mtime and size, so
+					// it would catch up on its own — but not before the
+					// refresh below reads it, which is how a re-added
+					// repository keeps its stale chip for one more tick.
+					a.globals.Invalidate()
+					if a.globalPane != nil {
+						a.globalPane.reload()
+					}
+				}
 				if res.Err != nil {
 					applog.Errorf("auto-fix %s: stopped after %d/%d — %v",
 						name, res.Ran, res.Total, res.Err)

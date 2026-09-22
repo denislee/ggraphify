@@ -100,7 +100,9 @@ type Options struct {
 	Backend       string
 	Model         string
 	OpenCodeModel string
-	ClaudeAccount string
+	// OpenCodeZenModel is the same for the Zen plan, which keeps its own.
+	OpenCodeZenModel string
+	ClaudeAccount    string
 	// Version is graphify's own probe result.
 	Version gfy.Version
 }
@@ -142,7 +144,10 @@ func graphifyCheck(opts Options) Check {
 
 func backendCheck(opts Options) Check {
 	model := opts.Model
-	if gfy.EffectiveBackend(opts.Backend) == gfy.OpenCodeBackend {
+	switch gfy.EffectiveBackend(opts.Backend) {
+	case gfy.OpenCodeZenBackend:
+		model = opts.OpenCodeZenModel
+	case gfy.OpenCodeBackend:
 		model = opts.OpenCodeModel
 	}
 	eff, ready, why := gfy.BackendVerdict(opts.Backend, model)

@@ -158,7 +158,7 @@ func run() int {
 		return 2
 	}
 
-	cost := gfy.CostOf(*kind)
+	cost := gfy.CostFor(*kind, p.Backend)
 	fmt.Fprintf(os.Stderr, "# %s (%s)\n%s\n", gfy.Title(*kind), cost, gfy.Quote(argv))
 	if *dry {
 		return 0
@@ -207,7 +207,14 @@ func run() int {
 		func(format string, args ...any) { fmt.Fprintf(os.Stderr, "# "+format+"\n", args...) },
 	)
 	r := jobs.New(jobs.Options{
-		Precheck: jobs.RequireGraph,
+		// The same pair the board queues behind, with this tool's own
+		// -auto-ollama in place of the board's setting: a headless run that
+		// spends an hour failing against a server nobody can start is the
+		// case for refusing early, not against it.
+		Precheck: jobs.Checks(
+			jobs.RequireGraph,
+			jobs.RequireLocalServer(func() bool { return *autoOll }),
+		),
 		LocalLease: func(j *jobs.Job) jobs.Lease {
 			if j == nil || !j.Local || gfy.ArgvBackend(j.Argv) != gfy.OllamaBackend {
 				return nil

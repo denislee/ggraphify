@@ -45,11 +45,11 @@ func (a *App) checkBackend() {
 	a.backendAt = time.Now()
 	set := a.opts.Store.Settings()
 	backend, model := set.Backend, set.Model
-	if gfy.EffectiveBackend(backend) == gfy.OpenCodeBackend {
-		// This backend's model lives in its own setting, and it is half of
-		// what its readiness means — a model the plan will not serve is as
-		// broken a pin as a missing key.
-		model = set.OpenCodeModel
+	if eff := gfy.EffectiveBackend(backend); gfy.IsOpenCodeBackend(eff) {
+		// This backend's model lives in its own setting, one per plan, and it
+		// is half of what its readiness means — a model the plan will not
+		// serve is as broken a pin as a missing key.
+		model = set.OpenCodeModelFor(eff)
 	}
 	go func() {
 		eff, ready, why := gfy.BackendVerdict(backend, model)

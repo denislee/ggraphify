@@ -21,7 +21,7 @@ type keyBinding struct {
 var keyBindings = []keyBinding{
 	{"j / ↓", "Next repository", "Moving"},
 	{"k / ↑", "Previous repository", "Moving"},
-	{"g / G", "First / last repository", "Moving"},
+	{"g", "First repository", "Moving"},
 	{"Enter", "Open the most useful detail page for this row", "Moving"},
 	{"Ctrl+F / Ctrl+B", "Page down / page up", "Moving"},
 	{"/", "Filter repositories", "Moving"},
@@ -44,6 +44,7 @@ var keyBindings = []keyBinding{
 	{"e", "Export graph.html", "Building"},
 	{"w", "Export wiki", "Building"},
 	{"W", "Start/stop `graphify watch` on this repository", "Building"},
+	{"m", "Add this repository to the global graph, or take it out again", "Building"},
 	{"p", "Pause / resume this row's running job", "Building"},
 	{"x", "Cancel this row's running job", "Building"},
 
@@ -55,7 +56,7 @@ var keyBindings = []keyBinding{
 	{"J", "All jobs, across every repository", "Pages"},
 	{"U", "Usage tab: what agents actually ran, every repository", "Pages"},
 	{"y", "Usage tab: copy the window as a markdown briefing for an agent", "Pages"},
-	{"G", "Cross-repo global graph", "Pages"},
+	{"G", "Global graph: which repositories are in the cross-repo graph, and adding or removing them in bulk", "Pages"},
 
 	{"v", "Select mode, for batch actions", "Batch"},
 	{"Space", "Add / remove this row from the batch", "Batch"},
@@ -135,14 +136,25 @@ func (a *App) installKeys() {
 
 // dispatchKey routes one plain keystroke. Returning true stops propagation.
 func (a *App) dispatchKey(keyval uint) bool {
-	// The Usage page replaces the board, so the keys that act on a row would
-	// be acting on something nobody can see. Only the handful that are about
-	// the window itself stay live there; everything else is inert until U or
-	// Escape brings the board back.
-	if a.onUsagePage() {
+	// The Usage and Global pages replace the board, so the keys that act on a
+	// row would be acting on something nobody can see. Only the handful that
+	// are about the window itself stay live there; everything else is inert
+	// until Escape — or the page's own key — brings the board back.
+	if !a.onBoardPage() {
 		switch keyval {
-		case gdk.KEY_U, gdk.KEY_Escape:
+		case gdk.KEY_Escape:
 			a.setMainPage(pageBoard)
+		case gdk.KEY_U:
+			a.showUsage()
+		case gdk.KEY_G:
+			a.showGlobal()
+		case gdk.KEY_F:
+			// The Global screen carries the same folder filter the board
+			// does, so the same key steps through it there.
+			if !a.onGlobalPage() {
+				return false
+			}
+			a.globalPane.cycleFolder()
 		case gdk.KEY_t:
 			a.cycleScheme()
 		case gdk.KEY_comma:
@@ -152,7 +164,9 @@ func (a *App) dispatchKey(keyval uint) bool {
 		case gdk.KEY_J:
 			a.showJobs()
 		case gdk.KEY_y:
-			a.usagePane.copyReport()
+			if a.onUsagePage() {
+				a.usagePane.copyReport()
+			}
 		default:
 			return false
 		}
@@ -197,6 +211,8 @@ func (a *App) dispatchKey(keyval uint) bool {
 		a.actExportWiki()
 	case gdk.KEY_W:
 		a.actWatch()
+	case gdk.KEY_m:
+		a.actGlobalToggle()
 	case gdk.KEY_p:
 		a.pauseCurrent()
 	case gdk.KEY_x:

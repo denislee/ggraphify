@@ -29,6 +29,10 @@ type Buf struct {
 	cap     int
 	dropped int // lines evicted off the front, for the "…N lines elided" note
 	gen     uint64
+	// pendingCR remembers a chunk that ended on a carriage return, so a CRLF
+	// split across two writes is still read as one line terminator rather
+	// than as a redraw of the line it terminates.
+	pendingCR bool
 }
 
 // New returns a buffer holding at most capBytes. A non-positive cap uses
@@ -59,10 +63,59 @@ func New(capBytes int) *Buf {
 func (b *Buf) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.buf = append(b.buf, p...)
+	n := len(p)
 	b.gen++
+
+	// A carriage return is a redraw, not text.
+	//
+	// graft's --deep pass reports progress the way a terminal expects it: one
+	// "\rreading concepts 41/444: some/file.go" per file, no newline anywhere
+	// in the stream. Appended verbatim, a 40-minute run over a large checkout
+	// is megabytes of one single line — and a single line is exactly what the
+	// eviction below cannot trim, so it used to throw the ENTIRE buffer away
+	// on overflow. That is how job 203 (`graft build --deep` on pulumi, exit
+	// 1 after 42 minutes) came to be recorded with no log at all: not one
+	// byte of the failure survived, not even the "$ …" command header, and
+	// the board could only report the command back. A cancelled run of the
+	// same shape kept nothing but its own 60-byte cancellation notice.
+	//
+	// So the return is honoured here the way a terminal honours it: it erases
+	// the unterminated line it returns to. A progress stream then occupies
+	// one line rather than the whole budget, the header and every real line
+	// of output stay put, and Tail/LastLine/FirstErrorLine downstream see
+	// something a human can read instead of one megabyte-long "line".
+	if b.pendingCR {
+		b.pendingCR = false
+		// "\r\n" split across two writes: a terminator, so leave the line.
+		if len(p) == 0 || p[0] != '\n' {
+			b.eraseLine()
+		}
+	}
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\r')
+		if i < 0 {
+			b.buf = append(b.buf, p...)
+			break
+		}
+		b.buf = append(b.buf, p[:i]...)
+		p = p[i+1:]
+		switch {
+		case len(p) == 0:
+			// Decided on the next write, which knows whether an '\n' follows.
+			b.pendingCR = true
+		case p[0] == '\n':
+			b.buf = append(b.buf, '\n')
+			p = p[1:]
+			continue
+		default:
+			b.eraseLine()
+			continue
+		}
+		break
+	}
+
 	if len(b.buf) <= b.cap {
-		return len(p), nil
+		return n, nil
 	}
 	// Trim to the first newline at or after the low-water mark, so the buffer
 	// always starts at a line boundary and the UI never renders half a line.
@@ -72,15 +125,29 @@ func (b *Buf) Write(p []byte) (int, error) {
 	}
 	if i := bytes.IndexByte(b.buf[over:], '\n'); i >= 0 {
 		over += i + 1
-	} else {
-		over = len(b.buf) // the whole thing is one enormous line; drop it
 	}
+	// No newline at or after the mark: what is retained is one enormous line,
+	// and it is cut at the mark rather than dropped whole. The newest bytes
+	// are the ones worth keeping — a traceback's last frame, the line that
+	// says why the run failed — and discarding them left the reader with an
+	// empty log, which is strictly less than half a line.
 	b.dropped += bytes.Count(b.buf[:over], []byte{'\n'})
 	// Copy down rather than reslice: reslicing keeps the original backing
 	// array alive forever, which defeats the point of a bounded buffer.
-	n := copy(b.buf, b.buf[over:])
-	b.buf = b.buf[:n]
-	return len(p), nil
+	m := copy(b.buf, b.buf[over:])
+	b.buf = b.buf[:m]
+	return n, nil
+}
+
+// eraseLine drops the unterminated line at the end of the buffer — what a
+// carriage return does to the line it returns to, once something is written
+// over it. Caller holds mu.
+func (b *Buf) eraseLine() {
+	if i := bytes.LastIndexByte(b.buf, '\n'); i >= 0 {
+		b.buf = b.buf[:i+1]
+		return
+	}
+	b.buf = b.buf[:0]
 }
 
 // trimFraction is how much of the buffer an eviction reclaims, as a divisor:

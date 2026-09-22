@@ -3,13 +3,14 @@ package gfy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // isolateHome points ProvidersPath at a scratch directory and clears every
@@ -96,8 +97,8 @@ func TestTheBaseURLOverrideMovesTheGatewayNotTheEntry(t *testing.T) {
 	isolateHome(t)
 	t.Setenv(OpenCodeBaseURLVar, "https://gateway.example.test/v1")
 
-	if got := OpenCodeUpstream(); got != "https://gateway.example.test/v1" {
-		t.Errorf("OpenCodeUpstream() = %q, want the override", got)
+	if got := OpenCodeUpstream(OpenCodeBackend); got != "https://gateway.example.test/v1" {
+		t.Errorf("OpenCodeUpstream(OpenCodeBackend) = %q, want the override", got)
 	}
 	if _, _, err := EnsureOpenCodeProvider(OpenCodeBackend, ""); err != nil {
 		t.Fatalf("EnsureOpenCodeProvider: %v", err)
@@ -139,7 +140,7 @@ func TestEnsureOpenCodeProviderKeepsOtherProvidersAndTheUsersOwnEdits(t *testing
 	// field is moved to the registered model, not just the name: they are all
 	// derived from it, so leaving one on the previous model's value is a file
 	// that genuinely does need rewriting and would not test what this asserts.
-	kimi, ok := OpenCodeModelByID("kimi-k2.7-code")
+	kimi, ok := OpenCodeModelByID(OpenCodeBackend, "kimi-k2.7-code")
 	if !ok {
 		t.Fatal("kimi-k2.7-code is not in the catalogue")
 	}
@@ -168,7 +169,7 @@ func TestEnsureOpenCodeProviderKeepsOtherProvidersAndTheUsersOwnEdits(t *testing
 	if got, _ := cfg["default_model"].(string); got != "mimo-v2.5" {
 		t.Errorf("default_model = %q, want the chosen model", got)
 	}
-	want, ok := OpenCodeModelByID("mimo-v2.5")
+	want, ok := OpenCodeModelByID(OpenCodeBackend, "mimo-v2.5")
 	if !ok {
 		t.Fatal("mimo-v2.5 is not in the catalogue")
 	}
@@ -281,7 +282,7 @@ func resetProxy(t *testing.T) {
 	t.Helper()
 	reset := func() {
 		proxyState.Lock()
-		proxyState.base, proxyState.session = "", ""
+		proxyState.root, proxyState.base, proxyState.session = "", "", ""
 		proxyState.Unlock()
 	}
 	reset()
@@ -290,19 +291,22 @@ func resetProxy(t *testing.T) {
 
 func resetCatalog(t *testing.T) {
 	t.Helper()
-	catalogCache.Lock()
-	catalogCache.models, catalogCache.fetched = nil, time.Time{}
-	catalogCache.Unlock()
-	t.Cleanup(func() {
+	clear := func() {
 		catalogCache.Lock()
-		catalogCache.models, catalogCache.fetched = nil, time.Time{}
+		catalogCache.byPlan = nil
 		catalogCache.Unlock()
-	})
+		openCodeVerdicts.Range(func(k, _ any) bool {
+			openCodeVerdicts.Delete(k)
+			return true
+		})
+	}
+	clear()
+	t.Cleanup(clear)
 }
 
 func TestTheBakedCatalogueCoversTheDefaultModel(t *testing.T) {
 	resetCatalog(t)
-	m, ok := OpenCodeModelByID(DefaultOpenCodeModel)
+	m, ok := OpenCodeModelByID(OpenCodeBackend, DefaultOpenCodeModel)
 	if !ok {
 		t.Fatalf("%q is not in the catalogue", DefaultOpenCodeModel)
 	}
@@ -311,7 +315,7 @@ func TestTheBakedCatalogueCoversTheDefaultModel(t *testing.T) {
 	}
 	// Cheapest first among the models whose price is published, and the
 	// unpriced ones last: that order is what makes the dropdown meaningful.
-	all := OpenCodeCatalog()
+	all := OpenCodeCatalog(OpenCodeBackend)
 	for i := 1; i < len(all); i++ {
 		if !all[i-1].Priced && all[i].Priced {
 			t.Fatalf("an unpriced model sorts before a priced one: %s then %s", all[i-1].ID, all[i].ID)
@@ -344,7 +348,7 @@ func TestRefreshOpenCodeCatalogTakesAvailabilityFromTheGateway(t *testing.T) {
 	ModelsDevURL = md.URL
 	t.Cleanup(func() { ModelsDevURL = oldMD })
 
-	got, err := RefreshOpenCodeCatalog(context.Background())
+	got, err := RefreshOpenCodeCatalog(context.Background(), OpenCodeBackend)
 	if err != nil {
 		t.Fatalf("RefreshOpenCodeCatalog: %v", err)
 	}
@@ -358,14 +362,14 @@ func TestRefreshOpenCodeCatalogTakesAvailabilityFromTheGateway(t *testing.T) {
 	if got[2].ID != "unlisted-model" || got[2].Priced {
 		t.Errorf("an unpriced served model is mishandled: %+v", got[2])
 	}
-	if _, ok := OpenCodeModelByID("phantom-model"); ok {
+	if _, ok := OpenCodeModelByID(OpenCodeBackend, "phantom-model"); ok {
 		t.Error("a models.dev model the gateway does not serve reached the catalogue")
 	}
 
 	// A second call inside the TTL must not repeat either fetch.
 	gw.Close()
 	md.Close()
-	if _, err := RefreshOpenCodeCatalog(context.Background()); err != nil {
+	if _, err := RefreshOpenCodeCatalog(context.Background(), OpenCodeBackend); err != nil {
 		t.Errorf("a cached refresh went back to the network: %v", err)
 	}
 }
@@ -378,14 +382,14 @@ func TestRefreshOpenCodeCatalogKeepsTheBakedListWhenTheGatewayCannotBeReached(t 
 	defer gw.Close()
 	t.Setenv(OpenCodeBaseURLVar, gw.URL+"/v1")
 
-	got, err := RefreshOpenCodeCatalog(context.Background())
+	got, err := RefreshOpenCodeCatalog(context.Background(), OpenCodeBackend)
 	if err == nil {
 		t.Fatal("want the fetch error reported")
 	}
 	if len(got) != len(openCodeCatalog) {
 		t.Errorf("got %d models, want the baked-in %d", len(got), len(openCodeCatalog))
 	}
-	if _, ok := OpenCodeModelByID(DefaultOpenCodeModel); !ok {
+	if _, ok := OpenCodeModelByID(OpenCodeBackend, DefaultOpenCodeModel); !ok {
 		t.Error("a failed refresh emptied the catalogue")
 	}
 }
@@ -408,20 +412,20 @@ func TestOpenCodeReadyRefusesAModelTheGatewayDoesNotServe(t *testing.T) {
 	t.Cleanup(func() { ModelsDevURL = oldMD })
 
 	// Before a live list exists, nothing here can say a model is wrong.
-	if ok, why := OpenCodeReady("ox-alpha-free"); !ok {
+	if ok, why := OpenCodeReady(OpenCodeBackend, "ox-alpha-free"); !ok {
 		t.Fatalf("refused against the baked catalogue: %s", why)
 	}
-	if _, err := RefreshOpenCodeCatalog(context.Background()); err != nil {
+	if _, err := RefreshOpenCodeCatalog(context.Background(), OpenCodeBackend); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	ok, why := OpenCodeReady("ox-alpha-free")
+	ok, why := OpenCodeReady(OpenCodeBackend, "ox-alpha-free")
 	if ok {
 		t.Fatal("a model the gateway does not serve was reported ready")
 	}
 	if !strings.Contains(why, "ox-alpha-free") || !strings.Contains(why, "not supported") {
 		t.Errorf("the refusal does not explain itself: %s", why)
 	}
-	if ok, why := OpenCodeReady("served-model"); !ok {
+	if ok, why := OpenCodeReady(OpenCodeBackend, "served-model"); !ok {
 		t.Errorf("a served model was refused: %s", why)
 	}
 }
@@ -429,25 +433,25 @@ func TestOpenCodeReadyRefusesAModelTheGatewayDoesNotServe(t *testing.T) {
 func TestOpenCodeModelForSaysWhereTheAnswerCameFrom(t *testing.T) {
 	resetCatalog(t)
 
-	m, origin := OpenCodeModelFor(nil, "")
+	m, origin := OpenCodeModelFor(OpenCodeBackend, nil, "")
 	if m.ID != DefaultOpenCodeModel || !strings.Contains(origin, "default") {
 		t.Errorf("blank = %q from %q, want the board's default", m.ID, origin)
 	}
 
-	m, origin = OpenCodeModelFor(Env{OpenCodeModelVar: "kimi-k2.6"}, "")
+	m, origin = OpenCodeModelFor(OpenCodeBackend, Env{OpenCodeModelVar: "kimi-k2.6"}, "")
 	if m.ID != "kimi-k2.6" || !strings.Contains(origin, OpenCodeModelVar) {
 		t.Errorf("overlay = %q from %q, want the overlay's model", m.ID, origin)
 	}
 
 	// The flag wins over the overlay, because `--model` wins inside graphify.
-	m, _ = OpenCodeModelFor(Env{OpenCodeModelVar: "kimi-k2.6"}, "mimo-v2.5")
+	m, _ = OpenCodeModelFor(OpenCodeBackend, Env{OpenCodeModelVar: "kimi-k2.6"}, "mimo-v2.5")
 	if m.ID != "mimo-v2.5" {
 		t.Errorf("model setting = %q, want it to win over the overlay", m.ID)
 	}
 
 	// An id this build does not know is passed through, not refused: the
 	// gateway is the only thing that can say whether it exists.
-	m, origin = OpenCodeModelFor(nil, "some-model-shipped-tomorrow")
+	m, origin = OpenCodeModelFor(OpenCodeBackend, nil, "some-model-shipped-tomorrow")
 	if m.ID != "some-model-shipped-tomorrow" || !strings.Contains(origin, "catalogue") {
 		t.Errorf("unknown = %q from %q, want it passed through with a caveat", m.ID, origin)
 	}
@@ -457,7 +461,7 @@ func TestOpenCodeOutputBudgetAsksForWhatTheModelWillActuallyGenerate(t *testing.
 	// The case that motivated the whole function: a chunk of 60_000 tokens of
 	// corpus answers at roughly six tenths of what it read, so a cap of
 	// 16_384 truncates it. This model allows 384_000 and the entry must say so.
-	flash, ok := OpenCodeModelByID("deepseek-v4.1-flash")
+	flash, ok := OpenCodeModelByID(OpenCodeBackend, "deepseek-v4.1-flash")
 	if !ok {
 		t.Fatal("deepseek-v4.1-flash is not in the catalogue")
 	}
@@ -566,7 +570,7 @@ func TestPreflightRefusesAModelTheGatewayWillNotAnswer(t *testing.T) {
 	}
 
 	// And it reaches the readiness line the confirm dialog prints.
-	if ok, why := OpenCodeReady("sulky-model"); ok || !strings.Contains(why, "Internal server error") {
+	if ok, why := OpenCodeReady(OpenCodeBackend, "sulky-model"); ok || !strings.Contains(why, "Internal server error") {
 		t.Errorf("OpenCodeReady = %v, %q; want the cached refusal", ok, why)
 	}
 
@@ -587,7 +591,222 @@ func TestAnUnreachableGatewayIsNotAVerdictAboutTheModel(t *testing.T) {
 	if err := PreflightOpenCode(OpenCodeBackend, "some-model"); err != nil {
 		t.Errorf("an unreachable gateway refused the run: %v", err)
 	}
-	if known, _, _ := OpenCodeVerdict("some-model"); known {
+	if known, _, _ := OpenCodeVerdict(OpenCodeBackend, "some-model"); known {
 		t.Error("a network failure was cached as a verdict about the model")
+	}
+}
+
+// Zen's catalogue comes from Zen's gateway and Zen's models.dev provider, and
+// a plan with free models defaults to one of them. This is the whole point of
+// the plan existing: an extraction that costs nothing is the one worth
+// falling back to when nobody has chosen.
+func TestTheZenPlanReadsItsOwnCatalogueAndDefaultsToAFreeModel(t *testing.T) {
+	isolateHome(t)
+	resetCatalog(t)
+
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"paid-model"},{"id":"free-model"}]}`))
+	}))
+	defer gw.Close()
+	md := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"opencode-go":{"models":{"paid-model":{"name":"Not This One","cost":{"input":99,"output":99},"limit":{"context":1000,"output":100}}}},
+			"opencode":{"models":{
+				"paid-model":{"name":"Paid","cost":{"input":1,"output":3},"limit":{"context":200000,"output":8192}},
+				"free-model":{"name":"Free","cost":{"input":0,"output":0},"limit":{"context":250000,"output":16384}}}}}`))
+	}))
+	defer md.Close()
+	t.Setenv(OpenCodeZenBaseURLVar, gw.URL+"/v1")
+	oldMD := ModelsDevURL
+	ModelsDevURL = md.URL
+	t.Cleanup(func() { ModelsDevURL = oldMD })
+
+	// Before the gateway has answered, Zen claims nothing: no baked-in list,
+	// so no model ids this build invented.
+	if got := OpenCodeCatalog(OpenCodeZenBackend); len(got) != 0 {
+		t.Fatalf("Zen started with %d baked-in models, want none: %+v", len(got), got)
+	}
+	if got := DefaultModelFor(OpenCodeZenBackend); got != "" {
+		t.Errorf("DefaultModelFor(zen) = %q before any catalogue, want no claim", got)
+	}
+
+	got, err := RefreshOpenCodeCatalog(context.Background(), OpenCodeZenBackend)
+	if err != nil {
+		t.Fatalf("RefreshOpenCodeCatalog(zen): %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "free-model" {
+		t.Fatalf("Zen catalogue = %+v, want the free model first", got)
+	}
+	if !got[0].IsFree() || !strings.Contains(got[0].Label(), "free") {
+		t.Errorf("the free model is not labelled free: %q", got[0].Label())
+	}
+	// Zen's prices, not Go's: the same id is published under both providers
+	// and reading the wrong one puts a number on screen nobody is charged.
+	if got[1].Input != 1 {
+		t.Errorf("paid-model priced at %v, want Zen's own price", got[1].Input)
+	}
+	if want := "free-model"; DefaultModelFor(OpenCodeZenBackend) != want {
+		t.Errorf("DefaultModelFor(zen) = %q, want %q", DefaultModelFor(OpenCodeZenBackend), want)
+	}
+	// And the Go plan is untouched by any of it — separate catalogue, separate
+	// default, separate bill.
+	if _, ok := OpenCodeModelByID(OpenCodeBackend, "free-model"); ok {
+		t.Error("a Zen model leaked into the Go catalogue")
+	}
+	if DefaultModelFor(OpenCodeBackend) != DefaultOpenCodeModel {
+		t.Error("the Go plan's default moved when Zen refreshed")
+	}
+}
+
+// The two plans are two provider entries, side by side, each pointing at its
+// own path on the one proxy. An entry that carried the other plan's endpoint
+// or the other plan's model_env_key would bill a run to the wrong plan.
+func TestEachPlanRegistersItsOwnProviderEntry(t *testing.T) {
+	isolateHome(t)
+	resetCatalog(t)
+	t.Setenv(OpenCodePortVar, "0")
+	resetProxy(t)
+
+	if _, _, err := EnsureOpenCodeProvider(OpenCodeBackend, "glm-5.3-flash"); err != nil {
+		t.Fatalf("EnsureOpenCodeProvider(go): %v", err)
+	}
+	if _, _, err := EnsureOpenCodeProvider(OpenCodeZenBackend, "some-zen-model"); err != nil {
+		t.Fatalf("EnsureOpenCodeProvider(zen): %v", err)
+	}
+
+	all := readProviders(t)
+	goEntry, zenEntry := all[OpenCodeBackend], all[OpenCodeZenBackend]
+	if goEntry == nil || zenEntry == nil {
+		t.Fatalf("want both entries, got %v", all)
+	}
+	if got, _ := goEntry["base_url"].(string); !strings.HasSuffix(got, "/v1") || strings.Contains(got, "/zen/") {
+		t.Errorf("go base_url = %q, want the proxy's Go path", got)
+	}
+	if got, _ := zenEntry["base_url"].(string); !strings.HasSuffix(got, "/zen/v1") {
+		t.Errorf("zen base_url = %q, want the proxy's Zen path", got)
+	}
+	if got, _ := zenEntry["model_env_key"].(string); got != OpenCodeZenModelVar {
+		t.Errorf("zen model_env_key = %q, want %q", got, OpenCodeZenModelVar)
+	}
+	if got, _ := goEntry["default_model"].(string); got != "glm-5.3-flash" {
+		t.Errorf("go default_model = %q, want the Go model", got)
+	}
+	if got, _ := zenEntry["default_model"].(string); got != "some-zen-model" {
+		t.Errorf("zen default_model = %q, want the Zen model", got)
+	}
+	// One key, both plans: the credential is the same variable, and it is the
+	// endpoint that decides the bill.
+	if got, _ := zenEntry["env_key"].(string); got != OpenCodeKeyVar {
+		t.Errorf("zen env_key = %q, want %q", got, OpenCodeKeyVar)
+	}
+}
+
+// The settings dropdown fades a model the gateway refuses, and that fade is
+// only as honest as this sweep: it must ask about every model it has not
+// asked about, cache what it was told, and record nothing at all when the
+// gateway could not be reached.
+func TestVerifyOpenCodeCatalogSeparatesARefusalFromAnUnreachableGateway(t *testing.T) {
+	resetCatalog(t)
+	t.Setenv(OpenCodeKeyVar, "sk-test")
+
+	var asked int32
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&asked, 1)
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "regional-model") {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":{"message":"Internal server error"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer gw.Close()
+	t.Setenv(OpenCodeBaseURLVar, gw.URL+"/v1")
+
+	models := []OpenCodeModel{{ID: "good-model"}, {ID: "regional-model"}}
+	seen := map[string]bool{}
+	details := map[string]string{}
+	VerifyOpenCodeCatalog(context.Background(), OpenCodeBackend, models,
+		func(id string, ok bool, detail string) {
+			seen[id] = ok
+			details[id] = detail
+		})
+
+	if len(seen) != 2 {
+		t.Fatalf("reported on %d models, want both: %v", len(seen), seen)
+	}
+	if !seen["good-model"] {
+		t.Error("a model that answered was reported as refused")
+	}
+	if seen["regional-model"] {
+		t.Error("a model the gateway refused was reported as available")
+	}
+	// The gateway's own words, not a generic failure — that is the whole
+	// reason the probe exists.
+	if !strings.Contains(details["regional-model"], "Internal server error") {
+		t.Errorf("refusal detail = %q, want the gateway's message", details["regional-model"])
+	}
+	if known, ok, _ := OpenCodeVerdict(OpenCodeBackend, "regional-model"); !known || ok {
+		t.Error("the refusal was not cached")
+	}
+	// A verdict for one plan says nothing about the other.
+	if known, _, _ := OpenCodeVerdict(OpenCodeZenBackend, "regional-model"); known {
+		t.Error("a Go verdict was read as a Zen verdict")
+	}
+
+	// A second sweep answers from cache: forty models are not re-probed every
+	// time the settings dialog opens.
+	before := atomic.LoadInt32(&asked)
+	VerifyOpenCodeCatalog(context.Background(), OpenCodeBackend, models, func(string, bool, string) {})
+	if atomic.LoadInt32(&asked) != before {
+		t.Errorf("the second sweep made %d more requests, want none", atomic.LoadInt32(&asked)-before)
+	}
+
+	// An unreachable gateway is not a verdict about anything. Nothing is
+	// cached, so the model is asked about again rather than shown as refused.
+	resetCatalog(t)
+	t.Setenv(OpenCodeBaseURLVar, "http://127.0.0.1:1/v1")
+	VerifyOpenCodeCatalog(context.Background(), OpenCodeBackend, []OpenCodeModel{{ID: "good-model"}},
+		func(id string, ok bool, detail string) {
+			if !ok {
+				t.Errorf("%s reported as refused after a connection failure: %q", id, detail)
+			}
+		})
+	if known, _, _ := OpenCodeVerdict(OpenCodeBackend, "good-model"); known {
+		t.Error("a connection failure was cached as a verdict about the model")
+	}
+}
+
+// Among free models the widest window wins, for the reason
+// OpenCodeOutputBudget documents: a narrow window is what makes a chunk split,
+// retry and lose files, and price cannot break the tie when every candidate
+// is free.
+func TestTheZenDefaultPrefersTheWidestFreeWindow(t *testing.T) {
+	resetCatalog(t)
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"aaa-narrow-free"},{"id":"zzz-wide-free"},{"id":"cheap-paid"}]}`))
+	}))
+	defer gw.Close()
+	md := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"opencode":{"models":{
+			"aaa-narrow-free":{"name":"Narrow","cost":{"input":0,"output":0},"limit":{"context":32768,"output":4096}},
+			"zzz-wide-free":{"name":"Wide","cost":{"input":0,"output":0},"limit":{"context":1000000,"output":131072}},
+			"cheap-paid":{"name":"Cheap","cost":{"input":0.1,"output":0.2},"limit":{"context":1000000,"output":131072}}}}}`))
+	}))
+	defer md.Close()
+	t.Setenv(OpenCodeZenBaseURLVar, gw.URL+"/v1")
+	oldMD := ModelsDevURL
+	ModelsDevURL = md.URL
+	t.Cleanup(func() { ModelsDevURL = oldMD })
+
+	if _, err := RefreshOpenCodeCatalog(context.Background(), OpenCodeZenBackend); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if got := DefaultModelFor(OpenCodeZenBackend); got != "zzz-wide-free" {
+		t.Errorf("DefaultModelFor(zen) = %q, want the widest free window", got)
+	}
+	m, origin := OpenCodeModelFor(OpenCodeZenBackend, nil, "")
+	if m.ID != "zzz-wide-free" || !strings.Contains(origin, "free") {
+		t.Errorf("OpenCodeModelFor(zen) = %q from %q, want the free default named as free", m.ID, origin)
 	}
 }

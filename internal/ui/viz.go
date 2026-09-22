@@ -55,6 +55,7 @@ func (a *App) newVizPage() *vizPage {
 		names[i] = t.title
 	}
 	v.chooser = gtk.NewDropDownFromStrings(names)
+	v.chooser.SetListFactory(&wideTextFactory(nil).ListItemFactory)
 	v.chooser.NotifyProperty("selected", func() {
 		v.target = int(v.chooser.Selected())
 		v.loaded = ""

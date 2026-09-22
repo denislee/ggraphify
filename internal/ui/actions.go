@@ -8,24 +8,46 @@ import (
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
+	"github.com/dns/ggraphify/internal/applog"
 	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/gfy"
+	"github.com/dns/ggraphify/internal/globalgraph"
 	"github.com/dns/ggraphify/internal/graphstate"
 	"github.com/dns/ggraphify/internal/jobs"
 	"github.com/dns/ggraphify/internal/store"
 )
 
-// params builds the gfy.Params for one row: the board's defaults, overlaid
-// with whatever that repository overrides.
+// params builds the gfy.Params for one row with no command in mind: the
+// board's defaults, overlaid with whatever that repository overrides.
+//
+// Callers that know which command they are about to run want paramsFor
+// instead — the backend a job runs against depends on how much of the model
+// that command eats, and this one cannot know.
 func (a *App) params(r board.Row) gfy.Params {
+	return a.paramsFor("", r)
+}
+
+// paramsFor is params for a known kind: the same parameters, with the backend
+// and model chosen for that command's weight class.
+//
+// The split is store.Settings.HeavyBackend's: an extraction that sends a
+// request per chunk of the tree and a labelling pass that sends a few dozen
+// short prompts do not have to share a backend. A kind of "" — or any command
+// that talks to no model — resolves to the general pin, which is what every
+// caller that only wants p.Out gets.
+//
+// BackendForKind and not BackendFor: a command may also carry a pin of its
+// own, one tier finer than its weight class, and the kind is in hand here.
+func (a *App) paramsFor(kind string, r board.Row) gfy.Params {
 	set := a.opts.Store.Settings()
 	o := a.opts.Store.Override(r.Path)
 
+	backend, model := set.BackendForKind(kind)
 	p := gfy.Params{
 		Repo:      r.Path,
 		Out:       r.Graph.Out,
-		Backend:   set.Backend,
-		Model:     set.Model,
+		Backend:   backend,
+		Model:     model,
 		ClaudeDir: set.ClaudeAccount,
 		Extra:     append([]string(nil), o.Extra...),
 	}
@@ -47,13 +69,14 @@ func (a *App) params(r board.Row) gfy.Params {
 	// run would refuse; there this names claude-cli. The resolved name is in
 	// the argv the confirm dialog prints, so the substitution is on screen.
 	p.Backend = gfy.EffectiveBackend(p.Backend)
-	// OpenCode Go takes its model from its own setting, for the reason
+	// Each OpenCode plan takes its model from its own setting, for the reason
 	// store.Settings.OpenCodeModel documents: the shared Model field holds
-	// whatever the last backend needed, and sending an ollama tag to a
-	// gateway is a failure per repository rather than a substitution.
-	if p.Backend == gfy.OpenCodeBackend && strings.TrimSpace(o.Model) == "" {
-		p.Model = gfy.DefaultOpenCodeModel
-		if m := strings.TrimSpace(set.OpenCodeModel); m != "" {
+	// whatever the last backend needed, and sending an ollama tag — or the
+	// other plan's id — to a gateway is a failure per repository rather than
+	// a substitution.
+	if gfy.IsOpenCodeBackend(p.Backend) && strings.TrimSpace(o.Model) == "" {
+		p.Model = gfy.DefaultModelFor(p.Backend)
+		if m := strings.TrimSpace(set.OpenCodeModelFor(p.Backend)); m != "" {
 			p.Model = m
 		}
 	}
@@ -120,7 +143,7 @@ func (a *App) run(kind string, rows []board.Row, mutate func(*gfy.Params)) {
 	}
 
 	set := a.opts.Store.Settings()
-	needsConfirm := spec.Cost == gfy.Metered ||
+	needsConfirm := a.costOf(kind, rows) == gfy.Metered ||
 		(len(rows) > 1 && len(rows) >= set.ConfirmBatchAt)
 	if !needsConfirm {
 		a.submit(kind, rows, mutate)
@@ -129,17 +152,50 @@ func (a *App) run(kind string, rows []board.Row, mutate func(*gfy.Params)) {
 	a.confirm(kind, rows, mutate)
 }
 
+// costOf is what this action will actually cost, which is not always what its
+// kind costs: graft's deep pass is free against a model on this machine and a
+// real bill against anything else, so the answer depends on where the weight
+// pin — and any per-repository override — points.
+//
+// It reads the pin rather than resolving params per row: paramsFor probes the
+// local server, and forty probes on the main thread to decide whether to show
+// one dialog is a visibly stalled board. The pin is what GraftDeepReady
+// resolves from anyway, and it only ever rewrites one local backend into
+// another, so the metered/free half of the answer is the same either way.
+//
+// The pin here is the kind's own when it has one, its weight class's when it
+// does not — the same resolution paramsFor will apply to every row.
+func (a *App) costOf(kind string, rows []board.Row) gfy.Cost {
+	backend, _ := a.opts.Store.Settings().BackendForKind(kind)
+	for _, r := range rows {
+		b := backend
+		if o := a.opts.Store.Override(r.Path).Backend; o != "" {
+			b = o
+		}
+		if gfy.CostFor(kind, b) == gfy.Metered {
+			return gfy.Metered
+		}
+	}
+	return gfy.CostFor(kind, backend)
+}
+
 // submit queues the jobs. No gate here: run() and confirm() own that decision.
 func (a *App) submit(kind string, rows []board.Row, mutate func(*gfy.Params)) {
 	n := 0
 	for _, r := range rows {
-		p := a.params(r)
+		p := a.paramsFor(kind, r)
 		if mutate != nil {
 			mutate(&p)
 		}
 		label := gfy.Title(kind) + " · " + r.Name
 		if _, err := a.runner.SubmitCmd(kind, r.Path, label, p, a.opts.Store.Overlay(r.Path)); err != nil {
-			a.toastf("%s: %v", r.Name, err)
+			// A refusal about the local model server is about the MACHINE,
+			// not about this row: every remaining row would be refused for
+			// the identical reason, so it is said once and the rest are not
+			// attempted. Anything else is per-repository and the loop goes on.
+			if a.submitRefused(r.Name, err) {
+				return
+			}
 			continue
 		}
 		n++
@@ -156,6 +212,24 @@ func (a *App) submit(kind string, rows []board.Row, mutate func(*gfy.Params)) {
 	a.refreshStatus()
 }
 
+// submitRefused reports a precheck's refusal, and says whether it ends the
+// whole submission rather than just this row.
+//
+// The needs-root case gets the command on the clipboard as well as in the
+// toast, for the same reason the settings page's Start button does: a toast
+// is gone in five seconds and `sudo systemctl start ollama` retyped from
+// memory is `sudo systemctl start ollama.service` half the time.
+func (a *App) submitRefused(name string, err error) (fatal bool) {
+	if gfy.NeedsRoot(err) {
+		applog.Errorf("submit refused: %v", err)
+		a.win.Clipboard().SetText(gfy.SudoStartOllama)
+		a.toastf("%v — copied: %s", err, gfy.SudoStartOllama)
+		return true
+	}
+	a.toastf("%s: %v", name, err)
+	return false
+}
+
 // confirm is the dialog that stands between a click and a bill.
 //
 // It shows the literal command line, the environment overlay with secrets
@@ -164,14 +238,18 @@ func (a *App) submit(kind string, rows []board.Row, mutate func(*gfy.Params)) {
 // count to be typed, because "click through" is exactly the failure mode the
 // gate exists to prevent.
 func (a *App) confirm(kind string, rows []board.Row, mutate func(*gfy.Params)) {
-	spec := gfy.Known[kind]
 	set := a.opts.Store.Settings()
 
-	sample := a.params(rows[0])
+	sample := a.paramsFor(kind, rows[0])
 	if mutate != nil {
 		mutate(&sample)
 	}
 	argv := gfy.Argv(kind, sample)
+
+	// The sample has been through paramsFor and the kind's own mutation, so
+	// its backend is the one the run will use — the last point at which the
+	// price of THIS run, rather than of the kind, is still knowable.
+	cost := gfy.CostFor(kind, sample.Backend)
 
 	heading := gfy.Title(kind)
 	var body strings.Builder
@@ -188,7 +266,7 @@ func (a *App) confirm(kind string, rows []board.Row, mutate func(*gfy.Params)) {
 		}
 	}
 
-	if spec.Cost == gfy.Metered {
+	if cost == gfy.Metered {
 		body.WriteString("\n\n" + a.meteredNotice(sample))
 	} else if note := gfy.AccountNote(kind, sample.Backend, sample.ClaudeDir); note != "" {
 		// A free command can still write into a Claude Code configuration
@@ -245,7 +323,7 @@ func (a *App) confirm(kind string, rows []board.Row, mutate func(*gfy.Params)) {
 	dlg.AddResponse("cancel", "Cancel")
 	dlg.AddResponse("run", "Run")
 	dlg.SetResponseAppearance("run", adw.ResponseSuggested)
-	if spec.Cost == gfy.Metered {
+	if cost == gfy.Metered {
 		dlg.SetResponseAppearance("run", adw.ResponseDestructive)
 		// `--code-only` is the free way to get most of what `extract` gives,
 		// offered right here rather than buried in settings: the moment
@@ -296,11 +374,11 @@ func (a *App) meteredNotice(sample gfy.Params) string {
 		shown = "auto-detected from whichever API key is set"
 	}
 	model := sample.Model
-	if backend == gfy.OpenCodeBackend {
+	if gfy.IsOpenCodeBackend(backend) {
 		// Never "the backend's default" for this one: the default lives in a
 		// provider entry this board wrote, so it can be named exactly, along
 		// with what it costs.
-		m, origin := gfy.OpenCodeModelFor(a.opts.Store.Overlay(sample.Repo), sample.Model)
+		m, origin := gfy.OpenCodeModelFor(backend, a.opts.Store.Overlay(sample.Repo), sample.Model)
 		model = m.Label() + " (from " + origin + ")"
 	}
 	if model == "" {
@@ -339,11 +417,11 @@ func (a *App) meteredNotice(sample gfy.Params) string {
 			"Claude Code CLI on this machine, billed to the " + acc.Name +
 			" login's plan rather than to an API key.\n")
 		b.WriteString("Claude Code account: " + acc.Name + " (" + acc.Dir + ")\n")
-	case gfy.OpenCodeBackend:
-		b.WriteString("This is METERED. It dispatches LLM requests to OpenCode Go " +
-			"against " + gfy.OpenCodeKeyVar + ", drawn from that subscription's monthly " +
-			"allowance for this model rather than from an API balance.\n")
-		b.WriteString("Endpoint: " + gfy.OpenCodeUpstream() + " (through this board's loopback " +
+	case gfy.OpenCodeBackend, gfy.OpenCodeZenBackend:
+		plan := gfy.OpenCodePlanFor(backend)
+		b.WriteString("This is METERED. It dispatches LLM requests to " + plan.Name +
+			" against " + gfy.OpenCodeKeyVar + ", " + plan.Billing + ".\n")
+		b.WriteString("Endpoint: " + gfy.OpenCodeUpstream(backend) + " (through this board's loopback " +
 			"proxy, which adds the session header the gateway requires)\n")
 	default:
 		b.WriteString("This is METERED. It dispatches LLM requests against your " +
@@ -353,14 +431,14 @@ func (a *App) meteredNotice(sample gfy.Params) string {
 	_, meteredLanes, _ := a.runner.Lanes()
 	b.WriteString("Metered lane concurrency: " + gfy.Itoa(meteredLanes) + "\n")
 	ready, why := gfy.BackendReady(backend)
-	if backend == gfy.OpenCodeBackend {
+	if gfy.IsOpenCodeBackend(backend) {
 		// BackendReady answers for a job with nothing chosen; here the model
 		// is known, and it is half of what this backend's readiness means.
-		ready, why = gfy.OpenCodeReady(sample.Model)
+		ready, why = gfy.OpenCodeReady(backend, sample.Model)
 	}
 	if !ready {
 		b.WriteString("\n⚠ " + why + "\nEvery one of these runs is likely to fail.")
-	} else if backend == gfy.ClaudeCLIBackend || backend == gfy.OpenCodeBackend {
+	} else if backend == gfy.ClaudeCLIBackend || gfy.IsOpenCodeBackend(backend) {
 		b.WriteString("\n" + why)
 	}
 	return b.String()
@@ -452,21 +530,42 @@ func (a *App) actGraftDeep() {
 		a.toast("nothing selected")
 		return
 	}
-	set := a.opts.Store.Settings()
-	if _, _, ok, why := gfy.GraftDeepReady(set.Backend, set.Model); !ok {
+	if _, _, ok, why := a.graftDeepPin(); !ok {
 		a.toast(why)
 		return
 	}
 	a.run(gfy.GraftDeepKind, rows, a.graftDeepParams())
 }
 
-// graftDeepParams is the mutation every deep submit applies: a local backend, a
-// model that server serves, and the concurrency its slots hold. Resolved once
-// per action rather than once per repository — ProbeLocal does network I/O,
-// and forty identical probes on the main thread is a visibly stalled board.
-func (a *App) graftDeepParams() func(*gfy.Params) {
+// graftDeepPin is where the deep pass will run: its own pin if it has been
+// given one, the Heavy work pin otherwise, resolved through graft's own view
+// of whichever it is.
+//
+// Heavy and not the general Backend it used to read — see the weight table:
+// the deep index is the other pass that reads every file in the checkout. And
+// its own pin above that, because the two heavy kinds are the same shape of
+// job and still not the same job.
+func (a *App) graftDeepPin() (backend, model string, ok bool, why string) {
 	set := a.opts.Store.Settings()
-	backend, model, ok, _ := gfy.GraftDeepReady(set.Backend, set.Model)
+	b, m := set.BackendForKind(gfy.GraftDeepKind)
+	// Each OpenCode plan takes its model from its own setting, for the reason
+	// paramsFor does the same: the weight pin's model field is blank for those
+	// two backends — the settings page greys it out and sends people to the
+	// plan's own group — and a blank there would fall back to a plan default
+	// nobody picked.
+	if eff := gfy.EffectiveBackend(b); gfy.IsOpenCodeBackend(eff) && strings.TrimSpace(m) == "" {
+		m = set.OpenCodeModelFor(eff)
+	}
+	return gfy.GraftDeepReady(b, m)
+}
+
+// graftDeepParams is the mutation every deep submit applies: the backend Heavy
+// work names, a model it serves, and — locally — the concurrency its slots
+// hold. Resolved once per action rather than once per repository — ProbeLocal
+// does network I/O, and forty identical probes on the main thread is a visibly
+// stalled board.
+func (a *App) graftDeepParams() func(*gfy.Params) {
+	backend, model, ok, _ := a.graftDeepPin()
 	return func(p *gfy.Params) {
 		if !ok {
 			return
@@ -475,7 +574,7 @@ func (a *App) graftDeepParams() func(*gfy.Params) {
 		// The re-check inside is not redundant: the server can go away between
 		// the dialog and the submit, and a refusal here leaves the argv
 		// unbuildable, which SubmitCmd reports per repository rather than
-		// sending the corpus somewhere metered.
+		// sending the corpus somewhere nobody named.
 		gfy.GraftDeepParams(p)
 	}
 }
@@ -507,13 +606,225 @@ func (a *App) actWatch() {
 
 // actGlobalAdd merges the selected repositories' graphs into the global graph
 // under a tag, which is the cross-repo answer the CLI makes tedious.
-func (a *App) actGlobalAdd() {
+func (a *App) actGlobalAdd() { a.globalAdd(a.batch()) }
+
+// actGlobalToggle is the membership switch: one key that puts the selection
+// into the global graph or takes it out again.
+//
+// A mixed batch adds rather than removes. The two are not symmetrical — an add
+// is free and idempotent, a remove throws away nodes that cost an extraction —
+// so the safe reading of "some of these are in and some are not" is "put the
+// rest in", and removing is left to say so explicitly.
+func (a *App) actGlobalToggle() {
 	rows := a.batch()
-	a.run("global-add", rows, func(p *gfy.Params) {
-		if p.Tag == "" {
-			p.Tag = filepath.Base(p.Repo)
+	if len(rows) == 0 {
+		a.toast("nothing selected")
+		return
+	}
+	var out []board.Row
+	for _, r := range rows {
+		if !r.Global.In {
+			out = append(out, r)
+		}
+	}
+	if len(out) == 0 {
+		a.globalRemove(rows)
+		return
+	}
+	a.globalAdd(out)
+}
+
+// globalTag is the name a row is, or would be, in the global graph.
+//
+// The manifest's own tag wins whenever there is one: it is the only handle
+// `graphify global remove` accepts, and a repository that was added under a
+// different name must not be removed by guessing its directory's.
+func globalTag(r board.Row) string {
+	if t := strings.TrimSpace(r.Global.Tag); t != "" {
+		return t
+	}
+	return filepath.Base(r.Path)
+}
+
+// globalAdd merges rows into the global graph, one command at a time.
+//
+// The sequencing is not a nicety. `graphify global add` is a read-modify-write
+// of a single shared file with no cross-process lock, so two of them running
+// in different free lanes would race and one repository's nodes would vanish
+// into the loser's copy. Every membership change on this board therefore goes
+// through a chain, and this is the only place that submits one.
+func (a *App) globalAdd(rows []board.Row) {
+	if len(rows) == 0 {
+		a.toast("nothing selected")
+		return
+	}
+	var ready, blocked []board.Row
+	for _, r := range rows {
+		if a.hasGraph(r) {
+			ready = append(ready, r)
+		} else {
+			blocked = append(blocked, r)
+		}
+	}
+	if len(blocked) > 0 {
+		a.offerExtract("global-add", blocked)
+	}
+	if len(ready) == 0 {
+		return
+	}
+	if clash := a.globalTagClashes(ready); clash != "" {
+		a.confirmGlobal("Tag already taken", clash, "Add anyway", adw.ResponseDestructive,
+			func() { a.runGlobalChain("global-add", ready) })
+		return
+	}
+	if len(ready) == 1 {
+		a.runGlobalChain("global-add", ready)
+		return
+	}
+	a.confirmGlobal("Add to the global graph",
+		"graphify will merge "+plural(len(ready), "repository", "repositories")+
+			" into ~/.graphify/global-graph.json, one at a time.\n\n"+
+			"They are run in sequence rather than in parallel: `graphify global add` "+
+			"rewrites one shared file, and two at once would lose one of them.",
+		"Add", adw.ResponseSuggested,
+		func() { a.runGlobalChain("global-add", ready) })
+}
+
+// globalRemove takes rows back out of the global graph.
+//
+// Always behind a confirm, even for one row: the nodes it drops were paid for
+// by an extraction, and putting them back means running that command again.
+func (a *App) globalRemove(rows []board.Row) {
+	var in []board.Row
+	for _, r := range rows {
+		if r.Global.In {
+			in = append(in, r)
+		}
+	}
+	if len(in) == 0 {
+		a.toast("none of these are in the global graph")
+		return
+	}
+	var tags []string
+	for _, r := range in {
+		tags = append(tags, globalTag(r))
+	}
+	a.confirmGlobal("Remove from the global graph",
+		"graphify will drop "+plural(len(in), "repository's", "repositories'")+
+			" nodes from ~/.graphify/global-graph.json:\n\n"+
+			strings.Join(namesUpTo(tags, 8), ", ")+"\n\n"+
+			"Nothing inside any checkout is touched — the repositories' own graphs stay "+
+			"where they are, and adding them back is free.",
+		"Remove", adw.ResponseDestructive,
+		func() { a.runGlobalChain("global-remove", in) })
+}
+
+// globalTagClashes names the rows whose tag is already taken in the manifest
+// by a different graph, which is the one way an add can quietly destroy
+// something: graphify prunes whatever is under that tag before it merges.
+func (a *App) globalTagClashes(rows []board.Row) string {
+	m := a.globals.Load()
+	var lines []string
+	for _, r := range rows {
+		tag := globalTag(r)
+		e, ok := m.ByTag(tag)
+		if !ok || e.Source == globalgraph.GraphFor(r.Graph.Out) {
+			continue
+		}
+		lines = append(lines, "“"+tag+"” currently holds "+board.Tilde(e.Source))
+	}
+	// Two rows in the same batch wanting one tag is the same accident one step
+	// earlier — two checkouts of the same name under different roots.
+	seen := map[string]string{}
+	for _, r := range rows {
+		tag := globalTag(r)
+		if other, dup := seen[tag]; dup {
+			lines = append(lines, "“"+tag+"” is wanted by both "+board.Tilde(other)+
+				" and "+board.Tilde(r.Path))
+			continue
+		}
+		seen[tag] = r.Path
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "Adding these would replace the nodes already under those tags:\n\n" +
+		strings.Join(lines, "\n") + "\n\n" +
+		"A tag is the only handle the global graph has on a repository, so the two " +
+		"cannot both be in it under that name."
+}
+
+// runGlobalChain submits one membership command per row, in sequence, and
+// repaints the board when the chain ends. See globalAdd for why it is a chain.
+func (a *App) runGlobalChain(kind string, rows []board.Row) {
+	steps := make([]jobs.ChainStep, 0, len(rows))
+	for _, r := range rows {
+		p := a.paramsFor(kind, r)
+		p.Tag = globalTag(r)
+		steps = append(steps, jobs.ChainStep{
+			Kind:   kind,
+			Repo:   r.Path,
+			Label:  gfy.Title(kind) + " · " + r.Name,
+			Params: p,
+			Env:    a.opts.Store.Overlay(r.Path),
+		})
+	}
+	a.submitGlobalChain(steps, gfy.Title(kind))
+}
+
+// submitGlobalChain is the tail both the board and the Global screen share:
+// run the steps in order, then drop the membership memo and repaint.
+func (a *App) submitGlobalChain(steps []jobs.ChainStep, what string) {
+	if len(steps) == 0 {
+		return
+	}
+	a.toastf("queued %s on %s", what, plural(len(steps), "repo", "repos"))
+	a.runner.SubmitChain(steps, func(res jobs.ChainResult) {
+		// The runner calls this on a worker goroutine; everything below is GTK.
+		idle(func() {
+			// Unconditionally, and before the scan: a chain that stopped
+			// halfway still changed the manifest for the steps that ran.
+			a.globals.Invalidate()
+			a.refresh(false)
+			if a.globalPane != nil {
+				a.globalPane.reload()
+			}
+			if res.Err != nil {
+				applog.Errorf("%s: stopped after %d/%d — %v", what, res.Ran, res.Total, res.Err)
+				a.toastf("%s: stopped after %d/%d — %v", what, res.Ran, res.Total, res.Err)
+				return
+			}
+			a.toastf("%s: %d/%d done", what, res.Ran, res.Total)
+		})
+	})
+}
+
+// confirmGlobal is the alert every membership change goes through. It is not
+// a.confirm: that one is about cost and prints an argv, and these commands are
+// free — what they need saying is what happens to the shared file.
+func (a *App) confirmGlobal(title, body, verb string, look adw.ResponseAppearance, do func()) {
+	dlg := adw.NewAlertDialog(title, body)
+	dlg.AddResponse("cancel", "Cancel")
+	dlg.AddResponse("go", verb)
+	dlg.SetResponseAppearance("go", look)
+	dlg.SetDefaultResponse("cancel")
+	dlg.SetCloseResponse("cancel")
+	dlg.ConnectResponse(func(resp string) {
+		if resp == "go" {
+			do()
 		}
 	})
+	dlg.Present(a.win)
+}
+
+// namesUpTo is a list a dialog can carry: the first n, and a count for the
+// rest. A confirm that names forty repositories is a confirm nobody reads.
+func namesUpTo(names []string, n int) []string {
+	if len(names) <= n {
+		return names
+	}
+	out := append([]string(nil), names[:n]...)
+	return append(out, sprintf("and %d more", len(names)-n))
 }
 
 // actHookInstall installs graphify's git hooks in the selected repositories.

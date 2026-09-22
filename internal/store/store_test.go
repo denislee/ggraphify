@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dns/ggraphify/internal/gfy"
 	"github.com/dns/ggraphify/internal/graphstate"
 )
 
@@ -567,5 +568,153 @@ func TestOllamaLifecycleRoundTrips(t *testing.T) {
 	}
 	if got.OllamaIdle() != 120*time.Second {
 		t.Fatalf("idle period came back as %v, want 120s", got.OllamaIdle())
+	}
+}
+
+// A blank weight pin follows the general Backend, a set one replaces it
+// together with its model, and the explicit auto-detect sentinel resolves to
+// the blank backend graphify understands — never to the inherit case it
+// shares a spelling with in the state file.
+func TestBackendForWeight(t *testing.T) {
+	set := Defaults()
+	set.Backend, set.Model = "claude", "sonnet"
+	set.HeavyBackend, set.HeavyModel = "", ""
+	set.LightBackend, set.LightModel = gfy.OllamaBackend, "qwen2.5-coder:7b"
+
+	if b, m := set.BackendFor(gfy.Heavy); b != "claude" || m != "sonnet" {
+		t.Fatalf("blank heavy pin = %q/%q, want the general claude/sonnet", b, m)
+	}
+	if b, m := set.BackendFor(gfy.NoLLM); b != "claude" || m != "sonnet" {
+		t.Fatalf("no-LLM kind = %q/%q, want the general claude/sonnet", b, m)
+	}
+	if b, m := set.BackendFor(gfy.Light); b != gfy.OllamaBackend || m != "qwen2.5-coder:7b" {
+		t.Fatalf("light pin = %q/%q, want ollama/qwen2.5-coder:7b", b, m)
+	}
+
+	// A pinned backend must not inherit the general model: that id belongs to
+	// some other provider's catalogue.
+	set.HeavyBackend, set.HeavyModel = gfy.OllamaBackend, ""
+	if b, m := set.BackendFor(gfy.Heavy); b != gfy.OllamaBackend || m != "" {
+		t.Fatalf("heavy pin = %q/%q, want ollama with no inherited model", b, m)
+	}
+
+	set.HeavyBackend = gfy.AutoBackend
+	if b, _ := set.BackendFor(gfy.Heavy); b != "" {
+		t.Fatalf("auto-detect pin = %q, want the blank graphify detects from", b)
+	}
+}
+
+// A fresh state file runs both weights on this machine's own model, so a
+// first run cannot bill anybody. A file written before the pins existed keeps
+// its single Backend for both, which is the behaviour it was saved under.
+func TestWeightPinDefaults(t *testing.T) {
+	if b := Defaults().HeavyBackend; b != gfy.OllamaBackend {
+		t.Fatalf("default heavy backend = %q, want ollama", b)
+	}
+	if b := Defaults().LightBackend; b != gfy.OllamaBackend {
+		t.Fatalf("default light backend = %q, want ollama", b)
+	}
+
+	p := filepath.Join(t.TempDir(), "state.json")
+	old := `{"version":1,"settings":{"backend":"claude","model":"sonnet"}}`
+	if err := os.WriteFile(p, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	set := Open(p).Settings()
+	if set.HeavyBackend != "" || set.LightBackend != "" {
+		t.Fatalf("loaded pins = %q/%q, want both blank (follow Backend)",
+			set.HeavyBackend, set.LightBackend)
+	}
+	if b, m := set.BackendFor(gfy.Heavy); b != "claude" || m != "sonnet" {
+		t.Fatalf("pre-split file heavy = %q/%q, want claude/sonnet", b, m)
+	}
+}
+
+// The third tier. A kind with no pin of its own is its weight class's answer;
+// a kind with one replaces the pair outright, model included; and a state file
+// written before the tier existed has no map at all, which must read back as
+// "no pin" rather than as anything else.
+func TestBackendForKind(t *testing.T) {
+	set := Defaults()
+	set.Backend, set.Model = "claude", "sonnet"
+	set.HeavyBackend, set.HeavyModel = "claude", "opus"
+	set.LightBackend, set.LightModel = gfy.OllamaBackend, "qwen2.5-coder:7b"
+
+	if b, m := set.BackendForKind("extract"); b != "claude" || m != "opus" {
+		t.Fatalf("unpinned extract = %q/%q, want the heavy claude/opus", b, m)
+	}
+	if b, m := set.BackendForKind(gfy.GraftDeepKind); b != "claude" || m != "opus" {
+		t.Fatalf("unpinned deep pass = %q/%q, want the heavy claude/opus", b, m)
+	}
+	if b, m := set.BackendForKind("label"); b != gfy.OllamaBackend || m != "qwen2.5-coder:7b" {
+		t.Fatalf("unpinned label = %q/%q, want the light ollama pair", b, m)
+	}
+
+	// One of the two heavy kinds moved, and only that one.
+	set.SetKindPin(gfy.GraftDeepKind, gfy.OllamaBackend, "qwen2.5-coder:14b")
+	if b, m := set.BackendForKind(gfy.GraftDeepKind); b != gfy.OllamaBackend || m != "qwen2.5-coder:14b" {
+		t.Fatalf("pinned deep pass = %q/%q, want ollama/qwen2.5-coder:14b", b, m)
+	}
+	if b, m := set.BackendForKind("extract"); b != "claude" || m != "opus" {
+		t.Fatalf("extract moved with it: %q/%q", b, m)
+	}
+
+	// A pinned backend must not inherit its class's model — that id belongs to
+	// another provider's catalogue — and the explicit auto-detect sentinel
+	// resolves to the blank graphify detects from.
+	set.SetKindPin("extract", gfy.OllamaBackend, "")
+	if b, m := set.BackendForKind("extract"); b != gfy.OllamaBackend || m != "" {
+		t.Fatalf("pinned extract = %q/%q, want ollama with no inherited model", b, m)
+	}
+	set.SetKindPin("extract", gfy.AutoBackend, "")
+	if b, _ := set.BackendForKind("extract"); b != "" {
+		t.Fatalf("auto-detect kind pin = %q, want the blank graphify detects from", b)
+	}
+
+	// Clearing it puts the kind back on its class, and leaves no key behind.
+	set.SetKindPin("extract", "", "")
+	if _, ok := set.KindBackend["extract"]; ok {
+		t.Fatal("a cleared pin left a key in the map")
+	}
+	if b, m := set.BackendForKind("extract"); b != "claude" || m != "opus" {
+		t.Fatalf("cleared extract = %q/%q, want the heavy pair back", b, m)
+	}
+}
+
+// Settings is handed out by value, so a map inside it is shared with every
+// copy. SetKindPin rebuilds rather than writing through: a pin set on one copy
+// must not appear in a copy taken before it.
+func TestSetKindPinDoesNotWriteThroughCopies(t *testing.T) {
+	a := Defaults()
+	a.SetKindPin("label", gfy.OllamaBackend, "qwen2.5-coder:7b")
+
+	b := a
+	b.SetKindPin("label", "claude", "haiku")
+
+	if got, _ := a.KindPin("label"); got != gfy.OllamaBackend {
+		t.Fatalf("the older copy's pin became %q", got)
+	}
+	if got, _ := b.KindPin("label"); got != "claude" {
+		t.Fatalf("the newer copy's pin is %q, want claude", got)
+	}
+}
+
+// A state file written before per-command pins existed carries no map, and a
+// nil map must answer "no pin" rather than panic or invent one.
+func TestKindPinsAbsentFromAnOlderStateFile(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "state.json")
+	old := `{"version":1,"settings":{"backend":"claude","model":"sonnet","heavy_backend":"ollama"}}`
+	if err := os.WriteFile(p, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	set := Open(p).Settings()
+	if set.KindBackend != nil {
+		t.Fatalf("loaded kind pins = %v, want none", set.KindBackend)
+	}
+	if b, _ := set.KindPin("extract"); b != "" {
+		t.Fatalf("a nil map answered %q", b)
+	}
+	if b, _ := set.BackendForKind("extract"); b != gfy.OllamaBackend {
+		t.Fatalf("pre-tier file extract = %q, want the heavy ollama", b)
 	}
 }

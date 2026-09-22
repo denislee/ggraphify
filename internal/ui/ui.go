@@ -36,6 +36,7 @@ import (
 	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/discover"
 	"github.com/dns/ggraphify/internal/gfy"
+	"github.com/dns/ggraphify/internal/globalgraph"
 	"github.com/dns/ggraphify/internal/graftstate"
 	"github.com/dns/ggraphify/internal/graphstate"
 	"github.com/dns/ggraphify/internal/jobs"
@@ -102,6 +103,15 @@ type App struct {
 	// job could run at all. Two facts, two lifetimes — multiplexing them onto
 	// one widget would mean whichever was set last silently hid the other.
 	backendBanner *adw.Banner
+	// heldBanner is the third: a queue that will never start on its own.
+	// Restoring a session announces itself in a toast, and a toast is gone in
+	// five seconds — which is how a queue restored from yesterday's session
+	// sat there all afternoon waiting for a click nobody knew was owed. This
+	// one stays up for exactly as long as the held queue does.
+	heldBanner *adw.Banner
+	// heldShown is the count the banner is currently worded for, so the tick
+	// rewrites it when the number moves and leaves it alone when it does not.
+	heldShown int
 	// The last verdict, kept so the banner's button can open a dialog that
 	// explains it without re-probing every port while a human waits.
 	backendReady bool
@@ -219,19 +229,29 @@ type App struct {
 	graftFixBtn    *gtk.Button
 	graftSetup     gfy.GraftSetup
 	graftVersion   gfy.GraftVersion
-	// The OpenCode Go group: the model dropdown for the one backend graphify
-	// does not ship. ocApply is how the Backend picker tells it that it is
-	// now the selected backend — a dropdown two groups below the choice that
+	// The OpenCode group: the model dropdown for the two backends graphify
+	// does not ship. ocApply is how the Backend picker tells it which plan is
+	// now selected — a dropdown two groups below the choice that
 	// activates it is a dropdown nobody finds.
 	ocGroup    *adw.PreferencesGroup
 	ocModelRow *adw.ComboRow
 	ocApply    func(backend string)
+	// The backend pins below the general one: the two weight classes, and the
+	// optional per-command row under each. weightApply is how the Backend
+	// picker restates them when it moves; pinRefresh is one closure per row
+	// that does the restating. None of them touches a dropdown's model or
+	// selection, which is what keeps a refresh from reading as a click — see
+	// pinRows.
+	weightApply func(backend string)
+	pinRefresh  []func()
 	// The local-model group: is there a model server on this machine, is it
 	// up, and what has it got. Four rows because the three ways it can be
 	// unusable have three different fixes.
 	localGroup      *adw.PreferencesGroup
 	localServerRow  *adw.ActionRow
+	localStateLbl   *gtk.Label
 	localStartBtn   *gtk.Button
+	localStopBtn    *gtk.Button
 	localAutoRow    *adw.SwitchRow
 	localIdleRow    *adw.SpinRow
 	localModelsRow  *adw.ComboRow
@@ -281,10 +301,17 @@ type App struct {
 	// board: main switches between the board and it, and usageGuard stops the
 	// header toggle and the keyboard from fighting each other over which one
 	// set it.
-	main       *gtk.Stack
-	usagePane  *usagePane
-	usageBtn   *gtk.ToggleButton
-	usageGuard bool
+	main      *gtk.Stack
+	usagePane *usagePane
+	usageBtn  *gtk.ToggleButton
+	// The Global screen is the window's third page, on the same footing: it
+	// is about one file that spans every repository, so it replaces the board
+	// rather than opening over it. pageGuard stops a header toggle and the
+	// keyboard from fighting each other over which one set the page — one
+	// guard for both toggles, because only one page is ever on screen.
+	globalPane *globalPane
+	globalBtn  *gtk.ToggleButton
+	pageGuard  bool
 	filterBar  *gtk.Box
 
 	runner *jobs.Runner
@@ -306,10 +333,13 @@ type App struct {
 	// rather than in the jobs package because the policy — is this switched
 	// on, how long is the grace period — is a setting, and the runner is not
 	// the thing that reads settings.
-	ollama  *gfy.AutoOllama
-	cache   discover.Cache
-	graphs  graphstate.Cache
-	grafts  graftstate.Cache
+	ollama *gfy.AutoOllama
+	cache  discover.Cache
+	graphs graphstate.Cache
+	grafts graftstate.Cache
+	// globals is the membership record of graphify's cross-repo graph, read
+	// once per scan rather than once per row. See internal/globalgraph.
+	globals globalgraph.Cache
 	version gfy.Version
 
 	// selectMode is the batch-action mode. `Space` adds a row to selected;
@@ -420,14 +450,22 @@ func (a *App) activate() {
 		MeteredLanes: set.MeteredLanes,
 		LocalLanes:   set.LocalLanes,
 		LogBytes:     set.LogBytes,
-		Precheck:     jobs.RequireGraph,
-		LocalLease:   a.leaseOllama,
+		// Two refusals, both before anything is queued: a command that needs
+		// a graph there is not, and a local job whose model server is down
+		// and unstartable from here. The second is the lifecycle's verdict
+		// brought forward — see jobs.RequireLocalServer — and it reads the
+		// same setting the lifecycle does, live, for activate's own reason.
+		Precheck: jobs.Checks(
+			jobs.RequireGraph,
+			jobs.RequireLocalServer(func() bool { return a.opts.Store.Settings().AutoOllama() }),
+		),
+		LocalLease: a.leaseOllama,
 	})
 	// Before the pump, because Restore deliberately emits nothing: the views
 	// below are built from Snapshot, which already has the restored jobs in
 	// it, and an event storm into a channel nobody is draining yet would be
 	// dropped anyway.
-	restored, held := a.restoreJobs()
+	restored, held, resumed := a.restoreJobs()
 	go a.pumpJobs()
 
 	a.win = adw.NewApplicationWindow(&a.app.Application)
@@ -460,6 +498,13 @@ func (a *App) activate() {
 	a.backendBanner.SetRevealed(false)
 	a.backendBanner.ConnectButtonClicked(func() { a.backendDialog() })
 	toolbar.AddTopBar(a.backendBanner)
+
+	// The held-queue banner. Work that is waiting for a person is invisible
+	// on a board whose rows all look idle — see refreshHeldBanner.
+	a.heldBanner = adw.NewBanner("")
+	a.heldBanner.SetRevealed(false)
+	a.heldBanner.ConnectButtonClicked(func() { a.startAllHeld() })
+	toolbar.AddTopBar(a.heldBanner)
 
 	a.split = gtk.NewPaned(gtk.OrientationHorizontal)
 	a.split.SetStartChild(a.buildBoard())
@@ -498,6 +543,8 @@ func (a *App) activate() {
 	a.main.SetTransitionType(gtk.StackTransitionTypeCrossfade)
 	a.main.AddNamed(a.vsplit, pageBoard)
 	a.main.AddNamed(a.usagePane.widget, pageUsageName)
+	a.globalPane = a.newGlobalPane()
+	a.main.AddNamed(a.globalPane.widget, pageGlobalName)
 	a.main.SetVExpand(true)
 
 	body := gtk.NewBox(gtk.OrientationVertical, 0)
@@ -528,7 +575,7 @@ func (a *App) activate() {
 	})
 
 	a.win.SetVisible(true)
-	a.announceRestored(restored, held)
+	a.announceRestored(restored, held, resumed)
 	a.applyDockSettings()
 	a.restoreFilter()
 	a.refresh(true)
@@ -662,6 +709,10 @@ func (a *App) refresh(full bool) {
 	}
 	outName, outBase := a.outLocation()
 	st := a.opts.Store
+	// Read on the main thread, before the worker starts: the cache is the
+	// board's and the scan must not be the thing that decides when it is
+	// refreshed. One manifest serves every row of the scan.
+	global := a.globals.Load()
 
 	go func() {
 		rows, err := board.Scan(board.Options{
@@ -673,6 +724,7 @@ func (a *App) refresh(full bool) {
 			Cache:      &a.cache,
 			Graphs:     &a.graphs,
 			Grafts:     &a.grafts,
+			Global:     global,
 			Override: func(path string) (string, bool, bool) {
 				o := st.Override(path)
 				return o.Out, o.ExcludeBatch, o.Pinned
@@ -760,6 +812,13 @@ func (a *App) setRows(rows []board.Row) {
 	// for the tools outside this process that have no scan of their own. See
 	// knowledge.go.
 	a.syncIndex(rows)
+
+	// The Global screen is a second view of the same scan — which repositories
+	// have a graph, and which of those are in the cross-repo one — so it is
+	// repainted from here rather than from a timer of its own.
+	if a.onGlobalPage() {
+		a.globalPane.reloadIfChanged()
+	}
 }
 
 // rowFor resolves a model object back to its row.
@@ -827,6 +886,9 @@ func (a *App) refreshStatus() {
 		return
 	}
 	a.refreshActivity()
+	// Rides the same refresh as the status bar's "(N held)" clause, and for
+	// the same reason: both are the held queue, and they may not disagree.
+	a.refreshHeldBanner()
 	c := board.Summarize(a.allRows())
 	queued, running := a.runner.Active()
 	free, metered, localLanes := a.runner.Lanes()
@@ -865,6 +927,19 @@ func (a *App) refreshStatus() {
 		if c.GraftStale > 0 {
 			b.WriteString(" (")
 			b.WriteString(gfy.Itoa(c.GraftStale))
+			b.WriteString(" stale)")
+		}
+	}
+	// And the cross-repo half: how many of those checkouts an agent can reach
+	// through the one global graph, and how many of those it would reach a
+	// superseded extraction of. Both are invisible from inside a checkout.
+	if c.InGlobal > 0 {
+		b.WriteString(" · ")
+		b.WriteString(gfy.Itoa(c.InGlobal))
+		b.WriteString(" in global")
+		if c.GlobalStale > 0 {
+			b.WriteString(" (")
+			b.WriteString(gfy.Itoa(c.GlobalStale))
 			b.WriteString(" stale)")
 		}
 	}
@@ -1116,6 +1191,12 @@ const (
 	scopeGraft
 	// scopeRepo is a job that wrote into one repository's graphify-out/.
 	scopeRepo
+	// scopeGlobal is a job that changed which repositories are in graphify's
+	// cross-repo graph. It writes nothing a row is derived from and
+	// everything the Global column is, which is why it is its own scope: the
+	// membership memo is what has to be dropped, and the graph caches must
+	// not be.
+	scopeGlobal
 	// scopeBoard is a mutating job with no repository of its own: a rescan,
 	// but no memo to drop. Clearing the whole graph cache would be a full
 	// re-derivation of every repository — and an unnecessary one, because the
@@ -1133,6 +1214,8 @@ const (
 // as a finished one, and the row is what says so.
 func deriveScopeOf(kind, repo string) deriveScope {
 	switch {
+	case gfy.Global(kind):
+		return scopeGlobal
 	case gfy.Graft(kind):
 		if repo == "" {
 			return scopeNone
@@ -1156,6 +1239,8 @@ func (a *App) reDerive(s jobs.Snapshot) {
 		return
 	case scopeGraft:
 		a.grafts.Invalidate(s.Repo)
+	case scopeGlobal:
+		a.globals.Invalidate()
 	case scopeRepo:
 		a.graphs.Invalidate(s.Repo)
 	case scopeBoard:
@@ -1391,6 +1476,7 @@ const boardCSS = `
 .cellpad    { padding-left: 6px; padding-right: 6px; }
 .dim        { opacity: 0.6; }
 .metered    { color: @warning_color; font-weight: bold; }
+.local      { color: @success_color; }
 .argv       { font-family: monospace; font-size: 0.9em; }
 .dockbar    { min-height: 28px; }
 .dockhead   { font-size: 0.78em; font-weight: bold; letter-spacing: 0.08em; }

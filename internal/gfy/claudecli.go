@@ -174,13 +174,13 @@ func BackendReady(backend string) (bool, string) {
 		// its own reasons — no server, no model pulled — and those are worth
 		// catching in the confirm rather than in the job log. See LocalReady.
 		return LocalReady(OllamaBackend, "")
-	case OpenCodeBackend:
+	case OpenCodeBackend, OpenCodeZenBackend:
 		// Not just "is there a key": this backend is a provider entry and a
 		// model as much as it is a credential, and the entry is the half a
 		// user cannot see. Blank asks about the model a job with nothing
 		// chosen would run; a caller holding the chosen one — the confirm
 		// dialog — asks OpenCodeReady directly.
-		return OpenCodeReady("")
+		return OpenCodeReady(strings.TrimSpace(backend), "")
 	case "bedrock":
 		return true, "Bedrock authenticates through the AWS credential chain."
 	case "":

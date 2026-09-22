@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/dns/ggraphify/internal/discover"
+	"github.com/dns/ggraphify/internal/globalgraph"
 	"github.com/dns/ggraphify/internal/graphstate"
 )
 
@@ -275,5 +276,100 @@ func TestBehindHeadIsStaleAndCarriesTheIssue(t *testing.T) {
 	}
 	if c := Summarize(rows); c.Stale != 1 || c.Behind != 1 || c.Fresh != 0 {
 		t.Errorf("counts = %+v, want 1 stale / 1 behind / 0 fresh", c)
+	}
+}
+
+// Membership of graphify's cross-repo graph is joined onto the row the same
+// way graph state is, and by path rather than by name: two checkouts called
+// the same thing under different roots are two repositories, and only one of
+// them is in the global graph.
+func TestScanJoinsGlobalMembership(t *testing.T) {
+	root := t.TempDir()
+	head := "1111111111111111111111111111111111111111"
+	in := mkrepo(t, root, "merged", head)
+	withGraph(t, in, head)
+	out := mkrepo(t, root, "unmerged", head)
+	withGraph(t, out, head)
+
+	graph := filepath.Join(in, "graphify-out", "graph.json")
+	manifest := filepath.Join(t.TempDir(), "global-manifest.json")
+	body := `{"version":1,"repos":{"merged":{
+	  "added_at":"` + time.Now().Add(time.Hour).UTC().Format(time.RFC3339) + `",
+	  "source_path":"` + graph + `","node_count":1,"edge_count":0,"source_hash":"h"}}}`
+	if err := os.WriteFile(manifest, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := Scan(Options{Roots: []string{root}, Global: globalgraph.Load(manifest)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]Row{}
+	for _, r := range rows {
+		byName[r.Name] = r
+	}
+	if got := byName["merged"].Global; !got.In || got.Tag != "merged" || got.Stale {
+		t.Errorf("merged row = %+v, want a current member", got)
+	}
+	if byName["unmerged"].Global.In {
+		t.Error("a repository that is not in the manifest reported as a member")
+	}
+
+	c := Summarize(rows)
+	if c.InGlobal != 1 || c.GlobalStale != 0 {
+		t.Errorf("counts = %d in global, %d stale; want 1/0", c.InGlobal, c.GlobalStale)
+	}
+}
+
+// With no manifest at all — the ordinary state of a machine that has never
+// run `graphify global add` — every row is simply out, and nothing fails.
+func TestScanWithoutAGlobalManifest(t *testing.T) {
+	root := t.TempDir()
+	head := "1111111111111111111111111111111111111111"
+	withGraph(t, mkrepo(t, root, "solo", head), head)
+
+	rows, err := Scan(Options{Roots: []string{root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].Global.In {
+		t.Errorf("row = %+v, want no membership", rows[0].Global)
+	}
+}
+
+// The update sweep keys on NeedsRebuild, not Behind, because a row with no
+// git has no commit to be behind: Behind is permanently false on it, so a
+// sweep keyed on Behind alone would skip a drifted corpus forever.
+func TestNeedsRebuildUsesDriftForARowWithNoGit(t *testing.T) {
+	corpus := Row{}
+	corpus.NoGit = true
+	corpus.Graph.DriftAdded = 48
+	if !corpus.NeedsRebuild() {
+		t.Error("a drifted no-git row does not need a rebuild — the sweep would skip it forever")
+	}
+	if corpus.Behind {
+		t.Error("a row with no commits reported Behind")
+	}
+
+	// Negative control: no drift, no rebuild. Otherwise the sweep re-extracts
+	// a corpus that has not changed, every time it runs.
+	quiet := Row{}
+	quiet.NoGit = true
+	if quiet.NeedsRebuild() {
+		t.Error("an unchanged no-git row was swept")
+	}
+}
+
+// A checkout still answers the original question, and only that one: a commit
+// of already-extracted files moves HEAD without touching an mtime.
+func TestNeedsRebuildStillKeysOnBehindForACheckout(t *testing.T) {
+	behind := Row{Behind: true}
+	if !behind.NeedsRebuild() {
+		t.Error("a checkout behind HEAD was dropped from the sweep")
+	}
+	drifted := Row{}
+	drifted.Graph.DriftAdded = 9
+	if drifted.NeedsRebuild() {
+		t.Error("drift alone pulled a checkout into the behind-HEAD sweep")
 	}
 }

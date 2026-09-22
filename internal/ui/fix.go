@@ -326,7 +326,7 @@ func (a *App) fixPlanWidget(plans []rowPlan) gtk.Widgetter {
 			text.WriteString("✗ " + i.What + "\n")
 		}
 		for n, s := range rp.plan.Steps {
-			p := a.params(rp.row)
+			p := a.paramsFor(s.Kind, rp.row)
 			s.Apply(&p)
 			tag := ""
 			if s.Cost() == gfy.Metered {
@@ -374,7 +374,7 @@ func (a *App) runFix(plans []rowPlan, metered bool) {
 		total := len(rp.plan.Steps)
 		steps := make([]jobs.ChainStep, 0, total)
 		for n, s := range rp.plan.Steps {
-			p := a.params(rp.row)
+			p := a.paramsFor(s.Kind, rp.row)
 			s.Apply(&p)
 			steps = append(steps, jobs.ChainStep{
 				Kind:   s.Kind,
@@ -430,8 +430,10 @@ func fixSubtitle(r *board.Row) string {
 		". Runs the commands that clear them, in order."
 }
 
-// actUpdateBehind re-extracts every repository whose graph was built from a
-// commit that is no longer HEAD.
+// actUpdateBehind re-extracts every repository whose graph no longer answers
+// for its tree: a checkout whose graph was built from a commit that is no
+// longer HEAD, and a row with no git — which has no commit to be behind — that
+// has drifted. See board.Row.NeedsRebuild.
 //
 // It is `update` and only `update`: the AST pass re-reads whatever moved and
 // stamps the graph with the current commit, which is what clears the issue
@@ -447,12 +449,12 @@ func fixSubtitle(r *board.Row) string {
 func (a *App) actUpdateBehind() {
 	var rows []board.Row
 	for _, r := range a.fixableRows() {
-		if r.Behind {
+		if r.NeedsRebuild() {
 			rows = append(rows, r)
 		}
 	}
 	if len(rows) == 0 {
-		a.toast("no repository is behind its HEAD")
+		a.toast("nothing is behind its HEAD or drifted")
 		return
 	}
 	a.run("update", rows, nil)

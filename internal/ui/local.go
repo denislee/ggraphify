@@ -45,6 +45,14 @@ func (a *App) settingsLocal() *adw.PreferencesGroup {
 	server.SetSubtitleLines(0)
 	server.SetSubtitle("Checking…")
 
+	// The one-word status, beside the buttons that change it. The row's
+	// subtitle already says everything — where the server is, what it serves,
+	// how wide its context — but it says it in four lines of prose, and the
+	// question asked most often here is the shortest one there is: is it up?
+	state := gtk.NewLabel("")
+	state.SetVAlign(gtk.AlignCenter)
+	server.AddSuffix(state)
+
 	refresh := gtk.NewButtonWithLabel("Refresh")
 	refresh.AddCSSClass("flat")
 	refresh.SetVAlign(gtk.AlignCenter)
@@ -60,6 +68,18 @@ func (a *App) settingsLocal() *adw.PreferencesGroup {
 		"otherwise a detached `ollama serve`.")
 	start.ConnectClicked(func() { a.startOllama() })
 	server.AddSuffix(start)
+
+	// Stop is the other half of Start, and it is shown only while there is
+	// something to stop. It stays visible-but-insensitive for a server this
+	// board did not start, because "you cannot stop this one, and here is
+	// why" is the answer to the question the button asks; hiding it would
+	// leave somebody looking for a control that exists.
+	stop := gtk.NewButtonWithLabel("Stop")
+	stop.AddCSSClass("destructive-action")
+	stop.SetVAlign(gtk.AlignCenter)
+	stop.SetVisible(false)
+	stop.ConnectClicked(func() { a.stopOllama() })
+	server.AddSuffix(stop)
 	g.Add(server)
 
 	// The model row is a combo when the server has models and a plain row when
@@ -67,6 +87,8 @@ func (a *App) settingsLocal() *adw.PreferencesGroup {
 	// way to swap a row's type in place, so both exist and one is hidden.
 	models := adw.NewComboRow()
 	models.SetTitle("Model on this machine")
+	models.SetListFactory(&wideTextFactory(nil).ListItemFactory)
+	models.SetFactory(&valueFactory().ListItemFactory)
 	models.SetSubtitleLines(0)
 	models.SetVisible(false)
 	models.NotifyProperty("selected", func() {
@@ -158,7 +180,9 @@ func (a *App) settingsLocal() *adw.PreferencesGroup {
 	a.localIdleRow = idle
 	a.updateLocalIdleRow()
 	a.localServerRow = server
+	a.localStateLbl = state
 	a.localStartBtn = start
+	a.localStopBtn = stop
 	a.localModelsRow = models
 	a.localPullRow = pull
 	a.localCompatRow = compat
@@ -196,6 +220,49 @@ func (a *App) checkLocalLLM(announce bool) {
 	}()
 }
 
+// ollamaState answers the shortest question the local group is asked — is the
+// server up? — as a word and the state class that colours it.
+//
+// Three answers, not two, because "nothing is answering" splits into a server
+// that could be started from here and one that is not on the machine at all,
+// and those have different next actions. A stopped-but-installed server is
+// warning-coloured rather than error-coloured: it is not broken, it is off,
+// and the Start button beside the word is the whole fix.
+func ollamaState(reach, installed bool) (word, class string) {
+	switch {
+	case reach:
+		return "Running", "st-fresh"
+	case installed:
+		return "Stopped", "st-stale"
+	default:
+		return "Not installed", "st-none"
+	}
+}
+
+// ollamaStopButton decides what the Stop button does about a server that is
+// up. It is separate from the fill so the ownership rule — the board only
+// stops what it started — is testable without a GTK main loop.
+func ollamaStopButton(reach, ours bool) (visible, sensitive bool, tip string) {
+	if !reach {
+		return false, false, ""
+	}
+	if !ours {
+		return true, false, "This ollama was not started by the board, so it is not the " +
+			"board's to stop. Stop it the way you started it."
+	}
+	return true, true, "Stop the ollama server this board started, freeing the memory its " +
+		"loaded models hold."
+}
+
+// setStateClass gives a label exactly one of the state classes, so a second
+// fill does not leave the previous colour behind it.
+func setStateClass(l *gtk.Label, class string) {
+	for _, c := range []string{"st-fresh", "st-stale", "st-broken", "st-running", "st-none"} {
+		l.RemoveCSSClass(c)
+	}
+	l.AddCSSClass(class)
+}
+
 // fillLocalLLM renders one probe into the four rows. Main thread.
 func (a *App) fillLocalLLM(ollama, compat gfy.LocalProbe, model string) {
 	if a.localGroup == nil {
@@ -204,6 +271,16 @@ func (a *App) fillLocalLLM(ollama, compat gfy.LocalProbe, model string) {
 
 	// ollama: installed / running / serving what.
 	bin := gfy.Ollama()
+
+	word, class := ollamaState(ollama.Reach, bin != "")
+	a.localStateLbl.SetText(word)
+	setStateClass(a.localStateLbl, class)
+
+	vis, sens, tip := ollamaStopButton(ollama.Reach, gfy.StartedOllama())
+	a.localStopBtn.SetVisible(vis)
+	a.localStopBtn.SetSensitive(sens)
+	a.localStopBtn.SetTooltipText(tip)
+
 	switch {
 	case ollama.Reach:
 		sub := "Running at " + ollama.BaseURL + " — " +
@@ -389,6 +466,36 @@ func (a *App) startOllama() {
 			gfy.PinOllama()
 			applog.Infof("started ollama via %s", how)
 			a.toastf("ollama started (%s)", how)
+			a.checkLocalLLM(false)
+		})
+	}()
+}
+
+// stopOllama is Start's mirror. It runs off the main thread for the same
+// reason: the systemctl route waits for the unit to actually go down.
+//
+// errNotOurs is not reported as a failure, because it is not one — it is the
+// ownership rule answering, and the button that produced it was already
+// insensitive for exactly that case, so reaching here at all means the server
+// changed hands between the last probe and the click.
+func (a *App) stopOllama() {
+	a.localStopBtn.SetSensitive(false)
+	go func() {
+		how, err := gfy.StopOllama()
+		idle(func() {
+			switch {
+			case gfy.NotOurs(err):
+				applog.Infof("not stopping ollama: %v", err)
+				a.toast("that ollama was not started by the board, so it is not ours to stop")
+			case err != nil:
+				applog.Errorf("stop ollama (%s): %v", how, err)
+				a.toastf("could not stop ollama: %v", err)
+			default:
+				applog.Infof("stopped ollama via %s", how)
+				a.toastf("ollama stopped (%s)", how)
+			}
+			// Either way the truth about the port is now stale: re-probe, and
+			// let the fill decide what the buttons and the word should say.
 			a.checkLocalLLM(false)
 		})
 	}()

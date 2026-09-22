@@ -51,6 +51,16 @@ const (
 	// models.dev publishes for this subscription.
 	OpenCodeBackend = "opencode-go"
 
+	// OpenCodeZenBackend is the same idea for the other plan. Zen is
+	// pay-as-you-go over a wider estate — the same open models, the frontier
+	// ones, and a handful the gateway serves at no charge at all — and it is
+	// a DIFFERENT BILL reached over a different path with the same key. It
+	// gets its own backend name for exactly that reason: a run billed to Zen
+	// must not appear in the argv, the log and the cost notice as a run
+	// against the Go subscription's monthly allowance. Its provider entry is
+	// a second, separate entry in ~/.graphify/providers.json.
+	OpenCodeZenBackend = "opencode-zen"
+
 	// OpenCodeKeyVar is the credential graphify reads for this provider — it
 	// is the `env_key` of the registered entry, so nothing in ggraphify ever
 	// holds the value. The name is OpenCode's own, shared with Zen.
@@ -63,16 +73,34 @@ const (
 	// provider's base_url is a literal in the JSON file.
 	OpenCodeBaseURLVar = "OPENCODE_BASE_URL"
 
+	// OpenCodeZenBaseURLVar is the same override for the Zen plan. Two
+	// variables rather than one, because the two plans now exist side by side
+	// in one process: a single variable could only move whichever endpoint was
+	// selected at the moment it was read, and a board that had moved BOTH
+	// gateways to one URL would be quietly billing one plan's runs to the
+	// other.
+	OpenCodeZenBaseURLVar = "OPENCODE_ZEN_BASE_URL"
+
 	// OpenCodeModelVar is the registered entry's `model_env_key`, so it
 	// overrides the entry's default the same way GRAPHIFY_OPENAI_MODEL does
 	// for the openai backend. The model chosen in settings still wins: it goes
 	// in as `--model`, which llm.py prefers over any env default.
 	OpenCodeModelVar = "GRAPHIFY_OPENCODE_MODEL"
 
+	// OpenCodeZenModelVar is the Zen entry's own model_env_key. Separate for
+	// the reason store.Settings keeps a separate model per plan: a model id is
+	// not portable between the two catalogues, and one variable feeding both
+	// entries would send a Go id to Zen the first time the backend moved.
+	OpenCodeZenModelVar = "GRAPHIFY_OPENCODE_ZEN_MODEL"
+
 	// DefaultOpenCodeBaseURL is OpenCode Go's OpenAI-compatible endpoint. Note
 	// the `/go/` segment: dropping it is Zen, which is a different plan and a
 	// different bill.
 	DefaultOpenCodeBaseURL = "https://opencode.ai/zen/go/v1"
+
+	// DefaultOpenCodeZenBaseURL is the same gateway without the `/go/`
+	// segment: OpenCode Zen, pay-as-you-go, over the same key.
+	DefaultOpenCodeZenBaseURL = "https://opencode.ai/zen/v1"
 
 	// DefaultOpenCodeModel is what a run with no model chosen asks for. An
 	// extraction is a schema-constrained JSON job over one file at a time —
@@ -106,6 +134,145 @@ const (
 // `/models` on the gateway returns. A variable rather than a constant so a
 // test can answer it locally; nothing in the application writes it.
 var ModelsDevURL = "https://models.dev/api.json"
+
+// An OpenCodePlan is one of the two OpenCode subscriptions, and everything
+// that differs between them. They differ in more than a URL: the endpoint
+// decides the bill, the models.dev provider decides the prices, the model
+// env key and the provider entry are per plan, and the proxy needs a path of
+// its own per plan so one loopback port can serve both.
+//
+// It is a value rather than a mode switch on purpose. A package-level
+// "current plan" would be read by the proxy handler, the catalogue fetch and
+// the verifier at three different moments, and a settings change between two
+// of them would bill a Zen run to the Go allowance. Every function that can
+// reach a gateway takes the backend name and resolves the plan itself.
+type OpenCodePlan struct {
+	// Backend is the provider name in the argv and in providers.json.
+	Backend string
+	// Name is the plan as its documentation calls it.
+	Name string
+	// DefaultURL is the gateway, and URLVar the variable that moves it.
+	DefaultURL string
+	URLVar     string
+	// ModelsDevProvider is the provider id to read prices and context windows
+	// from. The two plans are published separately there, and joining one
+	// plan's models to the other's prices would put a number on screen that
+	// nobody will be charged.
+	ModelsDevProvider string
+	// ModelVar is the entry's model_env_key.
+	ModelVar string
+	// ProxyPath is the path prefix the loopback proxy serves this plan on.
+	// The Go plan keeps "/v1" so a provider entry written by an older build
+	// still points somewhere real.
+	ProxyPath string
+	// DefaultModel is what a run with nothing chosen asks for, or "" when the
+	// plan has no fixed answer and the catalogue decides; see
+	// DefaultModelFor.
+	DefaultModel string
+	// Billing is the sentence the confirm dialog says about where the money
+	// comes from.
+	Billing string
+}
+
+// openCodePlans is the pair, Go first.
+var openCodePlans = []OpenCodePlan{{
+	Backend:           OpenCodeBackend,
+	Name:              "OpenCode Go",
+	DefaultURL:        DefaultOpenCodeBaseURL,
+	URLVar:            OpenCodeBaseURLVar,
+	ModelsDevProvider: "opencode-go",
+	ModelVar:          OpenCodeModelVar,
+	ProxyPath:         "/v1",
+	DefaultModel:      DefaultOpenCodeModel,
+	Billing: "drawn from that $10/month subscription's monthly allowance for this " +
+		"model rather than from an API balance",
+}, {
+	Backend:           OpenCodeZenBackend,
+	Name:              "OpenCode Zen",
+	DefaultURL:        DefaultOpenCodeZenBaseURL,
+	URLVar:            OpenCodeZenBaseURLVar,
+	ModelsDevProvider: "opencode",
+	ModelVar:          OpenCodeZenModelVar,
+	ProxyPath:         "/zen/v1",
+	// No constant: Zen's catalogue is not this build's to know — it is wider
+	// than Go's, it moves faster, and the models worth defaulting to are the
+	// ones it serves at no charge, which is a fact only the live catalogue
+	// carries. DefaultModelFor picks from what the gateway actually said.
+	DefaultModel: "",
+	Billing: "billed per token to that OpenCode account, at the price shown against the " +
+		"model — except the models the gateway serves free, which are labelled as such",
+}}
+
+// OpenCodePlans is both plans, for a caller building a picker.
+func OpenCodePlans() []OpenCodePlan {
+	return append([]OpenCodePlan(nil), openCodePlans...)
+}
+
+// IsOpenCodeBackend reports whether a backend name is one of the two OpenCode
+// plans. Every `== OpenCodeBackend` that meant "is this OpenCode" rather than
+// "is this specifically the Go plan" is this instead.
+func IsOpenCodeBackend(backend string) bool {
+	b := strings.TrimSpace(backend)
+	return b == OpenCodeBackend || b == OpenCodeZenBackend
+}
+
+// OpenCodePlanFor resolves a backend name to its plan. Anything that is not
+// Zen resolves to Go, so a caller that has not been taught about plans at all
+// behaves exactly as it did before this existed.
+func OpenCodePlanFor(backend string) OpenCodePlan {
+	if strings.TrimSpace(backend) == OpenCodeZenBackend {
+		return openCodePlans[1]
+	}
+	return openCodePlans[0]
+}
+
+// DefaultModelFor is the model a run against this plan asks for when nothing
+// has been chosen.
+//
+// For the Go plan that is a constant. For Zen it is read out of the
+// catalogue, because Zen bills per token and the model to fall back to is one
+// that costs nothing — which models those are is a fact the gateway and
+// models.dev publish rather than one this build can bake in. Of the free ones
+// it takes the widest context window, for the reason OpenCodeOutputBudget
+// documents at length: a chunk is 60_000 tokens of corpus and the reply runs
+// at six tenths of it, so a narrow window is what makes a run split, retry
+// and lose files. Among free models that is the only axis left to choose on.
+//
+// An empty answer — no catalogue yet, no network since launch — is honest: it
+// means the board has nothing to claim, and the settings page says so rather
+// than naming an id it invented.
+func DefaultModelFor(backend string) string {
+	plan := OpenCodePlanFor(backend)
+	if plan.DefaultModel != "" {
+		return plan.DefaultModel
+	}
+	catalogue, _ := openCodeCatalogNow(plan.Backend)
+	best := ""
+	bestCtx := -1
+	for _, m := range catalogue {
+		if m.IsFree() && m.Context > bestCtx {
+			best, bestCtx = m.ID, m.Context
+		}
+	}
+	if best != "" {
+		return best
+	}
+	// No free model on offer: the catalogue is already cheapest-first, so the
+	// first priced entry is the cheapest one that has a published price.
+	for _, m := range catalogue {
+		if m.Priced {
+			return m.ID
+		}
+	}
+	if len(catalogue) > 0 {
+		return catalogue[0].ID
+	}
+	return ""
+}
+
+// IsFree reports a model the gateway serves at no charge — published as a
+// zero price, which is only meaningful when a price was published at all.
+func (m OpenCodeModel) IsFree() bool { return m.Priced && m.Input == 0 && m.Output == 0 }
 
 // OpenCodeCaveat explains the loopback address in the provider entry, which
 // is otherwise the most alarming thing in this backend's configuration.
@@ -263,8 +430,10 @@ var openCodeCatalog = []OpenCodeModel{
 	{ID: "hy3-preview", Name: "hy3-preview", Input: 0, Output: 0, Context: 0, MaxOutput: 0, Priced: false},
 }
 
-var catalogCache struct {
-	sync.Mutex
+// The catalogue is cached per plan: the two gateways serve different model
+// lists at different prices, and one cache for both would answer the Zen
+// dropdown with Go's models the moment Go was refreshed first.
+type catalogEntry struct {
 	models  []OpenCodeModel
 	fetched time.Time
 	// live records that the list came from the gateway rather than from this
@@ -273,22 +442,41 @@ var catalogCache struct {
 	live bool
 }
 
-// OpenCodeCatalog is the model list the dropdown offers: the live one when a
-// refresh has succeeded within the last hour, the baked-in one otherwise. It
-// never blocks and never touches the network — RefreshOpenCodeCatalog does
-// that, from a goroutine the UI owns.
-func OpenCodeCatalog() []OpenCodeModel {
-	models, _ := openCodeCatalogNow()
+var catalogCache struct {
+	sync.Mutex
+	byPlan map[string]catalogEntry
+}
+
+// OpenCodeCatalog is the model list the dropdown offers for a plan: the live
+// one when a refresh has succeeded within the last hour, the baked-in one
+// otherwise. It never blocks and never touches the network —
+// RefreshOpenCodeCatalog does that, from a goroutine the UI owns.
+func OpenCodeCatalog(backend string) []OpenCodeModel {
+	models, _ := openCodeCatalogNow(backend)
 	return models
 }
 
-func openCodeCatalogNow() (models []OpenCodeModel, live bool) {
+// bakedCatalog is what a plan offers before the gateway has answered. Go has
+// a table; Zen deliberately has none — its catalogue is wider, moves faster,
+// and inventing ids for it would put models in a dropdown that no gateway
+// ever served. An empty list is the honest starting point, and the settings
+// page says the list arrives with the first refresh.
+func bakedCatalog(backend string) []OpenCodeModel {
+	if OpenCodePlanFor(backend).Backend == OpenCodeZenBackend {
+		return nil
+	}
+	return openCodeCatalog
+}
+
+func openCodeCatalogNow(backend string) (models []OpenCodeModel, live bool) {
+	plan := OpenCodePlanFor(backend)
 	catalogCache.Lock()
 	defer catalogCache.Unlock()
-	if len(catalogCache.models) > 0 && time.Since(catalogCache.fetched) < openCodeCatalogTTL {
-		return append([]OpenCodeModel(nil), catalogCache.models...), catalogCache.live
+	e := catalogCache.byPlan[plan.Backend]
+	if len(e.models) > 0 && time.Since(e.fetched) < openCodeCatalogTTL {
+		return append([]OpenCodeModel(nil), e.models...), e.live
 	}
-	return append([]OpenCodeModel(nil), openCodeCatalog...), false
+	return append([]OpenCodeModel(nil), bakedCatalog(plan.Backend)...), false
 }
 
 // RefreshOpenCodeCatalog fetches the plan's current model list and caches it
@@ -301,20 +489,22 @@ func openCodeCatalogNow() (models []OpenCodeModel, live bool) {
 // a gateway that cannot be reached leaves the baked-in list in place, because
 // a catalogue that cannot say what exists is worse than one that is a month
 // old.
-func RefreshOpenCodeCatalog(ctx context.Context) ([]OpenCodeModel, error) {
+func RefreshOpenCodeCatalog(ctx context.Context, backend string) ([]OpenCodeModel, error) {
+	plan := OpenCodePlanFor(backend)
 	catalogCache.Lock()
-	fresh := len(catalogCache.models) > 0 && time.Since(catalogCache.fetched) < openCodeCatalogTTL
-	cached := append([]OpenCodeModel(nil), catalogCache.models...)
+	e := catalogCache.byPlan[plan.Backend]
+	fresh := len(e.models) > 0 && time.Since(e.fetched) < openCodeCatalogTTL
+	cached := append([]OpenCodeModel(nil), e.models...)
 	catalogCache.Unlock()
 	if fresh {
 		return cached, nil
 	}
 
-	served, err := fetchOpenCodeModelIDs(ctx)
+	served, err := fetchOpenCodeModelIDs(ctx, plan)
 	if err != nil {
-		return OpenCodeCatalog(), err
+		return OpenCodeCatalog(plan.Backend), err
 	}
-	meta, metaErr := fetchModelsDev(ctx)
+	meta, metaErr := fetchModelsDev(ctx, plan)
 
 	out := make([]OpenCodeModel, 0, len(served))
 	for _, id := range served {
@@ -336,7 +526,10 @@ func RefreshOpenCodeCatalog(ctx context.Context) ([]OpenCodeModel, error) {
 	})
 
 	catalogCache.Lock()
-	catalogCache.models, catalogCache.fetched, catalogCache.live = out, time.Now(), true
+	if catalogCache.byPlan == nil {
+		catalogCache.byPlan = map[string]catalogEntry{}
+	}
+	catalogCache.byPlan[plan.Backend] = catalogEntry{models: out, fetched: time.Now(), live: true}
 	catalogCache.Unlock()
 	return append([]OpenCodeModel(nil), out...), metaErr
 }
@@ -344,17 +537,18 @@ func RefreshOpenCodeCatalog(ctx context.Context) ([]OpenCodeModel, error) {
 // fetchOpenCodeModelIDs reads the gateway's OpenAI-style model listing. It
 // needs no credential — the endpoint answers unauthenticated — which is what
 // lets the settings page populate before a key is exported.
-func fetchOpenCodeModelIDs(ctx context.Context) ([]string, error) {
+func fetchOpenCodeModelIDs(ctx context.Context, plan OpenCodePlan) ([]string, error) {
 	var doc struct {
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := getJSON(ctx, strings.TrimSuffix(OpenCodeUpstream(), "/")+"/models", &doc); err != nil {
+	up := OpenCodeUpstream(plan.Backend)
+	if err := getJSON(ctx, strings.TrimSuffix(up, "/")+"/models", &doc); err != nil {
 		return nil, err
 	}
 	if len(doc.Data) == 0 {
-		return nil, errors.New(OpenCodeUpstream() + "/models: served no models")
+		return nil, errors.New(up + "/models: served no models")
 	}
 	ids := make([]string, 0, len(doc.Data))
 	for _, m := range doc.Data {
@@ -366,7 +560,7 @@ func fetchOpenCodeModelIDs(ctx context.Context) ([]string, error) {
 }
 
 // fetchModelsDev reads the published prices and context windows.
-func fetchModelsDev(ctx context.Context) (map[string]OpenCodeModel, error) {
+func fetchModelsDev(ctx context.Context, plan OpenCodePlan) (map[string]OpenCodeModel, error) {
 	var doc map[string]struct {
 		Models map[string]struct {
 			Name string `json:"name"`
@@ -383,9 +577,9 @@ func fetchModelsDev(ctx context.Context) (map[string]OpenCodeModel, error) {
 	if err := getJSON(ctx, ModelsDevURL, &doc); err != nil {
 		return nil, err
 	}
-	provider, ok := doc[OpenCodeBackend]
+	provider, ok := doc[plan.ModelsDevProvider]
 	if !ok {
-		return nil, errors.New(ModelsDevURL + ": no " + OpenCodeBackend + " provider")
+		return nil, errors.New(ModelsDevURL + ": no " + plan.ModelsDevProvider + " provider")
 	}
 	out := make(map[string]OpenCodeModel, len(provider.Models))
 	for id, m := range provider.Models {
@@ -428,9 +622,9 @@ func (e *httpStatusError) Error() string { return e.url + ": HTTP " + Itoa(e.cod
 // OpenCodeModelByID finds a model in the catalogue. A miss is not a refusal:
 // a model this build has never heard of is still passed to the gateway, which
 // is the only thing that can actually say whether it exists.
-func OpenCodeModelByID(id string) (OpenCodeModel, bool) {
+func OpenCodeModelByID(backend, id string) (OpenCodeModel, bool) {
 	id = strings.TrimSpace(id)
-	for _, m := range OpenCodeCatalog() {
+	for _, m := range OpenCodeCatalog(backend) {
 		if m.ID == id {
 			return m, true
 		}
@@ -438,43 +632,58 @@ func OpenCodeModelByID(id string) (OpenCodeModel, bool) {
 	return OpenCodeModel{ID: id}, false
 }
 
-// OpenCodeModelFor is the model an opencode-go job will actually run, and
-// where that answer came from — the same shape as ClaudeCLIModelFor, and for
-// the same reason: the settings page and the confirm dialog must name the
-// same model for the same reason.
+// OpenCodeModelFor is the model an OpenCode job will actually run, and where
+// that answer came from — the same shape as ClaudeCLIModelFor, and for the
+// same reason: the settings page and the confirm dialog must name the same
+// model for the same reason.
 //
 // The order is the one that actually applies at run time: the chosen model
 // goes in as `--model`, which llm.py prefers over everything; the overlay's
-// GRAPHIFY_OPENCODE_MODEL is the entry's model_env_key, read when there is no
-// flag; and the entry's own default is the floor.
-func OpenCodeModelFor(overlay Env, model string) (m OpenCodeModel, origin string) {
+// model_env_key for this plan is read when there is no flag; and the entry's
+// own default is the floor.
+func OpenCodeModelFor(backend string, overlay Env, model string) (m OpenCodeModel, origin string) {
+	plan := OpenCodePlanFor(backend)
 	if v := strings.TrimSpace(model); v != "" {
-		found, known := OpenCodeModelByID(v)
+		found, known := OpenCodeModelByID(plan.Backend, v)
 		if !known {
 			return found, "the model setting (not in this build's catalogue — the gateway decides)"
 		}
 		return found, "the model setting"
 	}
-	if v := strings.TrimSpace(overlay[OpenCodeModelVar]); v != "" {
-		found, _ := OpenCodeModelByID(v)
-		return found, "the overlay's " + OpenCodeModelVar
+	if v := strings.TrimSpace(overlay[plan.ModelVar]); v != "" {
+		found, _ := OpenCodeModelByID(plan.Backend, v)
+		return found, "the overlay's " + plan.ModelVar
 	}
-	found, _ := OpenCodeModelByID(DefaultOpenCodeModel)
+	def := DefaultModelFor(plan.Backend)
+	if def == "" {
+		// Zen before any catalogue has arrived. Naming nothing is the truth:
+		// the plan has no fixed default, and the dropdown says the list
+		// arrives with the first refresh.
+		return OpenCodeModel{}, "no default yet — refresh " + plan.Name + "'s model list"
+	}
+	found, _ := OpenCodeModelByID(plan.Backend, def)
+	if plan.DefaultModel == "" {
+		if found.IsFree() {
+			return found, "the widest-context model " + plan.Name + " currently serves free"
+		}
+		return found, "the cheapest model " + plan.Name + " is currently serving"
+	}
 	return found, "the board's default for this plan"
 }
 
 // OpenCodeUpstream is the gateway itself — what the proxy forwards to, and
-// what OPENCODE_BASE_URL moves: a corporate proxy, or OpenCode Zen's
-// https://opencode.ai/zen/v1 for somebody on that plan instead.
+// what the plan's base-URL variable moves: a corporate proxy, or a gateway
+// under test.
 //
 // It is NOT what goes into the provider entry. That is the loopback proxy,
 // because graphify cannot send the session header the gateway requires; see
 // opencodeproxy.go.
-func OpenCodeUpstream() string {
-	if v := strings.TrimSpace(os.Getenv(OpenCodeBaseURLVar)); v != "" {
+func OpenCodeUpstream(backend string) string {
+	plan := OpenCodePlanFor(backend)
+	if v := strings.TrimSpace(os.Getenv(plan.URLVar)); v != "" {
 		return v
 	}
-	return DefaultOpenCodeBaseURL
+	return plan.DefaultURL
 }
 
 // HasOpenCodeKey reports whether an OpenCode key is visible in this
@@ -496,7 +705,7 @@ func ProvidersPath() string {
 // OpenCodeProvider is what ~/.graphify/providers.json currently says about
 // this provider: the endpoint it points at, the model it defaults to, and
 // whether it is there at all.
-func OpenCodeProvider() (baseURL, model string, registered bool) {
+func OpenCodeProvider(backend string) (baseURL, model string, registered bool) {
 	path := ProvidersPath()
 	if path == "" {
 		return "", "", false
@@ -509,7 +718,7 @@ func OpenCodeProvider() (baseURL, model string, registered bool) {
 	if json.Unmarshal(b, &all) != nil {
 		return "", "", false
 	}
-	cfg, ok := all[OpenCodeBackend]
+	cfg, ok := all[OpenCodePlanFor(backend).Backend]
 	if !ok {
 		return "", "", false
 	}
@@ -532,9 +741,10 @@ func OpenCodeProvider() (baseURL, model string, registered bool) {
 // field a user adds by hand survives, as does every other provider in the
 // file: it is decoded as raw JSON per name and re-encoded.
 func EnsureOpenCodeProvider(backend, model string) (path string, wrote bool, err error) {
-	if strings.TrimSpace(backend) != OpenCodeBackend {
+	if !IsOpenCodeBackend(backend) {
 		return "", false, nil
 	}
+	plan := OpenCodePlanFor(backend)
 	path = ProvidersPath()
 	if path == "" {
 		return "", false, os.ErrNotExist
@@ -543,7 +753,7 @@ func EnsureOpenCodeProvider(backend, model string) (path string, wrote bool, err
 	// entry claims it does. Starting it here rather than at the call site
 	// keeps the two facts — where graphify will connect, and what is
 	// listening there — written by one function.
-	proxy, err := StartOpenCodeProxy()
+	proxy, err := StartOpenCodeProxy(plan.Backend)
 	if err != nil {
 		return path, false, err
 	}
@@ -567,7 +777,7 @@ func EnsureOpenCodeProvider(backend, model string) (path string, wrote bool, err
 	// know about — a header map a future graphify grows, a comment key — is
 	// not deleted by a refresh of the price.
 	entry := map[string]any{}
-	if raw, ok := all[OpenCodeBackend]; ok {
+	if raw, ok := all[plan.Backend]; ok {
 		if uerr := json.Unmarshal(raw, &entry); uerr != nil {
 			entry = map[string]any{}
 		}
@@ -580,12 +790,12 @@ func EnsureOpenCodeProvider(backend, model string) (path string, wrote bool, err
 			model = prev
 		}
 	}
-	m, _ := OpenCodeModelFor(nil, model)
+	m, _ := OpenCodeModelFor(plan.Backend, nil, model)
 	managed := map[string]any{
 		"base_url":      proxy,
 		"default_model": m.ID,
 		"env_key":       OpenCodeKeyVar,
-		"model_env_key": OpenCodeModelVar,
+		"model_env_key": plan.ModelVar,
 		"pricing":       map[string]float64{"input": m.Input, "output": m.Output},
 		// Managed for the same reason pricing is, and it took the same kind of
 		// evidence to learn it: the reply cap belongs to the model, not to the
@@ -612,7 +822,7 @@ func EnsureOpenCodeProvider(backend, model string) (path string, wrote bool, err
 	if err != nil {
 		return path, false, err
 	}
-	all[OpenCodeBackend] = raw
+	all[plan.Backend] = raw
 
 	// Sorted keys and an indent, because this is a file a human edits after
 	// we have written it, and Go's map order would reshuffle it on every
@@ -682,7 +892,14 @@ type openCodeVerdict struct {
 	at     time.Time
 }
 
-var openCodeVerdicts sync.Map // model id -> openCodeVerdict
+// Keyed by plan AND model: the two gateways answer for their own estates, and
+// a model that is fine on Zen can be absent from Go. One key space would let
+// the first answer stand for both.
+var openCodeVerdicts sync.Map // verdictKey -> openCodeVerdict
+
+func verdictKey(backend, model string) string {
+	return OpenCodePlanFor(backend).Backend + "\x00" + strings.TrimSpace(model)
+}
 
 // openCodeVerdictTTL keeps a verdict long enough to cover a sweep and short
 // enough that a model fixed upstream is retried the same afternoon.
@@ -690,8 +907,8 @@ const openCodeVerdictTTL = 30 * time.Minute
 
 // OpenCodeVerdict is the cached answer for a model, without touching the
 // network: known is false when it has never been asked.
-func OpenCodeVerdict(model string) (known, ok bool, detail string) {
-	v, hit := openCodeVerdicts.Load(strings.TrimSpace(model))
+func OpenCodeVerdict(backend, model string) (known, ok bool, detail string) {
+	v, hit := openCodeVerdicts.Load(verdictKey(backend, model))
 	if !hit {
 		return false, false, ""
 	}
@@ -709,12 +926,16 @@ func OpenCodeVerdict(model string) (known, ok bool, detail string) {
 // A network failure is NOT a verdict: it says something about this machine's
 // connection, not about the model, and recording it would refuse a run for the
 // wrong reason. Only an answer from the gateway is cached.
-func VerifyOpenCodeModel(ctx context.Context, model string) (bool, string) {
+func VerifyOpenCodeModel(ctx context.Context, backend, model string) (bool, string) {
+	plan := OpenCodePlanFor(backend)
 	model = strings.TrimSpace(model)
 	if model == "" {
-		model = DefaultOpenCodeModel
+		model = DefaultModelFor(plan.Backend)
 	}
-	if known, ok, detail := OpenCodeVerdict(model); known {
+	if model == "" {
+		return false, plan.Name + " has not said which models it serves yet."
+	}
+	if known, ok, detail := OpenCodeVerdict(plan.Backend, model); known {
 		return ok, detail
 	}
 	key := strings.TrimSpace(os.Getenv(OpenCodeKeyVar))
@@ -725,7 +946,7 @@ func VerifyOpenCodeModel(ctx context.Context, model string) (bool, string) {
 	body := `{"model":` + jsonString(model) +
 		`,"messages":[{"role":"user","content":"ping"}],"max_tokens":8,"temperature":0}`
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimSuffix(OpenCodeUpstream(), "/")+"/chat/completions", strings.NewReader(body))
+		strings.TrimSuffix(OpenCodeUpstream(plan.Backend), "/")+"/chat/completions", strings.NewReader(body))
 	if err != nil {
 		return true, "" // cannot even build the request: not the model's fault
 	}
@@ -750,8 +971,74 @@ func VerifyOpenCodeModel(ctx context.Context, model string) (bool, string) {
 			verdict.detail += " — " + msg
 		}
 	}
-	openCodeVerdicts.Store(model, verdict)
+	openCodeVerdicts.Store(verdictKey(plan.Backend, model), verdict)
 	return verdict.ok, verdict.detail
+}
+
+// openCodeSweepConcurrency is how many models are probed at once. Small on
+// purpose: this is a courtesy probe against somebody else's gateway, and a
+// catalogue of forty opened forty at a time is the shape that gets an IP rate
+// limited — which would then be recorded as forty models refusing.
+const openCodeSweepConcurrency = 4
+
+// VerifyOpenCodeCatalog asks the gateway about every model in a list that has
+// no cached verdict, and reports each answer as it arrives.
+//
+// This is what lets the settings dropdown say which models are actually
+// reachable rather than only which ones are listed. The distinction is not
+// cosmetic: the gateway lists models it serves to some regions and accounts
+// and not others, `/models` says nothing about which, and picking one of them
+// costs a whole run before the truth arrives. Probing costs eight tokens per
+// model.
+//
+// onResult is called from this goroutine, once per model, with the gateway's
+// own words on a refusal. A model that was already verified is reported from
+// cache without a request. Only answers are cached — an unreachable gateway
+// says nothing about a model, so those models simply stay unknown and are
+// asked again next time.
+func VerifyOpenCodeCatalog(ctx context.Context, backend string, models []OpenCodeModel, onResult func(id string, ok bool, detail string)) {
+	plan := OpenCodePlanFor(backend)
+	if !HasOpenCodeKey() || len(models) == 0 {
+		return
+	}
+	ids := make(chan string)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	report := func(id string, ok bool, detail string) {
+		if onResult == nil {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		onResult(id, ok, detail)
+	}
+
+	for i := 0; i < openCodeSweepConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for id := range ids {
+				if ctx.Err() != nil {
+					return
+				}
+				ok, detail := VerifyOpenCodeModel(ctx, plan.Backend, id)
+				report(id, ok, detail)
+			}
+		}()
+	}
+	for _, m := range models {
+		if ctx.Err() != nil {
+			break
+		}
+		if known, ok, detail := OpenCodeVerdict(plan.Backend, m.ID); known {
+			report(m.ID, ok, detail)
+			continue
+		}
+		ids <- m.ID
+	}
+	close(ids)
+	wg.Wait()
 }
 
 // gatewayErrorMessage digs the human sentence out of the gateway's error
@@ -780,14 +1067,15 @@ func jsonString(s string) string {
 // one the gateway will actually answer with. It is a no-op for every other
 // backend, and for a model already verified in this process.
 func PreflightOpenCode(backend, model string) error {
-	if strings.TrimSpace(backend) != OpenCodeBackend {
+	if !IsOpenCodeBackend(backend) {
 		return nil
 	}
-	m, _ := OpenCodeModelFor(nil, model)
+	plan := OpenCodePlanFor(backend)
+	m, _ := OpenCodeModelFor(plan.Backend, nil, model)
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
-	if ok, detail := VerifyOpenCodeModel(ctx, m.ID); !ok {
-		return errors.New(detail + ". Pick another model under Settings ▸ OpenCode Go — " +
+	if ok, detail := VerifyOpenCodeModel(ctx, plan.Backend, m.ID); !ok {
+		return errors.New(detail + ". Pick another model under Settings ▸ " + plan.Name + " — " +
 			"a model can be listed by the gateway and still refuse this account or region")
 	}
 	return nil
@@ -799,26 +1087,33 @@ func PreflightOpenCode(backend, model string) error {
 // The entry not being there yet is not an error — SubmitCmd writes it on the
 // way to launching the job — so it is reported as what will happen rather than
 // as something wrong.
-func OpenCodeReady(model string) (bool, string) {
+func OpenCodeReady(backend, model string) (bool, string) {
+	plan := OpenCodePlanFor(backend)
 	if !HasOpenCodeKey() {
-		return false, "The " + OpenCodeBackend + " backend needs " + OpenCodeKeyVar +
+		return false, "The " + plan.Backend + " backend needs " + OpenCodeKeyVar +
 			" exported in this environment, and none is visible. Subscribe at " +
 			"https://opencode.ai/docs/go, copy the key, export it and relaunch the board — " +
 			"ggraphify never stores a key itself."
 	}
-	_, _, registered := OpenCodeProvider()
+	_, _, registered := OpenCodeProvider(plan.Backend)
 	// The endpoint worth naming is the gateway, not the loopback address the
 	// entry carries: the proxy is an implementation detail of getting the
 	// session header on, and saying "127.0.0.1" here would only puzzle
 	// somebody checking where their corpus goes.
-	where := OpenCodeUpstream()
-	m, origin := OpenCodeModelFor(nil, model)
+	where := OpenCodeUpstream(plan.Backend)
+	m, origin := OpenCodeModelFor(plan.Backend, nil, model)
+	if m.ID == "" {
+		// Zen, before the first catalogue. Nothing is wrong and nothing is
+		// ready: there is no model to name yet.
+		return false, plan.Name + " has not said which models it serves yet — open " +
+			"Settings ▸ " + plan.Name + " and refresh the model list, or pick a model there."
+	}
 	// A model the gateway does not serve fails every chunk of a run with
 	// "Model <id> is not supported", which surfaces as graphify's opaque "all
 	// semantic chunks failed". It is worth catching in the confirm dialog
 	// instead — but only against a list actually fetched from the gateway,
 	// never against this build's table, which is a month old by construction.
-	if catalogue, live := openCodeCatalogNow(); live {
+	if catalogue, live := openCodeCatalogNow(plan.Backend); live {
 		served := false
 		for _, c := range catalogue {
 			if c.ID == m.ID {
@@ -829,17 +1124,17 @@ func OpenCodeReady(model string) (bool, string) {
 		if !served {
 			return false, "The gateway's own model list does not include " + m.ID +
 				" — a run against it fails every chunk with \"Model " + m.ID +
-				" is not supported\". Pick another model under OpenCode Go."
+				" is not supported\". Pick another model under " + plan.Name + "."
 		}
 	}
 	// A model already caught refusing is worth saying before the run, not
 	// after twenty-five chunks have failed on it.
-	if known, ok, detail := OpenCodeVerdict(m.ID); known && !ok {
+	if known, ok, detail := OpenCodeVerdict(plan.Backend, m.ID); known && !ok {
 		return false, detail + ". Pick another model below — a model can be listed by the " +
 			"gateway and still refuse this account or region."
 	}
 	s := OpenCodeKeyVar + " is visible in this environment; requests go to " + where +
-		", billed to that OpenCode Go subscription.\nModel: " + m.Label() + " (from " + origin + ")."
+		", " + plan.Billing + ".\nModel: " + m.Label() + " (from " + origin + ")."
 	if registered {
 		return true, s + " The provider is registered in " + Tilde(ProvidersPath()) + "."
 	}

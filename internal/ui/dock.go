@@ -216,7 +216,9 @@ func (d *dockPane) jobsActions() gtk.Widgetter {
 	cancelAll := gtk.NewButtonWithLabel("Cancel all")
 	cancelAll.AddCSSClass("flat")
 	cancelAll.AddCSSClass("destructive-action")
-	cancelAll.ConnectClicked(func() { d.a.runner.CancelAll() })
+	cancelAll.SetTooltipText("Cancel every running and queued job. Running jobs can be " +
+		"re-run from their rows; a large queue is asked about first.")
+	cancelAll.ConnectClicked(func() { d.a.cancelAll(d.reloadJobs) })
 
 	box := gtk.NewBox(gtk.OrientationHorizontal, 6)
 	box.Append(d.jobsSummary)
@@ -322,6 +324,13 @@ func (d *dockPane) laneUse(running []jobs.Snapshot) laneUse {
 	l := laneUse{}
 	l.freeLanes, l.meteredLanes, l.localLanes = d.a.runner.Lanes()
 	for _, s := range running {
+		// A paused job is not in a lane — the runner stopped counting it the
+		// moment it was stopped, and the strip has to say the same number the
+		// scheduler is using or the queued row under it reads "waiting for a
+		// local lane" beside a local lane the dispatcher considers free.
+		if s.Paused {
+			continue
+		}
 		switch {
 		case s.Cost != gfy.Metered:
 			l.freeBusy++
@@ -585,12 +594,7 @@ func (d *dockPane) jobRow(e dockEntry) *gtk.ListBoxRow {
 	l.SetHExpand(true)
 	box.Append(l)
 
-	if s.Cost == gfy.Metered {
-		m := gtk.NewLabel("$")
-		m.AddCSSClass("metered")
-		m.SetTooltipText("This job dispatches LLM requests against your API key.")
-		box.Append(m)
-	}
+	appendCostMark(box, s)
 
 	prog := newJobProgressBar()
 	box.Append(progressSlot(prog))
@@ -631,6 +635,26 @@ func (d *dockPane) jobRow(e dockEntry) *gtk.ListBoxRow {
 
 	d.rows = append(d.rows, &dockJobRow{id: s.ID, class: class, status: status, row: row, prog: prog})
 	return row
+}
+
+// appendCostMark adds the row's money mark. A metered job that runs against a
+// model on this machine is billed in hours, not dollars, so it takes the
+// machine's own icon and the "free" colour rather than the `$` that promises an
+// API key will be charged — which is the fact a person scanning the lane needs.
+func appendCostMark(box *gtk.Box, s jobs.Snapshot) {
+	if s.Local {
+		m := gtk.NewImageFromIconName("computer-symbolic")
+		m.AddCSSClass("local")
+		m.SetTooltipText("Runs a model on this machine — no API key and no bill.")
+		box.Append(m)
+		return
+	}
+	if s.Cost == gfy.Metered {
+		m := gtk.NewLabel("$")
+		m.AddCSSClass("metered")
+		m.SetTooltipText("This job dispatches LLM requests against your API key.")
+		box.Append(m)
+	}
 }
 
 // dockStatus is the strip's status text. It is wordier than the board column's
