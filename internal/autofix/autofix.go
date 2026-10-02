@@ -62,6 +62,14 @@ type Policy struct {
 	LocalBackend string
 	LocalModel   string
 
+	// Pins says the LLM steps run on the Heavy and Light work pins as they
+	// are configured rather than on LocalBackend/LocalModel. Local then means
+	// every pin is a local server that answered with its pinned model, and
+	// LocalBackend/LocalModel are the Heavy pin — kept only as the safety net
+	// for a per-repository or per-command override that would otherwise bill
+	// with metered fixes off.
+	Pins bool
+
 	// Metered lets the loop spend money — LLM steps against a billed backend.
 	// It has no default: nothing in this package turns it on, and the settings
 	// page starts it off. A loop that bills a card without a click would be
@@ -75,9 +83,16 @@ type Policy struct {
 	// that queued `graft build` on a machine without graft would fail once per
 	// stale checkout per cooldown, forever.
 	//
-	// It never BUILDS a first index and never runs the deep pass: see
-	// graftstate.Index.Repairable for why those two are not unattended work.
+	// It never runs the deep pass, and builds a first index only under
+	// GraftCreate: see graftstate.Index.Repairable for why neither is a repair.
 	Graft bool
+
+	// GraftCreate widens Graft from "repair the indexes this machine has" to
+	// "every checkout has one": a git checkout with no graft/ at all gets a
+	// first `graft build`. Only meaningful with Graft — without the CLI there
+	// is nothing to build with. It is a preference, because that build writes
+	// graft/ into the working tree and graft's rule into its .gitignore.
+	GraftCreate bool
 
 	// Global says the loop may also bring the THIRD index up to date — the
 	// cross-repo graph under ~/.graphify — by re-merging a member whose own
@@ -157,6 +172,15 @@ type Candidate struct {
 	// fleets is a setting, and this package takes no settings.
 	Enrollable bool
 	Excluded   bool
+	// NoGit is the row's: a directory boarded on its graph alone. graft
+	// indexes repositories, so it never gets a first build.
+	NoGit bool
+	// GraftOnly marks a checkout the loop keeps a graft index for and nothing
+	// else — a linked worktree the board does not show. Its Graph and Global
+	// are zero and ignored: a worktree is the same repository on another
+	// branch, and extracting it would pay for a graph its main checkout's
+	// already covers, while graft's index is free and per working tree.
+	GraftOnly bool
 	// Busy is set when a job for this repository is already queued or running
 	// — the user's own, or one of this loop's earlier chains.
 	Busy bool
@@ -177,6 +201,9 @@ type Action struct {
 	// Local says the metered steps in this plan will run against the local
 	// model rather than a billed backend.
 	Local bool
+	// GraftOnly is the candidate's: the plan is a lone graft-build for a
+	// checkout that has no row on the board.
+	GraftOnly bool
 }
 
 // Skip is one repository the loop looked at and declined, for the diagnostics
@@ -235,14 +262,15 @@ func Sig(g graphstate.Graph) string {
 // with the global loop switched off — on the old signature; otherwise every
 // stale index on it would read as a new defect the loop can never clear.
 func candSig(c Candidate, pol Policy) string {
+	if c.GraftOnly {
+		return graftCode(c, pol)
+	}
 	codes := make([]string, 0, 3)
 	if sig := Sig(c.Graph); sig != "" {
 		codes = append(codes, sig)
 	}
-	if pol.Graft {
-		if code := c.Graft.Issue(); code != "" {
-			codes = append(codes, code)
-		}
+	if code := graftCode(c, pol); code != "" {
+		codes = append(codes, code)
 	}
 	if pol.Global {
 		if code := globalCode(c, pol); code != "" {
@@ -250,6 +278,33 @@ func candSig(c Candidate, pol Policy) string {
 		}
 	}
 	return strings.Join(codes, ",")
+}
+
+// graftCode is what is wrong with this checkout's graft index under the
+// policy: a defect graft build repairs, or — when first builds are wanted and
+// this is a git checkout — that there is no index at all.
+func graftCode(c Candidate, pol Policy) string {
+	if !pol.Graft {
+		return ""
+	}
+	if code := c.Graft.Issue(); code != "" {
+		return code
+	}
+	if pol.GraftCreate && !c.NoGit && c.Graft.State == graftstate.StateNone {
+		return graftstate.IssueMissing
+	}
+	return ""
+}
+
+// graftStep is the graft-build this candidate's plan should end with, if any.
+func graftStep(c Candidate, pol Policy) (heal.Step, bool) {
+	switch graftCode(c, pol) {
+	case "":
+		return heal.Step{}, false
+	case graftstate.IssueMissing:
+		return heal.GraftCreateStep(c.Graft)
+	}
+	return heal.GraftStep(c.Graft)
 }
 
 // globalCode is what is wrong with this repository's place in the global
@@ -395,21 +450,21 @@ func (e *Engine) Plan(cands []Candidate, pol Policy) (actions []Action, skips []
 			delete(e.seen, c.Path)
 			continue
 		}
-		plan := heal.For(c.Graph, allow)
-		// Order is the point, because a chain stops at its first failure.
-		// The re-merge comes after the steps that rewrite graph.json — it
-		// exists to pick up what they wrote — and before `graft build`, which
-		// is unrelated to both and must not be what stops either of them.
-		if step, ok := globalStep(c, pol, plan); ok {
-			plan.Steps = append(plan.Steps, step)
-		}
-		if pol.Graft {
-			if step, ok := heal.GraftStep(c.Graft); ok {
-				// Appended LAST, for the same reason: a `graft build` that
-				// cannot run must not be what stops this checkout's graph
-				// being rebuilt.
+		var plan heal.Plan
+		if !c.GraftOnly {
+			plan = heal.For(c.Graph, allow)
+			// Order is the point, because a chain stops at its first failure.
+			// The re-merge comes after the steps that rewrite graph.json — it
+			// exists to pick up what they wrote — and before `graft build`,
+			// which is unrelated to both and must not be what stops either.
+			if step, ok := globalStep(c, pol, plan); ok {
 				plan.Steps = append(plan.Steps, step)
 			}
+		}
+		if step, ok := graftStep(c, pol); ok {
+			// Appended LAST, for the same reason: a `graft build` that cannot
+			// run must not be what stops this checkout's graph being rebuilt.
+			plan.Steps = append(plan.Steps, step)
 		}
 		if plan.Empty() {
 			skips = append(skips, Skip{c.Path, c.Name,
@@ -434,7 +489,14 @@ func (e *Engine) Plan(cands []Candidate, pol Policy) (actions []Action, skips []
 			// signature gets one — this is progress, not a repeat.
 			rec.attempts, rec.err, rec.declared = 0, "", false
 		case rec.attempts >= attemptCap(pol, sig):
-			skips = append(skips, Skip{c.Path, c.Name, gaveUp(sig, rec.attempts)})
+			if !rec.declared {
+				// Only until Declare has said it out loud. A repository the
+				// loop has given up on stays a candidate forever — its defect
+				// is still there — and a skip line per tick would be the same
+				// sentence every thirty seconds for as long as the board is
+				// open. Declare is once per repository; so is this.
+				skips = append(skips, Skip{c.Path, c.Name, gaveUp(sig, rec.attempts)})
+			}
 			continue
 		case now.Sub(rec.last) < backoff(pol.Cooldown, rec.attempts):
 			skips = append(skips, Skip{c.Path, c.Name, "cooling down"})
@@ -450,6 +512,7 @@ func (e *Engine) Plan(cands []Candidate, pol Policy) (actions []Action, skips []
 		actions = append(actions, Action{
 			Path: c.Path, Name: c.Name, Plan: plan, Sig: sig,
 			Attempt: rec.attempts, Local: pol.Local && plan.Metered(),
+			GraftOnly: c.GraftOnly,
 		})
 	}
 	return actions, skips
@@ -495,9 +558,13 @@ func restamped(rec *record, sig string, g graphstate.Graph) bool {
 // reason: `global add` either replaces the merged nodes or it does not, and a
 // re-add that ran and left the entry older than the graph has proved the
 // timestamps cannot be made to agree by repeating it.
+//
+// A first graft build is the third: a `graft build` that ran and left no
+// index behind found nothing it parses (a docs-only checkout, say), and the
+// next one will find the same nothing.
 func attemptCap(pol Policy, sig string) int {
 	switch sig {
-	case graphstate.IssueBehind, globalgraph.IssueStale:
+	case graphstate.IssueBehind, globalgraph.IssueStale, graftstate.IssueMissing:
 		return 1
 	}
 	return pol.Attempts
@@ -521,6 +588,10 @@ func stuckWhy(sig string, attempts int) string {
 	if sig == globalgraph.IssueStale {
 		return "the global graph survived a re-add — its manifest entry is still older " +
 			"than this repository's graph, so merging it again cannot clear it"
+	}
+	if sig == graftstate.IssueMissing {
+		return "graft build left no index here — it found nothing it parses, " +
+			"so building again cannot create one"
 	}
 	if sig == graphstate.IssueBehind {
 		return "behind HEAD survived an update — the graph's commit stamp is not advancing, " +

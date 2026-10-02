@@ -282,14 +282,16 @@ func (a *App) describeAutoFix(set store.Settings) string {
 		autoFixOr(set.AutoFixCooldown, int(autofix.DefaultCooldown/time.Second)),
 		autoFixOr(set.AutoFixAttempts, autofix.DefaultAttempts))
 	switch {
+	case set.AutoFixFollowPins:
+		if _, _, ok, why := autoFixPinsLocal(set); ok {
+			s += "; LLM steps on the work pins, all local"
+		} else {
+			s += "; LLM steps on the work pins (" + why + ")"
+		}
 	case !set.AutoFixLocal():
 		s += "; local model off"
 	default:
-		eff := gfy.EffectiveBackend(set.Backend)
-		backend, preferred := eff, set.Model
-		if !gfy.IsLocalBackend(eff) {
-			backend, preferred = gfy.OllamaBackend, ""
-		}
+		backend, preferred := autoFixLocalPin(set)
 		if m, ok, why := gfy.AutoLocalModel(backend, preferred); ok {
 			s += "; LLM steps on " + backend + "/" + m
 		} else {

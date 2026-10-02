@@ -38,6 +38,7 @@ func main() {
 		outBase   = flag.String("out-base", "", "look for every repository's graph under this one directory instead, a subdirectory per checkout")
 		group     = flag.String("group", "", "only rows under this folder — a scan root, or a directory below one")
 		hidden    = flag.Bool("hidden", false, "board checkouts inside dot-named directories too")
+		worktrees = flag.Bool("worktrees", false, "board linked worktrees (checkouts whose .git is a file) too")
 		groups    = flag.Bool("groups", false, "list the folders the rows fall into, with counts, and exit")
 		unhealthy = flag.Bool("unhealthy", false, "only rows with something wrong — what the board's Fix button would act on")
 		behind    = flag.Bool("behind", false, "only rows whose graph was built from a commit that is no longer HEAD — what the board's Ctrl+U sweep would act on")
@@ -81,6 +82,10 @@ func main() {
 	if !setFlags["hidden"] {
 		opts.ShowHidden = set.ShowHidden
 	}
+	opts.ShowWorktrees = *worktrees
+	if !setFlags["worktrees"] {
+		opts.ShowWorktrees = set.ShowWorktrees
+	}
 	if *roots != "" {
 		for _, r := range strings.Split(*roots, ",") {
 			if r = strings.TrimSpace(r); r != "" {
@@ -106,6 +111,7 @@ func main() {
 		rows, err := board.Scan(board.Options{
 			Roots: opts.Roots, Depth: opts.Depth, SkipDrift: true,
 			OutName: opts.OutName, OutBase: opts.OutBase, ShowHidden: opts.ShowHidden,
+			ShowWorktrees: opts.ShowWorktrees,
 		})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "ggraphify-scan:", err)

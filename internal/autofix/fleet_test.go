@@ -2,6 +2,7 @@ package autofix
 
 import (
 	"testing"
+	"time"
 
 	"github.com/dns/ggraphify/internal/globalgraph"
 	"github.com/dns/ggraphify/internal/workspace"
@@ -275,5 +276,63 @@ func TestTheFleetPassRespectsMax(t *testing.T) {
 		[]Stranded{{Tag: "gone", Source: "/k/gone/graph.json"}}, pol)
 	if len(acts) != 1 {
 		t.Fatalf("got %d actions with Max=1", len(acts))
+	}
+}
+
+// A `graft build` that exits 0 and leaves the same drift behind is not a
+// repair. Forgetting the record on a clean exit reset the attempt count and
+// the cooldown together, so the next tick re-queued the whole-root rebuild at
+// once — 178 back-to-back rebuilds of ~/git in one afternoon.
+func TestACleanRebuildThatLeavesTheDriftIsNotRequeuedAtOnce(t *testing.T) {
+	e, now := fixed(t)
+	pol := graftOnFleet(enrollOn())
+	roots := []Root{federated("/git", nil, []string{"pulumi-wt-a"})}
+
+	first, _ := e.PlanFleet(roots, nil, pol)
+	if len(first) != 1 {
+		t.Fatalf("first tick planned %d actions, want 1", len(first))
+	}
+	e.FleetDone(first[0], "")
+
+	again, skips := e.PlanFleet(roots, nil, pol)
+	if len(again) != 0 {
+		t.Fatalf("re-queued the rebuild the tick after a clean run that changed nothing: %v",
+			fleetKinds(again))
+	}
+	if len(skips) != 1 || skips[0].Why != "cooling down" {
+		t.Fatalf("skips = %v, want one cooling down", skips)
+	}
+
+	*now = now.Add(DefaultCooldown)
+	second, _ := e.PlanFleet(roots, nil, pol)
+	if len(second) != 1 || second[0].Attempt != 2 {
+		t.Fatalf("after the cooldown got %v, want attempt 2", second)
+	}
+	e.FleetDone(second[0], "")
+
+	*now = now.Add(24 * time.Hour)
+	third, _ := e.PlanFleet(roots, nil, pol)
+	if len(third) != 0 {
+		t.Fatalf("attacked the same drift a third time: %v", fleetKinds(third))
+	}
+}
+
+// The record a clean run keeps is dropped the moment the root reads healthy,
+// so drift that comes back later starts from a fresh budget.
+func TestADriftThatClearsForgetsItsAttempts(t *testing.T) {
+	e, now := fixed(t)
+	pol := graftOnFleet(enrollOn())
+	drift := []Root{federated("/git", []string{"new"}, nil)}
+
+	first, _ := e.PlanFleet(drift, nil, pol)
+	e.FleetDone(first[0], "")
+	if acts, _ := e.PlanFleet([]Root{federated("/git", nil, nil)}, nil, pol); len(acts) != 0 {
+		t.Fatalf("a healthy root planned %v", fleetKinds(acts))
+	}
+
+	*now = now.Add(time.Second)
+	back, _ := e.PlanFleet(drift, nil, pol)
+	if len(back) != 1 || back[0].Attempt != 1 {
+		t.Fatalf("returning drift got %v, want attempt 1", back)
 	}
 }

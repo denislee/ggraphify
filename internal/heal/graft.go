@@ -34,3 +34,19 @@ func GraftStep(i graftstate.Index) (Step, bool) {
 	}
 	return Step{}, false
 }
+
+// GraftCreateStep is the free `graft build` that writes a first index into a
+// checkout that has none, and whether this index is one. It is a separate
+// function from GraftStep because the two are gated differently: a repair is
+// always unattended work, a first build only when the loop has been told it
+// may write graft/ into checkouts (and graft its rule into their .gitignore).
+func GraftCreateStep(i graftstate.Index) (Step, bool) {
+	if i.State != graftstate.StateNone {
+		return Step{}, false
+	}
+	return Step{
+		Kind: "graft-build",
+		Why: "build graft's index — this checkout has none, so an agent working in it " +
+			"falls back to grep. Free: tree-sitter only",
+	}, true
+}

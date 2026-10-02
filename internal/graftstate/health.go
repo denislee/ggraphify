@@ -14,11 +14,19 @@ package graftstate
 // whose scheduling belongs to the deep sweep and its local-model gate. What is
 // left is the honest unattended case: an index this machine already has, which
 // has stopped describing the tree it was built from.
+//
+// IssueMissing is the exception, and it is opt-out rather than absent: it is
+// never returned by Issue, only by a caller whose policy says first builds are
+// wanted (autofix.Policy.GraftCreate). Issue stays the list of defects, so the
+// row, the doctor and the Fix dialog do not start calling a checkout without
+// graft broken.
 const (
 	// IssueStale is an index whose recorded files have changed or gone.
 	IssueStale = "graft-stale"
 	// IssueBroken is a graft/ directory with no readable wiring.json.
 	IssueBroken = "graft-broken"
+	// IssueMissing is a checkout with no graft/ directory at all.
+	IssueMissing = "graft-missing"
 )
 
 // Issue is the code for what an unattended `graft build` would repair here, or

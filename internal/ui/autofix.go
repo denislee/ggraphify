@@ -2,13 +2,16 @@ package ui
 
 import (
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/dns/ggraphify/internal/applog"
 	"github.com/dns/ggraphify/internal/autofix"
 	"github.com/dns/ggraphify/internal/board"
+	"github.com/dns/ggraphify/internal/discover"
 	"github.com/dns/ggraphify/internal/gfy"
+	"github.com/dns/ggraphify/internal/graftstate"
 	"github.com/dns/ggraphify/internal/jobs"
 	"github.com/dns/ggraphify/internal/store"
 )
@@ -34,9 +37,11 @@ import (
 //     graphify's graph does, and `graft build` fixes it for free — so a stale
 //     or unreadable one is rebuilt in the same chain. So does the global
 //     graph's copy of a repository, which `graphify global add` re-merges for
-//     free. What the loop will not do is BUILD a graft index where there has
-//     never been one (that writes a directory into somebody's checkout and
-//     appends to its .gitignore), run graft's --deep pass (that is the deep
+//     free. It also builds a first graft index where there is none — in
+//     board rows and in their linked worktrees, which the board hides but an
+//     agent works in — unless switched off, since that writes graft/ into the
+//     checkout and appends to its .gitignore. What the loop will not do is
+//     run graft's --deep pass (that is the deep
 //     sweep, with its own gate), or JOIN a repository to the global graph
 //     (which repositories belong there is a judgement, not a defect).
 //   - It gives up. A repository whose defects survive the fix is tried a
@@ -76,13 +81,17 @@ func (a *App) autoFixTick() {
 	a.fleetTick(set, a.allRows())
 
 	cands := a.autoFixCandidates()
-	if len(cands) == 0 {
+	owners := worktreeOwners(a.allRows())
+	if len(cands) == 0 && len(owners) == 0 {
 		return
 	}
 
 	a.autofixBusy = true
 	go func() {
 		pol := autoFixPolicy(set)
+		if pol.Graft {
+			cands = append(cands, a.worktreeCandidates(owners, cands)...)
+		}
 		actions, skips := a.autofix.Plan(cands, pol)
 		stuck := a.autofix.Declare(cands, pol)
 		idle(func() {
@@ -138,8 +147,70 @@ func (a *App) autoFixCandidates() []autofix.Candidate {
 			Global:     r.Global,
 			Enrollable: fleets[filepath.Dir(r.Path)] && !r.NoGit,
 			Excluded:   r.Excluded,
+			NoGit:      r.NoGit,
 			Busy:       busy,
 		})
+	}
+	return out
+}
+
+// worktreeOwner is one board row whose linked worktrees the loop keeps graft
+// indexes for, as the main thread can see it before any file is read.
+type worktreeOwner struct {
+	gitDir string
+	name   string
+}
+
+// worktreeOwners is every main checkout on the board whose worktrees are in
+// scope. Main thread: it reads the row model. A row kept out of batch actions
+// keeps its worktrees out too — the X flag is about the repository.
+func worktreeOwners(rows []board.Row) []worktreeOwner {
+	var out []worktreeOwner
+	for _, r := range rows {
+		if r.NoGit || r.IsWorktree || r.Excluded || r.GitDir == "" {
+			continue
+		}
+		out = append(out, worktreeOwner{gitDir: r.GitDir, name: r.Name})
+	}
+	return out
+}
+
+// worktreeCandidates is every linked worktree of the owners that is not
+// already a row, as a graft-only candidate. Off the main thread: it reads
+// each repository's worktree registry and each worktree's graft/.
+//
+// The board hides worktrees by default (see discover.Options.ShowWorktrees)
+// and that is right for graphify — a worktree is the same repository on
+// another branch, and extracting it pays twice for one codebase. graft's index
+// is the opposite case: free to build and per working tree, and a worktree is
+// exactly where an agent is working. So the loop finds them through git's own
+// registry, wherever they live, and keeps their graft index and nothing else.
+func (a *App) worktreeCandidates(owners []worktreeOwner, boarded []autofix.Candidate) []autofix.Candidate {
+	have := make(map[string]bool, len(boarded))
+	for _, c := range boarded {
+		have[c.Path] = true
+	}
+	var out []autofix.Candidate
+	for _, o := range owners {
+		for _, wt := range discover.Worktrees(o.gitDir) {
+			if have[wt] {
+				continue // ShowWorktrees is on and it is a row of its own
+			}
+			have[wt] = true
+			gr, err := a.grafts.Read(graftstate.Options{Repo: wt})
+			if err != nil {
+				gr.State = graftstate.StateBroken
+				gr.Err = err.Error()
+			}
+			_, busy := a.runner.Busy(wt)
+			out = append(out, autofix.Candidate{
+				Path:      wt,
+				Name:      o.name + "@" + filepath.Base(wt),
+				Graft:     gr,
+				GraftOnly: true,
+				Busy:      busy,
+			})
+		}
 	}
 	return out
 }
@@ -166,6 +237,10 @@ func autoFixPolicy(set store.Settings) autofix.Policy {
 	// checkout.
 	if ok, why := gfy.GraftReady(); ok {
 		pol.Graft = true
+		// First builds — rows and their linked worktrees with no graft/ at
+		// all. A preference on top of the machine fact: it writes into the
+		// working tree.
+		pol.GraftCreate = set.AutoFixGraftCreate()
 	} else {
 		applog.Debugf("auto-fix: graft indexes left alone — %s", why)
 	}
@@ -182,27 +257,41 @@ func autoFixPolicy(set store.Settings) autofix.Policy {
 	// roots the user nominated.
 	pol.Enroll = set.AutoFixEnroll()
 
+	if set.AutoFixFollowPins {
+		// The pins are the answer, so there is no fallback to resolve — only
+		// whether they are free. When they all are, the loop may run the full
+		// plan on them; when one bills, the metered switch decides alone.
+		pol.Pins = true
+		backend, model, ok, why := autoFixPinsLocal(set)
+		if !ok {
+			if pol.Metered {
+				applog.Debugf("auto-fix: following the work pins — %s; metered fixes are on, so they run as set", why)
+			} else {
+				applog.Debugf("auto-fix: following the work pins — %s; metered fixes are off, so free steps only", why)
+			}
+			return pol
+		}
+		pol.Local = true
+		pol.LocalBackend = backend
+		pol.LocalModel = model
+		return pol
+	}
+
 	if !set.AutoFixLocal() {
 		return pol
 	}
 
-	// Which local backend, and with which model. When the board's backend is
-	// already a local one, its own model setting is the preference; when it is
-	// claude-cli or an API, the model setting names a model that server has
-	// never heard of, so the loop asks for the server's own default instead.
-	// gfy.AutoLocalModel resolves both cases and refuses rather than guessing
-	// when there is nothing usable.
-	eff := gfy.EffectiveBackend(set.Backend)
-	backend, preferred := eff, set.Model
-	if !gfy.IsLocalBackend(eff) {
-		backend, preferred = gfy.OllamaBackend, ""
-	}
+	backend, preferred := autoFixLocalPin(set)
 	model, ok, why := gfy.AutoLocalModel(backend, preferred)
 	if !ok {
 		// Not an error and not a toast: on a machine that has never run a
 		// local model this is the ordinary state of the world, every tick,
 		// forever. The loop carries on with the free plan.
-		applog.Debugf("auto-fix: no local model available (%s) — free steps only", why)
+		if pol.Metered {
+			applog.Debugf("auto-fix: no local model available (%s) — LLM steps run on their own pins", why)
+		} else {
+			applog.Debugf("auto-fix: no local model available (%s) — free steps only", why)
+		}
 		return pol
 	}
 	pol.Local = true
@@ -211,12 +300,77 @@ func autoFixPolicy(set store.Settings) autofix.Policy {
 	return pol
 }
 
+// autoFixLocalPin is the local backend the loop falls back to, and the model it
+// would prefer there. It reads the Heavy work pin, not the general Backend: the
+// LLM step the loop exists to run is the full extraction, and Heavy work is
+// where the user said extractions go. When that pin is already a local one, it
+// and its model are the answer; when it is claude-cli or an API, its model is
+// an id ollama has never heard of, so the loop asks for the server's own
+// default instead. gfy.AutoLocalModel resolves both cases and refuses rather
+// than guessing when there is nothing usable.
+func autoFixLocalPin(set store.Settings) (backend, preferred string) {
+	b, m := set.BackendFor(gfy.Heavy)
+	if eff := gfy.EffectiveBackend(b); gfy.IsLocalBackend(eff) {
+		return eff, m
+	}
+	return gfy.OllamaBackend, ""
+}
+
+// autoFixPinsLocal reports whether both work pins are free right now: each
+// resolves to a backend on this machine, the server answers, and it serves the
+// model the pin names (a blank model is whatever graphify defaults to). It
+// does not substitute — following the pins means a pinned model that is not
+// there is a reason to stay on the free plan, not a cue to pick another one.
+// backend and model are the Heavy pin's, for Policy.LocalBackend/LocalModel.
+//
+// Off the main thread: it probes.
+func autoFixPinsLocal(set store.Settings) (backend, model string, ok bool, why string) {
+	for _, w := range []struct {
+		weight gfy.Weight
+		name   string
+	}{{gfy.Heavy, "Heavy work"}, {gfy.Light, "Light work"}} {
+		b, m := set.BackendFor(w.weight)
+		eff := gfy.EffectiveBackend(b)
+		if !gfy.IsLocalBackend(eff) {
+			return "", "", false, w.name + " is on " + eff + ", which bills"
+		}
+		got, up, why := gfy.AutoLocalModel(eff, m)
+		if !up {
+			return "", "", false, w.name + ": " + why
+		}
+		if m = strings.TrimSpace(m); m != "" && got != m {
+			return "", "", false, w.name + ": " + eff + " does not serve " + m
+		}
+		if w.weight == gfy.Heavy {
+			backend, model = eff, m
+		}
+	}
+	return backend, model, true, ""
+}
+
+// autoFixToLocal reports whether one metered step, whose own pin resolved to
+// pinned, must be moved onto the policy's local model.
+//
+// The pin wins whenever the loop may use it. A local pin is free, so it runs
+// as configured; a billed one — claude-cli, an API — runs as configured once
+// the user has allowed metered fixes. Only a billed pin with metering off is
+// rerouted, because the alternative is the loop spending without a click.
+func autoFixToLocal(pinned string, act autofix.Action, pol autofix.Policy) bool {
+	return act.Local && !pol.Metered && !gfy.IsLocalBackend(pinned)
+}
+
 // runAutoFix queues one chain per repository, exactly as the Fix button does —
 // one chain each rather than one across all of them, so a failure on one
 // repository does not stop the others.
 func (a *App) runAutoFix(actions []autofix.Action, pol autofix.Policy) {
+	anyBilled := false
+	var where []string
 	for _, act := range actions {
 		act := act
+		if act.GraftOnly {
+			a.runGraftOnly(act)
+			continue
+		}
 		row := a.row(act.Path)
 		if row == nil {
 			// It left the board between the scan and here. Release the slot
@@ -229,6 +383,11 @@ func (a *App) runAutoFix(actions []autofix.Action, pol autofix.Policy) {
 		total := len(act.Plan.Steps)
 		steps := make([]jobs.ChainStep, 0, total)
 		global := false
+		// Where the LLM steps actually went, after the reroute — for the log
+		// line and the toast, which used to name the local model even for a
+		// step that ran on the Heavy work pin.
+		var llm []string
+		billed := false
 		for n, s := range act.Plan.Steps {
 			p := a.paramsFor(s.Kind, *row)
 			s.Apply(&p)
@@ -240,16 +399,28 @@ func (a *App) runAutoFix(actions []autofix.Action, pol autofix.Policy) {
 				p.Tag = globalTag(*row)
 				global = true
 			}
-			if act.Local && s.Cost() == gfy.Metered {
-				// The whole point of the loop: the step that would have been
-				// a bill is a local run instead. The sizing has to be redone
-				// after the backend moves — a.params sized the chunk and the
-				// timeout for whatever backend was configured, and against a
-				// local server those two numbers are the difference between a
-				// graph and six hours of truncated prose.
-				p.Backend = pol.LocalBackend
-				p.Model = pol.LocalModel
-				gfy.ApplyLocalSizing(&p)
+			if s.Cost() == gfy.Metered {
+				if autoFixToLocal(p.Backend, act, pol) {
+					// The step that would have been a bill is a local run
+					// instead. The sizing has to be redone after the backend
+					// moves — a.params sized the chunk and the timeout for
+					// whatever backend was configured, and against a local
+					// server those two numbers are the difference between a
+					// graph and six hours of truncated prose.
+					p.Backend = pol.LocalBackend
+					p.Model = pol.LocalModel
+					gfy.ApplyLocalSizing(&p)
+				}
+				where := p.Backend
+				if p.Model != "" {
+					where += "/" + p.Model
+				}
+				if !slices.Contains(llm, where) {
+					llm = append(llm, where)
+				}
+				if !gfy.IsLocalBackend(p.Backend) {
+					billed = true
+				}
 			}
 			steps = append(steps, jobs.ChainStep{
 				Kind: s.Kind,
@@ -262,7 +433,15 @@ func (a *App) runAutoFix(actions []autofix.Action, pol autofix.Policy) {
 		}
 
 		applog.Infof("auto-fix %s (attempt %d): %s — %s",
-			row.Name, act.Attempt, act.Sig, autoFixPlanLine(act, pol))
+			row.Name, act.Attempt, act.Sig, autoFixPlanLine(act, llm, billed))
+		if billed {
+			anyBilled = true
+		}
+		for _, w := range llm {
+			if !slices.Contains(where, w) {
+				where = append(where, w)
+			}
+		}
 		name := row.Name
 		a.runner.SubmitChain(steps, func(res jobs.ChainResult) {
 			// The runner calls this on a worker goroutine. The engine is safe
@@ -304,30 +483,71 @@ func (a *App) runAutoFix(actions []autofix.Action, pol autofix.Policy) {
 	}
 	how := "free steps"
 	switch {
-	case pol.Spends():
-		how = "metered — billed backend"
-	case pol.Local:
-		how = "local model " + pol.LocalModel
+	case anyBilled:
+		how = "metered — " + strings.Join(where, ", ")
+	case len(where) > 0:
+		how = "local model " + strings.Join(where, ", ")
 	}
 	a.toastf("auto-fix: %s (%s)", strings.Join(names, ", "), how)
 	a.refreshStatus()
 }
 
+// runGraftOnly queues the lone graft-build of a checkout with no board row — a
+// linked worktree. There is no row to size params from, and none is needed:
+// graft build takes the path and nothing else.
+func (a *App) runGraftOnly(act autofix.Action) {
+	steps := make([]jobs.ChainStep, 0, len(act.Plan.Steps))
+	for _, s := range act.Plan.Steps {
+		p := gfy.Params{Repo: act.Path}
+		s.Apply(&p)
+		step := jobs.ChainStep{
+			Kind:   s.Kind,
+			Repo:   act.Path,
+			Label:  "Auto-fix · " + gfy.Title(s.Kind) + " · " + act.Name,
+			Params: p,
+		}
+		if a.opts.Store != nil {
+			step.Env = a.opts.Store.Overlay(act.Path)
+		}
+		steps = append(steps, step)
+	}
+	applog.Infof("auto-fix %s (attempt %d): %s — %s (free)",
+		act.Name, act.Attempt, act.Sig, board.Tilde(act.Path))
+	a.runner.SubmitChain(steps, func(res jobs.ChainResult) {
+		errText := ""
+		if res.Err != nil {
+			errText = res.Err.Error()
+		}
+		// No row will rescan this path and invalidate its cache entry, so the
+		// next tick would read the index as it was before the build.
+		a.grafts.Invalidate(act.Path)
+		a.autofix.Done(act, errText)
+		idle(func() {
+			if res.Err != nil {
+				applog.Errorf("auto-fix %s: %v", act.Name, res.Err)
+			} else {
+				applog.Infof("auto-fix %s: graft index built", act.Name)
+			}
+		})
+	})
+}
+
 // autoFixPlanLine is the plan in one log line: the commands, in order, and
-// where the LLM steps are going.
-func autoFixPlanLine(act autofix.Action, pol autofix.Policy) string {
+// where the LLM steps are going — llm is each backend/model they resolved to,
+// and billed says at least one of them is not on this machine.
+func autoFixPlanLine(act autofix.Action, llm []string, billed bool) string {
 	kinds := make([]string, 0, len(act.Plan.Steps))
 	for _, s := range act.Plan.Steps {
 		kinds = append(kinds, s.Kind)
 	}
 	line := strings.Join(kinds, " → ")
 	switch {
-	case !act.Plan.Metered():
+	case !act.Plan.Metered() || len(llm) == 0:
 		return line + " (free)"
-	case act.Local:
-		return line + " (LLM steps on " + pol.LocalBackend + "/" + pol.LocalModel + ", free)"
+	case billed:
+		return line + " (LLM steps on " + strings.Join(llm, ", ") + ", METERED)"
 	default:
-		return line + " (METERED)"
+		return line + " (LLM steps on " + strings.Join(llm, ", ") + ", free)"
 	}
 }
 

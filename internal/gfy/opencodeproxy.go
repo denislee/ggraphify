@@ -1,8 +1,10 @@
 package gfy
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -188,8 +190,10 @@ func StartOpenCodeProxy(backend string) (string, error) {
 			proxyState.root = root
 			proxyState.base = OpenCodeProxyBase(root, OpenCodeBackend)
 			proxyState.Unlock()
+			applog.Infof("opencode proxy: sharing the one another ggraphify serves at %s (plans=%s)", root, plans)
 			return OpenCodeProxyBase(root, plan.Backend), nil
 		}
+		applog.Errorf("opencode proxy: cannot bind %s and the listener there is not ggraphify's: %v", addr, err)
 		return "", errors.New("the OpenCode Go proxy cannot bind " + addr + " (" + err.Error() +
 			") and what is listening there is not one of ours. Free the port, or set " +
 			OpenCodePortVar + " to another one")
@@ -217,6 +221,8 @@ func StartOpenCodeProxy(backend string) (string, error) {
 	proxyState.base = OpenCodeProxyBase(root, OpenCodeBackend)
 	proxyState.owned = true
 	proxyState.Unlock()
+	applog.Infof("opencode proxy: listening on %s → %s (go), %s (zen)", root,
+		OpenCodeUpstream(OpenCodeBackend), OpenCodeUpstream(OpenCodeZenBackend))
 	return OpenCodeProxyBase(root, plan.Backend), nil
 }
 
@@ -285,6 +291,7 @@ func openCodeProxyHandler() http.Handler {
 		// running on this machine.
 		plan, rest, ok := openCodeRoute(r.URL.Path)
 		if !ok {
+			applog.Warnf("opencode proxy: refused %s %s — not a plan path", r.Method, r.URL.Path)
 			http.Error(w, "this proxy forwards "+OpenCodeBackend+"'s /v1 to "+
 				OpenCodeUpstream(OpenCodeBackend)+" and "+OpenCodeZenBackend+"'s /zen/v1 to "+
 				OpenCodeUpstream(OpenCodeZenBackend)+", and nothing else", http.StatusNotFound)
@@ -300,7 +307,20 @@ func openCodeProxyHandler() http.Handler {
 		target.Path = strings.TrimSuffix(up.Path, "/") + "/v1" + rest
 		target.RawQuery = r.URL.RawQuery
 
-		req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), r.Body)
+		// The body is read whole so the log can name the model the client
+		// asked for — the one fact that says which model a job is really
+		// running on. A chunk is at most a few hundred kilobytes, and the
+		// request was never streamed to begin with.
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxProxyBody))
+		if err != nil {
+			applog.Warnf("opencode proxy: reading the request for %s: %v", r.URL.Path, err)
+			http.Error(w, "opencode-go: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		model := requestModel(body)
+		started := time.Now()
+
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), bytes.NewReader(body))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -324,6 +344,8 @@ func openCodeProxyHandler() http.Handler {
 		noteProxyRequest()
 		resp, err := proxyTransport.RoundTrip(req)
 		if err != nil {
+			applog.Errorf("opencode proxy: %s %s %s model=%s → upstream unreachable after %s: %v",
+				plan.Backend, r.Method, rest, model, time.Since(started).Round(time.Millisecond), err)
 			http.Error(w, "opencode-go: "+err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -336,20 +358,66 @@ func openCodeProxyHandler() http.Handler {
 		w.WriteHeader(resp.StatusCode)
 		// Flushed as it arrives, so a streamed completion is streamed rather
 		// than buffered until the model has finished thinking.
+		//
+		// A refusal's body is also kept — the first few hundred bytes of it —
+		// because the gateway's error message is the whole diagnosis, and
+		// graphify reduces it to "chunk failed".
+		var errBody bytes.Buffer
+		failed := resp.StatusCode >= 400
+		var sent int64
+		defer func() {
+			took := time.Since(started).Round(time.Millisecond)
+			if failed {
+				msg := gatewayErrorMessage(errBody.Bytes())
+				if msg == "" {
+					msg = strings.TrimSpace(errBody.String())
+				}
+				applog.Warnf("opencode proxy: %s %s %s model=%s → HTTP %d in %s: %s",
+					plan.Backend, r.Method, rest, model, resp.StatusCode, took, msg)
+				return
+			}
+			applog.Infof("opencode proxy: %s %s %s model=%s → HTTP %d in %s (%d bytes)",
+				plan.Backend, r.Method, rest, model, resp.StatusCode, took, sent)
+		}()
 		buf := make([]byte, 16*1024)
 		rc := http.NewResponseController(w)
 		for {
 			n, rerr := resp.Body.Read(buf)
 			if n > 0 {
+				sent += int64(n)
+				if failed && errBody.Len() < 512 {
+					errBody.Write(buf[:min(n, 512-errBody.Len())])
+				}
 				if _, werr := w.Write(buf[:n]); werr != nil {
+					applog.Warnf("opencode proxy: client went away mid-response (%s model=%s): %v", rest, model, werr)
 					return
 				}
 				_ = rc.Flush()
 			}
 			if rerr != nil {
+				if !errors.Is(rerr, io.EOF) {
+					applog.Warnf("opencode proxy: upstream response cut off (%s model=%s): %v", rest, model, rerr)
+				}
 				return
 			}
 		}
 	})
 	return mux
+}
+
+// maxProxyBody caps what one request may carry through the proxy. The largest
+// chunk graphify sends is a few hundred kilobytes; this is far above it and
+// still keeps a runaway client from filling memory.
+const maxProxyBody = 64 << 20
+
+// requestModel is the "model" field of an OpenAI-shaped request body, or "-"
+// when there is none (GET /models, or a body that is not JSON).
+func requestModel(body []byte) string {
+	var v struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(body, &v) != nil || v.Model == "" {
+		return "-"
+	}
+	return v.Model
 }

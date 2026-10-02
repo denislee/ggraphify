@@ -573,7 +573,14 @@ func (r *Runner) SubmitCmd(kind, repo, label string, p gfy.Params, env gfy.Env) 
 	// be in the gateway's own listing and still refuse this account or region,
 	// and graphify reports that as "all semantic chunks failed" with no cause.
 	// Cached per model per process, so a sweep pays it once.
+	if w := gfy.WeightOf(kind); w != gfy.NoLLM {
+		// Which backend and model a job really runs on, stated once per job:
+		// the weight pins, per-kind pins and per-repository overrides all get
+		// a say, and the argv alone does not say which of them won.
+		applog.Infof("submit %s (%s work) %s: backend=%q model=%q", kind, w, repo, p.Backend, p.Model)
+	}
 	if err := gfy.PreflightOpenCode(p.Backend, p.Model); err != nil {
+		applog.Warnf("submit %s %s refused by the preflight: %v", kind, repo, err)
 		return nil, errors.New("jobs: " + err.Error())
 	}
 	if path, wrote, err := gfy.EnsureOpenCodeProvider(p.Backend, p.Model); err != nil {
@@ -1326,6 +1333,15 @@ func (r *Runner) run(j *Job, ctx context.Context, cancel context.CancelFunc) {
 	// that was never sent.
 	exited := make(chan struct{})
 	err := cmd.Start()
+	if err != nil && j.Dir != "" {
+		// Go reports a chdir into a missing cmd.Dir as "fork/exec <argv0>: no
+		// such file or directory", which names the binary. A checkout deleted
+		// while its chain was running (a worktree removed mid-extract) reads
+		// as a broken graphify install instead of what it is.
+		if _, serr := os.Stat(j.Dir); errors.Is(serr, os.ErrNotExist) {
+			err = errors.New("working directory " + j.Dir + " no longer exists (moved or deleted)")
+		}
+	}
 	if err == nil {
 		r.mu.Lock()
 		j.pgid = cmd.Process.Pid

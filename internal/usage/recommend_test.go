@@ -154,3 +154,25 @@ func TestUsedWithoutGraph(t *testing.T) {
 		}
 	}
 }
+
+// The failure list makes the same judgement Recommend does about a directory
+// that boarded checkouts live under: ~/git is not a missing repository, and
+// "add it as a scan root" is advice to add a root that already exists. The row
+// stays — the failure total must still add up — but it offers nothing.
+func TestBlockagesDoesNotOfferAScanRootForAContainer(t *testing.T) {
+	rows := []board.Row{row("/home/me/git/svc", "svc", graphstate.Graph{State: graphstate.StateFresh, Communities: 1, Labeled: true}, graftstate.Index{State: graftstate.StateFresh})}
+	s := Summary{FailSplit: map[string]RepoFail{
+		"/home/me/git":    {Total: 4, Reasons: map[Fail]int{FailNoGraph: 4}},
+		"/somewhere/else": {Total: 1, Reasons: map[Fail]int{FailNoGraph: 1}},
+	}}
+	got := map[string]Blocked{}
+	for _, b := range Blockages(rows, s, 0) {
+		got[b.Repo] = b
+	}
+	if b, ok := got["/home/me/git"]; !ok || b.Action != "" || b.Fails != 4 {
+		t.Fatalf("container row = %+v (present %v), want it kept with no action", b, ok)
+	}
+	if b := got["/somewhere/else"]; b.Action != AddRoot {
+		t.Fatalf("unboarded row = %+v, want add-root", b)
+	}
+}

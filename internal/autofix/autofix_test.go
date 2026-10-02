@@ -752,3 +752,133 @@ func TestAStaleMemberGetsOneAttempt(t *testing.T) {
 		t.Fatalf("give-up reason = %q, want it to name the global graph", stuck[0].Why)
 	}
 }
+
+// The give-up line is a log line, not a heartbeat. A repository the loop has
+// written off stays a candidate forever — its defect is still there — and the
+// board re-plans every thirty seconds, so a skip per tick meant the same
+// sentence in the log every thirty seconds for as long as the window was open.
+// It is said once, like the stuck report it belongs to.
+func TestTheGiveUpLineIsNotRepeatedEveryTick(t *testing.T) {
+	e, now := fixed(t)
+	pol := on()
+	pol.Attempts = 2
+	pol.Cooldown = time.Minute
+	c := []Candidate{drifted("/a", "a")}
+
+	for i := 0; i < pol.Attempts; i++ {
+		acts, _ := e.Plan(c, pol)
+		e.Done(acts[0], "")
+		*now = now.Add(time.Hour)
+	}
+
+	if _, skips := e.Plan(c, pol); len(skips) != 1 {
+		t.Fatalf("first tick past the cap: skips = %+v, want the give-up line", skips)
+	}
+	if stuck := e.Declare(c, pol); len(stuck) != 1 {
+		t.Fatalf("Declare = %+v, want one report", stuck)
+	}
+	for i := 0; i < 3; i++ {
+		*now = now.Add(30 * time.Second)
+		if _, skips := e.Plan(c, pol); len(skips) != 0 {
+			t.Fatalf("tick %d repeated the give-up line: %+v", i+1, skips)
+		}
+	}
+
+	// And it comes back the moment the repository moves: a new defect is a
+	// new budget, and the loop says so again when that one runs out too.
+	moved := []Candidate{unbuilt("/a", "a")}
+	if acts, _ := e.Plan(moved, pol); len(acts) != 1 {
+		t.Fatalf("a changed signature did not get a fresh budget")
+	}
+}
+
+func graftCreateOn() Policy {
+	pol := on()
+	pol.Graft, pol.GraftCreate = true, true
+	return pol
+}
+
+// A git checkout with no graft index gets a first build when the policy asks
+// for one, and not otherwise — the old behaviour stays the default of the
+// engine itself.
+func TestAMissingGraftIndexIsBuiltOnlyUnderGraftCreate(t *testing.T) {
+	e, _ := fixed(t)
+	c := []Candidate{healthy("/a", "a")}
+
+	pol := on()
+	pol.Graft = true
+	if acts, _ := e.Plan(c, pol); len(acts) != 0 {
+		t.Fatalf("without GraftCreate a checkout with no index planned %v", kinds(pol, acts[0]))
+	}
+
+	acts, _ := e.Plan(c, graftCreateOn())
+	if len(acts) != 1 {
+		t.Fatalf("got %d actions, want the first build", len(acts))
+	}
+	if got := kinds(graftCreateOn(), acts[0]); len(got) != 1 || got[0] != "graft-build" {
+		t.Fatalf("steps = %v, want just graft-build", got)
+	}
+	if acts[0].Sig != graftstate.IssueMissing {
+		t.Fatalf("sig = %q, want %q", acts[0].Sig, graftstate.IssueMissing)
+	}
+}
+
+// A graph-only directory is not a repository, and graft indexes repositories.
+func TestANoGitRowGetsNoFirstGraftBuild(t *testing.T) {
+	e, _ := fixed(t)
+	c := healthy("/docs", "docs")
+	c.NoGit = true
+	if acts, _ := e.Plan([]Candidate{c}, graftCreateOn()); len(acts) != 0 {
+		t.Fatalf("a NoGit row planned %v", kinds(graftCreateOn(), acts[0]))
+	}
+}
+
+// A first build that left no index behind found nothing to parse; the loop
+// says so after one attempt instead of three.
+func TestAFirstBuildThatLeavesNoIndexGetsOneAttempt(t *testing.T) {
+	e, now := fixed(t)
+	c := []Candidate{healthy("/a", "a")}
+	acts, _ := e.Plan(c, graftCreateOn())
+	e.Done(acts[0], "")
+	*now = now.Add(24 * time.Hour)
+	if again, _ := e.Plan(c, graftCreateOn()); len(again) != 0 {
+		t.Fatalf("re-ran a first build that produced nothing")
+	}
+	stuck := e.Declare(c, graftCreateOn())
+	if len(stuck) != 1 || !strings.Contains(stuck[0].Why, "nothing it parses") {
+		t.Fatalf("stuck = %+v, want the no-index sentence", stuck)
+	}
+}
+
+// A worktree is a graft-only candidate: its zero Graph would read as a
+// checkout never extracted, and the loop must not pay for that extraction.
+func TestAGraftOnlyCandidateGetsOnlyGraft(t *testing.T) {
+	e, _ := fixed(t)
+	pol := graftCreateOn()
+	pol.Global, pol.Enroll = true, true
+	wt := Candidate{Path: "/a-wt", Name: "a@a-wt", GraftOnly: true, Enrollable: true}
+
+	acts, _ := e.Plan([]Candidate{wt}, pol)
+	if len(acts) != 1 || !acts[0].GraftOnly {
+		t.Fatalf("got %+v, want one graft-only action", acts)
+	}
+	if got := kinds(pol, acts[0]); len(got) != 1 || got[0] != "graft-build" {
+		t.Fatalf("steps = %v, want just graft-build", got)
+	}
+
+	// Stale is repaired whether or not first builds are on.
+	e2, _ := fixed(t)
+	repair := on()
+	repair.Graft = true
+	wt.Graft = graftstate.Index{State: graftstate.StateStale}
+	if acts, _ := e2.Plan([]Candidate{wt}, repair); len(acts) != 1 || acts[0].Sig != graftstate.IssueStale {
+		t.Fatalf("a stale worktree index got %+v, want a repair", acts)
+	}
+
+	// Fresh is left alone, graph or no graph.
+	e3, _ := fixed(t)
+	wt.Graft = graftstate.Index{State: graftstate.StateFresh}
+	if acts, _ := e3.Plan([]Candidate{wt}, pol); len(acts) != 0 {
+		t.Fatalf("a fresh worktree index planned %v", kinds(pol, acts[0]))
+	}
+}

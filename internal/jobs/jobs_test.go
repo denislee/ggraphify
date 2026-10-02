@@ -81,6 +81,32 @@ func TestRunsAndCapturesOutput(t *testing.T) {
 	}
 }
 
+// A checkout removed while its chain was queued (a worktree deleted mid
+// auto-fix) must fail naming the directory, not the graphify binary — Go's own
+// error for a failed chdir is "fork/exec <argv0>: no such file or directory".
+func TestAVanishedCheckoutNamesTheDirectory(t *testing.T) {
+	fakeGraphify(t, `exit 0`)
+	r := New(Options{})
+	defer r.Close()
+
+	repo := filepath.Join(repoDir(t), "gone")
+	job, err := r.SubmitCmd("update", repo, "Update", gfy.Params{Repo: repo}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := wait(t, r, job.ID)
+	if s.Status != Failed || s.Exit != -1 {
+		t.Fatalf("Status = %v, Exit = %d, want failed/-1", s.Status, s.Exit)
+	}
+	log := job.Log.String()
+	if !strings.Contains(log, "working directory "+repo+" no longer exists") {
+		t.Errorf("log does not name the missing directory:\n%s", log)
+	}
+	if strings.Contains(log, "fork/exec") {
+		t.Errorf("log still blames the binary:\n%s", log)
+	}
+}
+
 func TestFailureCarriesTheExitCode(t *testing.T) {
 	fakeGraphify(t, `echo "RuntimeError: no API key" >&2; exit 3`)
 	r := New(Options{})

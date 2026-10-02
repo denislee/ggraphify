@@ -77,6 +77,8 @@ type Options struct {
 	OutBase string
 	// ShowHidden boards the checkouts inside dot-named directories too.
 	ShowHidden bool
+	// ShowWorktrees boards linked worktrees too.
+	ShowWorktrees bool
 	// SkipDrift omits the per-repo tree walk. The walk is the expensive half
 	// of a refresh and a caller that only wants counters can skip it.
 	SkipDrift bool
@@ -122,7 +124,8 @@ func Scan(opts Options) ([]Row, error) {
 		OutName: opts.OutName,
 		OutBase: opts.OutBase,
 
-		ShowHidden: opts.ShowHidden,
+		ShowHidden:    opts.ShowHidden,
+		ShowWorktrees: opts.ShowWorktrees,
 	}
 	if len(dopts.Roots) == 0 {
 		dopts.Roots = discover.DefaultRoots()

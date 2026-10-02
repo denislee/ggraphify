@@ -306,7 +306,7 @@ func Blockages(rows []board.Row, s Summary, limit int) []Blocked {
 		}
 		row := byPath[path]
 		b.OnBoard = row != nil
-		b.Action, b.Why = blockedAction(row, f)
+		b.Action, b.Why = blockedAction(row, f, row == nil && containsCheckout(paths, path))
 		if row != nil {
 			b.Name = row.Name
 		}
@@ -335,8 +335,16 @@ func Blockages(rows []board.Row, s Summary, limit int) []Blocked {
 // whose graph is current and whose calls still failed has a different problem
 // — a timeout, a denied permission, a bad command line — and saying "extract
 // it" there would be advice that cannot help.
-func blockedAction(r *board.Row, f RepoFail) (Action, string) {
+//
+// container is whether boarded checkouts live below this directory. That is
+// ~/git itself, not a repository the board has missed: the calls ran a level
+// above every index there is, and a scan root for it would be one that already
+// exists — the same judgement Recommend makes for its loose directories.
+func blockedAction(r *board.Row, f RepoFail, container bool) (Action, string) {
 	switch {
+	case container:
+		return "", fmt.Sprintf("%s failed here, in a folder that holds boarded checkouts rather than being one — "+
+			"nothing to build or add; the calls ran above the repository whose index they wanted", calls(f.Total))
 	case r == nil:
 		return AddRoot, fmt.Sprintf("%s failed here, and it is not a checkout the board scans — "+
 			"add its folder as a scan root before anything can be built for it", calls(f.Total))

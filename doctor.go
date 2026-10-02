@@ -69,11 +69,12 @@ Exit status is 0 when every invariant holds and 1 when one is broken.
 	}
 
 	rows, err := board.Scan(board.Options{
-		Roots:      roots,
-		Depth:      d,
-		OutName:    outName,
-		OutBase:    outBase,
-		ShowHidden: set.ShowHidden,
+		Roots:         roots,
+		Depth:         d,
+		OutName:       outName,
+		OutBase:       outBase,
+		ShowHidden:    set.ShowHidden,
+		ShowWorktrees: set.ShowWorktrees,
 		// The drift walk is the expensive half of a scan and no check here
 		// asks about drift: what doctor wants is where each graph is, what
 		// commit it came from and what tier it reached.

@@ -7,6 +7,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/dns/ggraphify/internal/applog"
 )
 
 // The gateway answers 400 MissingSessionID to any request without
@@ -188,5 +191,69 @@ func TestTheProxyKeepsTheTwoPlansApartByPath(t *testing.T) {
 	b, _ := io.ReadAll(probe.Body)
 	if !strings.Contains(string(b), "plans=go,zen") {
 		t.Errorf("probe answered %q, want it to advertise both plans", b)
+	}
+}
+
+// graphify reduces a refused chunk to "chunk failed". The proxy is the one
+// place that sees the gateway's own reason, so a refusal has to reach the log
+// with the model it was for, and the credential must not.
+func TestTheProxyLogsWhyTheGatewayRefused(t *testing.T) {
+	t.Setenv(OpenCodePortVar, "0")
+	resetProxy(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"weekly quota exhausted"}}`)
+	}))
+	defer upstream.Close()
+	t.Setenv(OpenCodeBaseURLVar, upstream.URL+"/v1")
+
+	base, err := StartOpenCodeProxy(OpenCodeBackend)
+	if err != nil {
+		t.Fatalf("StartOpenCodeProxy: %v", err)
+	}
+	applog.Default.Clear()
+	req, _ := http.NewRequest(http.MethodPost, base+"/chat/completions",
+		bytes.NewBufferString(`{"model":"mimo-v2.6-flash","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer sk-secret-in-test")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("through the proxy: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want the gateway's 429 passed through", resp.StatusCode)
+	}
+
+	// The log line is written after the body is copied, which can land a
+	// moment after the client has read it.
+	var log string
+	for i := 0; i < 50; i++ {
+		if log = applog.Default.Text(); strings.Contains(log, "HTTP 429") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, want := range []string{"model=mimo-v2.6-flash", "HTTP 429", "weekly quota exhausted"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("log lacks %q:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, "sk-secret-in-test") {
+		t.Errorf("the credential reached the log:\n%s", log)
+	}
+}
+
+func TestRequestModel(t *testing.T) {
+	for body, want := range map[string]string{
+		`{"model":"glm-5.3-flash","messages":[]}`: "glm-5.3-flash",
+		`{"messages":[]}`:                         "-",
+		``:                                        "-",
+		`not json`:                                "-",
+	} {
+		if got := requestModel([]byte(body)); got != want {
+			t.Errorf("requestModel(%q) = %q, want %q", body, got, want)
+		}
 	}
 }

@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dns/ggraphify/internal/applog"
 )
 
 // OpenCode Go is a $10/month subscription to a curated set of open coding
@@ -936,10 +938,12 @@ func VerifyOpenCodeModel(ctx context.Context, backend, model string) (bool, stri
 		return false, plan.Name + " has not said which models it serves yet."
 	}
 	if known, ok, detail := OpenCodeVerdict(plan.Backend, model); known {
+		applog.Debugf("opencode verify: %s %s — cached verdict ok=%t %s", plan.Backend, model, ok, detail)
 		return ok, detail
 	}
 	key := strings.TrimSpace(os.Getenv(OpenCodeKeyVar))
 	if key == "" {
+		applog.Warnf("opencode verify: %s %s — %s is not set in ggraphify's environment", plan.Backend, model, OpenCodeKeyVar)
 		return false, OpenCodeKeyVar + " is not set, so the gateway cannot be asked about " + model + "."
 	}
 
@@ -957,8 +961,13 @@ func VerifyOpenCodeModel(ctx context.Context, backend, model string) (bool, stri
 	req.Header.Set("x-opencode-session", OpenCodeSession())
 	req.Header.Set("User-Agent", "ggraphify/"+AppVersion)
 
+	started := time.Now()
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
+		// Let through, because unreachable says nothing about the model — but
+		// said, because the run that follows will hit the same wall.
+		applog.Warnf("opencode verify: %s %s — gateway %s unreachable, letting the job through unverified: %v",
+			plan.Backend, model, OpenCodeUpstream(plan.Backend), err)
 		return true, "" // unreachable now says nothing about the model
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -972,6 +981,12 @@ func VerifyOpenCodeModel(ctx context.Context, backend, model string) (bool, stri
 		}
 	}
 	openCodeVerdicts.Store(verdictKey(plan.Backend, model), verdict)
+	if verdict.ok {
+		applog.Infof("opencode verify: %s %s — gateway answered in %s",
+			plan.Backend, model, time.Since(started).Round(time.Millisecond))
+	} else {
+		applog.Warnf("opencode verify: %s — refused: %s", plan.Backend, verdict.detail)
+	}
 	return verdict.ok, verdict.detail
 }
 

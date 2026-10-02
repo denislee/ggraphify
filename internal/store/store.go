@@ -46,8 +46,11 @@ type Settings struct {
 	// below a root. Off by default, which is why the zero value is the one
 	// that hides them: a state file written before this setting existed reads
 	// back as the default rather than as a choice nobody made.
-	ShowHidden bool   `json:"show_hidden"`
-	Scheme     string `json:"scheme"` // system | light | dark
+	ShowHidden bool `json:"show_hidden"`
+	// ShowWorktrees boards linked worktrees. Off by default for the same
+	// zero-value reason as ShowHidden; see discover.Options.ShowWorktrees.
+	ShowWorktrees bool   `json:"show_worktrees"`
+	Scheme        string `json:"scheme"` // system | light | dark
 
 	Backend string `json:"backend"`
 	Model   string `json:"model"`
@@ -170,12 +173,29 @@ type Settings struct {
 	NoAutoFixLocal bool `json:"no_auto_fix_local,omitempty"`
 	AutoFixMetered bool `json:"auto_fix_metered,omitempty"`
 
+	// AutoFixFollowPins makes the loop run its LLM steps exactly where the
+	// Heavy and Light work pins say — extraction on Heavy, naming on Light,
+	// each with its own model — and never on a fallback the loop picked for
+	// itself. Off by default: the fallback is what lets a board whose pins
+	// bill still finish repositories for free. Metering is unchanged by it —
+	// a billed pin still needs AutoFixMetered, and without it the loop runs
+	// the free steps only.
+	AutoFixFollowPins bool `json:"auto_fix_follow_pins,omitempty"`
+
 	// NoAutoFixGlobal turns off the third index's half of the loop: re-merging
 	// a repository into the global graph after its own graph is rebuilt. Off
 	// flag, on by default, for the same reason as the two above — the work is
 	// free and the alternative is a cross-repo graph that answers from an
 	// extraction nobody has seen in weeks.
 	NoAutoFixGlobal bool `json:"no_auto_fix_global,omitempty"`
+
+	// NoAutoFixGraftCreate turns off first graft builds: a git checkout with
+	// no graft/ at all — a board row, or a linked worktree of one — gets a
+	// `graft build` from the loop. Off flag, on by default: the build is free
+	// (tree-sitter only) and a checkout without an index is one where every
+	// agent falls back to grep. What it costs is a graft/ directory in the
+	// working tree and graft's rule appended to its .gitignore.
+	NoAutoFixGraftCreate bool `json:"no_auto_fix_graft_create,omitempty"`
 
 	// NoAutoFixEnroll turns off the half of the loop that keeps the MEMBERSHIP
 	// current rather than the members: merging a repository under a fleet root
@@ -405,6 +425,11 @@ func (s Settings) AutoFixLocal() bool { return !s.NoAutoFixLocal }
 // joins one — so switching it on cannot change what the global graph is about,
 // only how old the copy is.
 func (s Settings) AutoFixGlobal() bool { return !s.NoAutoFixGlobal }
+
+// AutoFixGraftCreate reports whether the loop builds a first graft index in
+// checkouts and worktrees that have none. Stored inverted, like the switches
+// above: not written down has to mean on.
+func (s Settings) AutoFixGraftCreate() bool { return !s.NoAutoFixGraftCreate }
 
 // AutoFixEnroll reports whether the loop keeps the global graph's membership
 // and graft's workspace federations current, not just their contents. Stored

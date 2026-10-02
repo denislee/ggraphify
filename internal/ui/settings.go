@@ -164,6 +164,21 @@ func (a *App) settingsGeneral() *adw.PreferencesPage {
 	a.pinned(dotted, "hidden")
 	scan.Add(dotted)
 
+	worktrees := adw.NewSwitchRow()
+	worktrees.SetTitle("Hide linked worktrees")
+	worktrees.SetSubtitle("Skip checkouts created with `git worktree add` (a .git file instead of a " +
+		".git directory). They are the same repository on another branch, usually short-lived, " +
+		"and graphing each one repeats a full extraction the main checkout already has. " +
+		"Hidden rows are also skipped by auto-fix and batch runs.")
+	worktrees.SetActive(!set.ShowWorktrees)
+	worktrees.NotifyProperty("active", func() {
+		s := a.opts.Store.Settings()
+		s.ShowWorktrees = !worktrees.Active()
+		a.opts.Store.SetSettings(s)
+		a.refresh(true)
+	})
+	scan.Add(worktrees)
+
 	refresh := adw.NewSpinRow(gtk.NewAdjustment(float64(set.Refresh), 5, 3600, 5, 30, 0), 1, 0)
 	refresh.SetTitle("Rescan interval (seconds)")
 	refresh.NotifyProperty("value", func() {
@@ -1006,10 +1021,14 @@ func (a *App) settingsAutoFix() *adw.PreferencesGroup {
 	// Everything under the master switch is desensitized with it, so a page
 	// with auto-fix off does not read as a page of live settings.
 	var dependents []interface{ SetSensitive(bool) }
+	var local, pins *adw.SwitchRow
 	sensitize := func(on bool) {
 		for _, w := range dependents {
 			w.SetSensitive(on)
 		}
+		// Following the work pins replaces the local fallback outright, so
+		// its switch stops meaning anything while that one is on.
+		local.SetSensitive(on && !pins.Active())
 	}
 
 	enabled := adw.NewSwitchRow()
@@ -1021,13 +1040,21 @@ func (a *App) settingsAutoFix() *adw.PreferencesGroup {
 	enabled.SetActive(set.AutoFix())
 	g.Add(enabled)
 
-	local := adw.NewSwitchRow()
+	local = adw.NewSwitchRow()
 	local.SetTitle("Use a local model for the LLM steps")
 	local.SetSubtitleLines(0)
 	local.SetActive(set.AutoFixLocal())
 	local.SetSubtitle(a.autoFixLocalSubtitle())
 	g.Add(local)
 	dependents = append(dependents, local)
+
+	pins = adw.NewSwitchRow()
+	pins.SetTitle("Follow Heavy and light work")
+	pins.SetSubtitleLines(0)
+	pins.SetActive(set.AutoFixFollowPins)
+	pins.SetSubtitle(a.autoFixPinsSubtitle())
+	g.Add(pins)
+	dependents = append(dependents, pins)
 
 	metered := adw.NewSwitchRow()
 	metered.SetTitle("Allow metered fixes")
@@ -1051,6 +1078,17 @@ func (a *App) settingsAutoFix() *adw.PreferencesGroup {
 	global.SetActive(set.AutoFixGlobal())
 	g.Add(global)
 	dependents = append(dependents, global)
+
+	graftNew := adw.NewSwitchRow()
+	graftNew.SetTitle("Build graft indexes where there are none")
+	graftNew.SetSubtitleLines(0)
+	graftNew.SetSubtitle("Every git checkout on the board, and every linked worktree of one " +
+		"(found through git, even when worktrees are hidden), gets a graft index, kept in " +
+		"step as branches move. Free — tree-sitter only — but it writes graft/ into the " +
+		"checkout and adds it to the checkout's .gitignore.")
+	graftNew.SetActive(set.AutoFixGraftCreate())
+	g.Add(graftNew)
+	dependents = append(dependents, graftNew)
 
 	enroll := adw.NewSwitchRow()
 	enroll.SetTitle("Keep the fleet roots' membership up to date")
@@ -1126,9 +1164,21 @@ func (a *App) settingsAutoFix() *adw.PreferencesGroup {
 		save(func(s *store.Settings) { s.NoAutoFixLocal = !local.Active() })
 		local.SetSubtitle(a.autoFixLocalSubtitle())
 	})
+	pins.NotifyProperty("active", func() {
+		on := pins.Active()
+		save(func(s *store.Settings) { s.AutoFixFollowPins = on })
+		pins.SetSubtitle(a.autoFixPinsSubtitle())
+		sensitize(enabled.Active())
+		if on {
+			a.toast("automatic fixes run their LLM steps on the Heavy and light work pins")
+		} else {
+			a.toast("automatic fixes fall back to a local model again")
+		}
+	})
 	metered.NotifyProperty("active", func() {
 		on := metered.Active()
 		save(func(s *store.Settings) { s.AutoFixMetered = on })
+		pins.SetSubtitle(a.autoFixPinsSubtitle())
 		if on {
 			a.toast("automatic fixes may now use the billed backend")
 		}
@@ -1140,6 +1190,15 @@ func (a *App) settingsAutoFix() *adw.PreferencesGroup {
 			a.toast("stale global-graph members will be re-merged automatically")
 		} else {
 			a.toast("global graph left alone — re-add from the Global screen")
+		}
+	})
+	graftNew.NotifyProperty("active", func() {
+		on := graftNew.Active()
+		save(func(s *store.Settings) { s.NoAutoFixGraftCreate = !on })
+		if on {
+			a.toast("checkouts and worktrees without a graft index will get one")
+		} else {
+			a.toast("graft indexes are only repaired, never created")
 		}
 	})
 	enroll.NotifyProperty("active", func() {
@@ -1185,6 +1244,28 @@ func autoFixOr(v, def int) int {
 	return v
 }
 
+// autoFixPinsSubtitle says where the LLM steps go when the loop follows the
+// work pins, and whether that is free on THIS machine right now.
+func (a *App) autoFixPinsSubtitle() string {
+	const lead = "The loop's extraction runs on Heavy work and its community naming on " +
+		"Light work, each with its own model — exactly as a job you start by hand — " +
+		"instead of the local model above. "
+
+	set := a.opts.Store.Settings()
+	heavy, _ := set.BackendFor(gfy.Heavy)
+	light, _ := set.BackendFor(gfy.Light)
+	s := lead + "Now: Heavy on " + gfy.EffectiveBackend(heavy) +
+		", Light on " + gfy.EffectiveBackend(light) + ". "
+	if _, _, ok, why := autoFixPinsLocal(set); ok {
+		return s + "Both are on this machine, so the full repair is free."
+	} else if set.AutoFixMetered {
+		return s + "Not free (" + why + "), and metered fixes are on, so the pins bill."
+	} else {
+		return s + "Not free (" + why + "); with metered fixes off the loop runs the " +
+			"free steps only."
+	}
+}
+
 // autoFixLocalSubtitle says what the local half of the loop will actually do
 // on THIS machine right now — which model it would use, or why it cannot — so
 // the switch is not a promise the hardware cannot keep.
@@ -1197,11 +1278,9 @@ func (a *App) autoFixLocalSubtitle() string {
 		"leaves here, and no bill: this is what lets the loop be on by default. "
 
 	set := a.opts.Store.Settings()
-	eff := gfy.EffectiveBackend(set.Backend)
-	backend, preferred := eff, set.Model
-	if !gfy.IsLocalBackend(eff) {
-		backend, preferred = gfy.OllamaBackend, ""
-	}
+	pin, _ := set.BackendFor(gfy.Heavy)
+	eff := gfy.EffectiveBackend(pin)
+	backend, preferred := autoFixLocalPin(set)
 	model, ok, why := gfy.AutoLocalModel(backend, preferred)
 	if !ok {
 		return lead + "Right now there is none: " + why +
@@ -1209,8 +1288,9 @@ func (a *App) autoFixLocalSubtitle() string {
 	}
 	s := lead + "Right now: " + backend + " / " + model + "."
 	if !gfy.IsLocalBackend(eff) {
-		s += " The board's backend is " + eff + ", so this is the fallback the loop uses " +
-			"for its own runs only — nothing you start by hand changes."
+		s += " Heavy work is pinned to " + eff + ", which bills, so this is the fallback the " +
+			"loop uses for its own runs while metered fixes are off — with them on, the pin " +
+			"itself runs. Nothing you start by hand changes."
 	}
 	return s
 }

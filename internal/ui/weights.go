@@ -8,6 +8,8 @@ import (
 
 	"github.com/dns/ggraphify/internal/gfy"
 	"github.com/dns/ggraphify/internal/store"
+
+	"github.com/dns/ggraphify/internal/applog"
 )
 
 // The backend pin has three tiers, and this file is the second and the third.
@@ -210,6 +212,7 @@ func (a *App) pinRows(g *adw.PreferencesGroup, p pin) *adw.ComboRow {
 		b, _ := p.get(s)
 		p.set(&s, b, strings.TrimSpace(entry.Text()))
 		a.opts.Store.SetSettings(s)
+		applog.Infof("settings: %s model → %q (backend %q)", p.title, strings.TrimSpace(entry.Text()), b)
 		a.checkBackend()
 	})
 	g.Add(entry)
@@ -226,6 +229,7 @@ func (a *App) pinRows(g *adw.PreferencesGroup, p pin) *adw.ComboRow {
 		}
 		p.set(&s, now, m)
 		a.opts.Store.SetSettings(s)
+		applog.Infof("settings: %s backend %q → %q", p.title, was, now)
 		// The pin a job of this kind will actually run against just moved, so
 		// every row that follows this one has a new answer to print, and the
 		// banner's question has a new answer too.

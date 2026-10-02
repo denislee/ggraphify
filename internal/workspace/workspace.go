@@ -173,13 +173,26 @@ func Inspect(root string, onDisk []string) State {
 		}
 	}
 	for _, c := range s.File.Children {
-		if !have[c] {
+		if !have[c] && !checkoutAt(filepath.Join(root, c)) {
 			s.Orphans = append(s.Orphans, c)
 		}
 	}
 	sort.Strings(s.Missing)
 	sort.Strings(s.Orphans)
 	return s
+}
+
+// checkoutAt reports whether dir is still a checkout on disk.
+//
+// onDisk is what the board boards, and the board hides things graft does not:
+// linked worktrees and dot-directories are off by default. graft federates
+// every one of them, so a federated child the board never listed is not by
+// that fact gone — and calling it an orphan is drift no rebuild can clear,
+// because the rebuild writes the very same child straight back. Only the
+// orphan candidates are stat-ed, so the cost is nil on a root in step.
+func checkoutAt(dir string) bool {
+	_, err := os.Lstat(filepath.Join(dir, ".git"))
+	return err == nil
 }
 
 // Issue is this federation's defect code, or "" when there is nothing to do.

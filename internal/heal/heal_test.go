@@ -241,3 +241,58 @@ func TestGraftStepCoversStaleAndBrokenOnly(t *testing.T) {
 		}
 	}
 }
+
+// A graph that parsed and holds nothing — a directory with no source graphify
+// reads, like platform-chat with only a graft/ index — has no communities
+// because there is nothing to cluster. Planning `label` for it was a loop: the
+// run succeeded, found 0 communities, and the next sweep planned it again.
+func TestEmptyGraphIsNotRelabelled(t *testing.T) {
+	g := graphstate.Graph{
+		State: graphstate.StateRaw, GraphBytes: 111, HasReport: true, Labeled: true,
+	}
+	if !g.Empty() {
+		t.Fatal("a parsed graph.json with no nodes is empty")
+	}
+	if p := For(g, true); !p.Empty() {
+		t.Fatalf("plan = %v, want nothing to do for an empty graph", kinds(p))
+	}
+
+	// What platform-chat actually carries: an empty labels file, so the
+	// graph also reads as unlabelled. That fell through to "0 communities
+	// carry placeholder names" and planned `label` all the same.
+	g.Labeled = false
+	if !g.Healthy() {
+		t.Fatalf("issues = %v, want none for an empty unlabelled graph", g.Issues())
+	}
+	if p := For(g, true); !p.Empty() {
+		t.Fatalf("plan = %v, want nothing to do for an empty unlabelled graph", kinds(p))
+	}
+}
+
+// The control: a graph too big to parse also reads as 0 nodes, and it is
+// uncounted rather than empty, so its missing communities are still an issue.
+func TestOversizeGraphIsNotMistakenForEmpty(t *testing.T) {
+	g := graphstate.Graph{
+		State: graphstate.StateRaw, GraphBytes: graphstate.MaxGraphBytes + 1,
+		Err: "graph.json is too large to parse", HasReport: true,
+	}
+	if g.Empty() {
+		t.Fatal("an unparsed graph is not empty")
+	}
+	want(t, For(g, true), "cluster-only", "label")
+}
+
+func TestGraftCreateStepCoversNoneOnly(t *testing.T) {
+	for st, ok := range map[graftstate.State]bool{
+		graftstate.StateNone: true, graftstate.StateRaw: false, graftstate.StateStale: false,
+		graftstate.StateFresh: false, graftstate.StateBroken: false,
+	} {
+		s, got := GraftCreateStep(graftstate.Index{State: st})
+		if got != ok {
+			t.Fatalf("GraftCreateStep(%v) = %v, want %v", st, got, ok)
+		}
+		if ok && (s.Kind != "graft-build" || s.Cost() != gfy.Free) {
+			t.Fatalf("GraftCreateStep(%v) = %+v, want a free graft-build", st, s)
+		}
+	}
+}

@@ -210,6 +210,14 @@ func (e *Engine) reserve(key, sig string, now time.Time, pol Policy, skips *[]Sk
 	case rec.sig != sig:
 		rec.attempts, rec.err, rec.declared = 0, "", false
 	case rec.attempts >= attemptCap(pol, sig):
+		if rec.declared {
+			return nil, false // already said once; see Plan's give-up branch
+		}
+		// Nothing declares a fleet record stuck — Declare walks repository
+		// candidates, and a workspace or a stranded member is neither — so
+		// the give-up line is said here, once, and the flag is what remembers
+		// it. A fresh signature clears it again above.
+		rec.declared = true
 		tmpl.Why = gaveUp(sig, rec.attempts)
 		*skips = append(*skips, tmpl)
 		return nil, false
@@ -240,15 +248,15 @@ func (e *Engine) FleetDone(a FleetAction, err string) {
 	if rec == nil {
 		return
 	}
+	// The record is kept even when the repair ran clean. A clean exit is not
+	// the drift going away — `graft build` exits 0 on a federation it rewrote
+	// identically — and forgetting the record here reset both the attempt
+	// count and the cooldown, so the next tick re-queued the whole-root
+	// rebuild at once, forever. PlanFleet drops the record itself on the
+	// first tick that reads the subject healthy; one that comes back with the
+	// same signature starts from the attempt it left off at.
 	rec.running = false
 	rec.err = err
-	if err == "" {
-		// A repair that ran clean is forgotten: the next tick reads the file
-		// it rewrote, and if the drift is genuinely gone there is nothing to
-		// remember. One that comes back with the same signature starts from
-		// the attempt it left off at, which is what the record is for.
-		delete(e.seen, key)
-	}
 }
 
 // rootName is the directory name a root is reported under, so a log line says

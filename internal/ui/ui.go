@@ -721,10 +721,12 @@ func (a *App) refresh(full bool) {
 			OutName:    outName,
 			OutBase:    outBase,
 			ShowHidden: showHidden,
-			Cache:      &a.cache,
-			Graphs:     &a.graphs,
-			Grafts:     &a.grafts,
-			Global:     global,
+			// Settings only: there is no command-line flag for it.
+			ShowWorktrees: set.ShowWorktrees,
+			Cache:         &a.cache,
+			Graphs:        &a.graphs,
+			Grafts:        &a.grafts,
+			Global:        global,
 			Override: func(path string) (string, bool, bool) {
 				o := st.Override(path)
 				return o.Out, o.ExcludeBatch, o.Pinned

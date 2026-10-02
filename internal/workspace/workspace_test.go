@@ -117,3 +117,25 @@ func TestAnEmptyFederationWithCheckoutsIsDrift(t *testing.T) {
 			"not an absent workspace", got, IssueDrift)
 	}
 }
+
+// The board hides linked worktrees and dot-directories by default; graft
+// federates them. A federated child the board never listed but that is still
+// a checkout on disk is not gone — calling it an orphan is drift that no
+// rebuild can clear, because the rebuild writes it straight back.
+func TestAHiddenCheckoutStillOnDiskIsNotAnOrphan(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "alpha", "alpha-wt", "gone")
+	wt := filepath.Join(root, "alpha-wt")
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A linked worktree: .git is a file, not a directory.
+	if err := os.WriteFile(filepath.Join(wt, ".git"),
+		[]byte("gitdir: /elsewhere/.git/worktrees/alpha-wt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := Inspect(root, []string{"alpha"})
+	if len(s.Orphans) != 1 || s.Orphans[0] != "gone" {
+		t.Fatalf("Orphans = %v, want [gone] — the worktree is still on disk", s.Orphans)
+	}
+}

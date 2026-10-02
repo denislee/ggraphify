@@ -40,6 +40,13 @@ const (
 // "fix" mean "regenerate 60 MB of HTML" on every click.
 func (g Graph) Healthy() bool { return len(g.Issues()) == 0 }
 
+// Empty reports a graph.json that was read in full and holds no nodes. It is
+// not "Nodes == 0": a graph over MaxGraphBytes is never parsed and carries a
+// zero count too, and that one is merely uncounted, not empty.
+func (g Graph) Empty() bool {
+	return g.Err == "" && g.GraphBytes > 0 && g.GraphBytes <= MaxGraphBytes && g.Nodes == 0
+}
+
 // Issues lists everything wrong with this graph, worst first.
 //
 // A graph that does not exist has exactly one issue: it does not exist.
@@ -88,13 +95,21 @@ func (g Graph) Issues() []Issue {
 			Why:  "commits have landed since the build; the graph answers for code this checkout has moved past",
 		})
 	}
-	if g.Communities == 0 {
+	switch {
+	case g.Empty():
+		// An empty graph has no communities because it has nothing to
+		// cluster, and naming none is not a fix: platform-chat, a directory
+		// holding only a graft/ index, was relabelled on every sweep — each
+		// run "ok", 0 communities, and the same issue back on the next scan.
+		// Neither half applies: not "clustering has not run", and not
+		// "0 communities carry placeholder names" either.
+	case g.Communities == 0:
 		out = append(out, Issue{
 			Code: IssueNoCommunity,
 			What: "clustering has not run — the graph has no communities",
 			Why:  "community structure is what makes the graph navigable instead of a wall of nodes",
 		})
-	} else if !g.Labeled {
+	case !g.Labeled:
 		out = append(out, Issue{
 			Code: IssueUnnamed,
 			What: itoa(g.Communities) + " communities carry placeholder names",

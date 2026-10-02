@@ -117,8 +117,9 @@ func TestLinkedWorktreeIsAFirstClassRow(t *testing.T) {
 	os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: "+wtGit+"\n"), 0o644)
 
 	// A `.wt-` park is a hidden directory, so the walk only reaches it with
-	// ShowHidden on; see TestHiddenDirectoriesAreOffByDefault.
-	repos, _ := Walk(Options{Roots: []string{root}, ShowHidden: true})
+	// ShowHidden on; see TestHiddenDirectoriesAreOffByDefault. Worktrees are
+	// off by default too; see TestLinkedWorktreesAreOffByDefault.
+	repos, _ := Walk(Options{Roots: []string{root}, ShowHidden: true, ShowWorktrees: true})
 	r := has(repos, ".wt-tech17302")
 	if r == nil {
 		t.Fatalf("the worktree was not found; got %v", names(repos))
@@ -133,6 +134,50 @@ func TestLinkedWorktreeIsAFirstClassRow(t *testing.T) {
 	// live.
 	if r.ShortSHA() != "fffffff" {
 		t.Errorf("HeadSHA = %q — commondir was not followed", r.HeadSHA)
+	}
+}
+
+// Linked worktrees are off the board by default: one is the same repository
+// on another branch, and boarding it hands auto-fix a full extraction of code
+// its main checkout's graph already covers. ShowWorktrees brings them back,
+// and a root that is itself a worktree is boarded either way.
+func TestLinkedWorktreesAreOffByDefault(t *testing.T) {
+	root := t.TempDir()
+	main := mkdir(t, root, "repo")
+	mkrepo(t, main, "main", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+	wtGit := filepath.Join(main, ".git", "worktrees", "repo-wt-b1")
+	os.MkdirAll(wtGit, 0o755)
+	os.WriteFile(filepath.Join(wtGit, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644)
+	os.WriteFile(filepath.Join(wtGit, "commondir"), []byte("../..\n"), 0o644)
+	wt := mkdir(t, root, "repo-wt-b1")
+	os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: "+wtGit+"\n"), 0o644)
+
+	repos, _ := Walk(Options{Roots: []string{root}})
+	if has(repos, "repo-wt-b1") != nil {
+		t.Errorf("a worktree was boarded by default; got %v", names(repos))
+	}
+	if has(repos, "repo") == nil {
+		t.Errorf("hiding worktrees hid the main checkout; got %v", names(repos))
+	}
+
+	repos, _ = Walk(Options{Roots: []string{root}, ShowWorktrees: true})
+	if has(repos, "repo-wt-b1") == nil {
+		t.Errorf("ShowWorktrees did not board the worktree; got %v", names(repos))
+	}
+
+	repos, _ = Walk(Options{Roots: []string{wt}})
+	if has(repos, "repo-wt-b1") == nil {
+		t.Errorf("a worktree named as a root was not boarded; got %v", names(repos))
+	}
+}
+
+// The cache must not serve a worktree-hidden walk to a caller that asked for
+// worktrees, or flipping the setting would do nothing until the next rescan.
+func TestCacheKeyIncludesShowWorktrees(t *testing.T) {
+	a := rootKey(Options{Roots: []string{"/x"}})
+	b := rootKey(Options{Roots: []string{"/x"}, ShowWorktrees: true})
+	if a == b {
+		t.Error("rootKey ignores ShowWorktrees")
 	}
 }
 
@@ -618,5 +663,40 @@ func TestWalkBoardsAnInTreeCorpusUnderACentralOutBase(t *testing.T) {
 	}
 	if d.Out != inTree {
 		t.Errorf("Out = %q, want the in-tree graph %q — reads would go to the empty central dir", d.Out, inTree)
+	}
+}
+
+// Worktrees reads git's registry, so it finds a worktree wherever it lives —
+// here outside any root — and skips one deleted without a prune.
+func TestWorktreesReadsTheRegistry(t *testing.T) {
+	root := t.TempDir()
+	main := mkdir(t, root, "repo")
+	mkrepo(t, main, "main", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+	gitDir := filepath.Join(main, ".git")
+
+	elsewhere := t.TempDir()
+	register := func(id, dir string, create bool) {
+		reg := filepath.Join(gitDir, "worktrees", id)
+		os.MkdirAll(reg, 0o755)
+		os.WriteFile(filepath.Join(reg, "gitdir"), []byte(filepath.Join(dir, ".git")+"\n"), 0o644)
+		if create {
+			os.MkdirAll(dir, 0o755)
+			os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: "+reg+"\n"), 0o644)
+		}
+	}
+	register("b", filepath.Join(elsewhere, "b"), true)
+	register("a", filepath.Join(main, ".claude", "worktrees", "agent-a"), true)
+	register("gone", filepath.Join(elsewhere, "gone"), false)
+
+	got := Worktrees(gitDir)
+	want := []string{filepath.Join(main, ".claude", "worktrees", "agent-a"), filepath.Join(elsewhere, "b")}
+	if len(want) == 2 && want[0] > want[1] {
+		want[0], want[1] = want[1], want[0]
+	}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("Worktrees = %v, want %v", got, want)
+	}
+	if Worktrees(filepath.Join(root, "nope")) != nil {
+		t.Fatal("a git dir with no worktrees/ returned entries")
 	}
 }

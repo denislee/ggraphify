@@ -94,6 +94,14 @@ type Options struct {
 	// A root that is itself hidden (~/.graphify/repos) is unaffected either
 	// way: naming a root is asking for what is in it.
 	ShowHidden bool
+	// ShowWorktrees boards linked worktrees — checkouts whose .git is a file
+	// pointing into another checkout's .git/worktrees/. The default hides
+	// them: a worktree is the same repository on another branch, usually a
+	// short-lived agent or PR park, and graphing each one pays for a full
+	// extraction of code its main checkout's graph already covers. A root
+	// that is itself a worktree is still boarded, for the same reason a
+	// hidden root is.
+	ShowWorktrees bool
 }
 
 // DefaultRoots are the three places checkouts live on a machine set up like
@@ -272,7 +280,8 @@ func walkRoot(root, dir string, depth int, opts Options, spec OutSpec, seen map[
 			continue
 		}
 		gitSeen = true
-		if r, ok := repoAt(root, dir, e); ok && !seen[r.Path] {
+		if r, ok := repoAt(root, dir, e); ok && !seen[r.Path] &&
+			(!r.IsWorktree || opts.ShowWorktrees || depth == 0) {
 			seen[r.Path] = true
 			*out = append(*out, r)
 		}
@@ -428,6 +437,45 @@ func HeadOf(repo string) (branch, sha string) {
 		gitDir = filepath.Clean(gd)
 	}
 	return head(gitDir)
+}
+
+// Worktrees is every linked worktree of the repository whose .git directory is
+// gitDir, as absolute checkout paths, wherever on disk they live. It reads
+// git's own registry — <gitDir>/worktrees/<id>/gitdir, which holds the path of
+// the worktree's .git file — rather than walking for them, because a worktree
+// is usually not under any scan root: an agent's .claude/worktrees/agent-*,
+// a sibling ~/git/<repo>-wt-<branch>. An entry whose checkout has been deleted
+// without `git worktree prune` is skipped. Like the rest of this package it
+// runs no git.
+func Worktrees(gitDir string) []string {
+	ents, err := os.ReadDir(filepath.Join(gitDir, "worktrees"))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(gitDir, "worktrees", e.Name(), "gitdir"))
+		if err != nil {
+			continue
+		}
+		dotGit := strings.TrimSpace(string(b))
+		if dotGit == "" {
+			continue
+		}
+		if !filepath.IsAbs(dotGit) {
+			dotGit = filepath.Join(gitDir, "worktrees", e.Name(), dotGit)
+		}
+		dotGit = filepath.Clean(dotGit)
+		if fi, err := os.Stat(dotGit); err != nil || fi.IsDir() {
+			continue
+		}
+		out = append(out, filepath.Dir(dotGit))
+	}
+	sort.Strings(out)
+	return out
 }
 
 // head reads the branch and resolved HEAD out of a git directory without
@@ -697,6 +745,9 @@ func rootKey(opts Options) string {
 	sb.WriteByte('|')
 	if opts.ShowHidden {
 		sb.WriteString("hidden|")
+	}
+	if opts.ShowWorktrees {
+		sb.WriteString("worktrees|")
 	}
 	for _, r := range opts.Roots {
 		sb.WriteString(r)
