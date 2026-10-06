@@ -134,6 +134,7 @@ func (a *App) autoFixCandidates() []autofix.Candidate {
 		}
 	}
 	canonical := autofix.CanonicalByOrigin(cPaths, cOrigins)
+	nested := containers(rows)
 	out := make([]autofix.Candidate, 0, len(rows))
 	for _, r := range rows {
 		job := a.jobFor(r.Path)
@@ -156,10 +157,35 @@ func (a *App) autoFixCandidates() []autofix.Candidate {
 			Graft:      r.Graft,
 			Global:     r.Global,
 			Enrollable: fleets[filepath.Dir(r.Path)] && !r.NoGit && canonical[r.Path],
-			Excluded:   r.Excluded,
+			Excluded:   r.Excluded || nested[r.Path],
 			NoGit:      r.NoGit,
 			Busy:       busy,
 		})
+	}
+	return out
+}
+
+// containers is every row whose directory holds another row — a scratch root
+// like ~/tmp that is a checkout of its own (see discover.walkRoot) while
+// holding a hundred unrelated ones. The loop leaves such a row alone, as if
+// it carried the X flag: its graph is every nested repository extracted over
+// again, it drifts whenever any of them changes, and one rebuild of a scratch
+// tree ran for most of an hour on 1.8 GB. The Fix button still works on it;
+// what goes is only the unattended re-run on every edit underneath.
+func containers(rows []board.Row) map[string]bool {
+	// With a trailing separator on every path, a directory sorts directly
+	// before its descendants — "/a/tmp-x/" < "/a/tmp/" < "/a/tmp/b/" — so a
+	// container is exactly a path the next one starts with.
+	keys := make([]string, 0, len(rows))
+	for _, r := range rows {
+		keys = append(keys, filepath.Clean(r.Path)+string(filepath.Separator))
+	}
+	slices.Sort(keys)
+	out := map[string]bool{}
+	for i := 0; i+1 < len(keys); i++ {
+		if strings.HasPrefix(keys[i+1], keys[i]) {
+			out[strings.TrimSuffix(keys[i], string(filepath.Separator))] = true
+		}
 	}
 	return out
 }

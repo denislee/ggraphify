@@ -14,7 +14,7 @@ func noCredentials(t *testing.T) {
 	for _, k := range []string{
 		"GRAPHIFY_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
 		"GEMINI_API_KEY", "GOOGLE_API_KEY", "DEEPSEEK_API_KEY", "MOONSHOT_API_KEY",
-		"OLLAMA_HOST",
+		"OLLAMA_HOST", OpenCodeKeyVar,
 	} {
 		t.Setenv(k, "")
 	}
