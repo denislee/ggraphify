@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# ggq — query the in-memory global graph (every ~/git repository).
+# Hit paths are ~/git/<repo>/<file>.
+#
+# Usage:
+#   ggq query "<question>" [--budget N] [--depth N]
+#   ggq path "<A>" "<B>"
+#   ggq explain "<symbol or node id>"
+#   ggq health
+set -u
+
+BASE="http://127.0.0.1:${GGQ_PORT:-7791}"
+TIMEOUT="${GGQ_TIMEOUT:-60}"
+SERVICE="ggraphify-global-query"
+
+usage() {
+  cat >&2 <<EOF
+usage: ggq query "<question>" [--budget N] [--depth N]
+       ggq path "<A>" "<B>"
+       ggq explain "<symbol or node id>"
+       ggq health
+EOF
+}
+
+# get <route> [--data-urlencode k=v]...
+get() {
+  local endpoint="$1"; shift
+  local body code args=()
+  local kv
+  for kv in "$@"; do args+=(--data-urlencode "$kv"); done
+  body="$(curl -sS -G --max-time "$TIMEOUT" -w '\n%{http_code}' \
+      "${args[@]}" "$BASE$endpoint")" || {
+    local rc=$?
+    if [ "$rc" -eq 7 ]; then
+      echo "ggq: the global graph service is not running — systemctl --user start $SERVICE" >&2
+      exit 2
+    fi
+    echo "ggq: curl failed with exit $rc" >&2
+    exit 2
+  }
+  code="${body##*$'\n'}"
+  body="${body%$'\n'*}"
+  if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+    printf '%s\n' "$body" >&2
+    exit 1
+  fi
+  printf '%s\n' "$body"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  query)
+    shift || true
+    q=""
+    budget="2000"
+    depth="3"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --budget) budget="${2:-}"; shift 2 ;;
+        --depth)  depth="${2:-}";  shift 2 ;;
+        *)
+          if [ -z "$q" ]; then q="$1"; else usage; exit 2; fi
+          shift ;;
+      esac
+    done
+    [ -n "$q" ] || { usage; exit 2; }
+    get /query "q=$q" "budget=$budget" "depth=$depth"
+    ;;
+  path)
+    a="${2:-}"; b="${3:-}"
+    [ -n "$a" ] && [ -n "$b" ] || { usage; exit 2; }
+    get /path "a=$a" "b=$b"
+    ;;
+  explain)
+    node="${2:-}"
+    [ -n "$node" ] || { usage; exit 2; }
+    get /explain "node=$node"
+    ;;
+  health)
+    get /health
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

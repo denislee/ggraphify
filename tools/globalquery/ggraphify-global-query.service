@@ -1,0 +1,12 @@
+[Unit]
+Description=ggraphify global graph query service (in-memory, 127.0.0.1:7791)
+
+[Service]
+ExecStart=/home/dns/.local/share/uv/tools/graphifyy/bin/python3 %h/.local/share/ggraphify/globalquery/ggserve.py
+Restart=on-failure
+RestartSec=10
+Nice=5
+MemoryHigh=6G
+
+[Install]
+WantedBy=default.target
