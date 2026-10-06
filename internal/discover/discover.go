@@ -37,15 +37,16 @@ var SkipDirs = map[string]bool{
 
 // Repo is one checkout, as the board renders it.
 type Repo struct {
-	Path       string `json:"path"`        // absolute checkout root
-	Name       string `json:"name"`        // display name; disambiguated on collision
-	Group      string `json:"group"`       // path from the root down to the parent dir
-	Root       string `json:"root"`        // the scan root it was found under
-	IsWorktree bool   `json:"is_worktree"` // .git is a file → linked worktree
-	Branch     string `json:"branch"`      // short branch name, or "" when detached
-	HeadSHA    string `json:"head_sha"`    // resolved HEAD, full hex
-	GitDir     string `json:"git_dir"`     // the real .git directory
-	Out        string `json:"out"`         // absolute graphify output dir in effect
+	Path       string `json:"path"`             // absolute checkout root
+	Name       string `json:"name"`             // display name; disambiguated on collision
+	Group      string `json:"group"`            // path from the root down to the parent dir
+	Root       string `json:"root"`             // the scan root it was found under
+	IsWorktree bool   `json:"is_worktree"`      // .git is a file → linked worktree
+	Branch     string `json:"branch"`           // short branch name, or "" when detached
+	HeadSHA    string `json:"head_sha"`         // resolved HEAD, full hex
+	GitDir     string `json:"git_dir"`          // the real .git directory
+	Origin     string `json:"origin,omitempty"` // normalized remote.origin.url ("github.com/owner/repo"); "" when there is none.
+	Out        string `json:"out"`              // absolute graphify output dir in effect
 	// NoGit marks a row boarded on its graph alone: a directory that carries
 	// graphify knowledge but is not a checkout. It has no HEAD, so it is
 	// never Behind, and drift is the only staleness signal it has.
@@ -405,8 +406,135 @@ func repoAt(root, dir string, git os.DirEntry) (Repo, bool) {
 	if rel, err := filepath.Rel(root, filepath.Dir(dir)); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
 		r.Group = rel
 	}
+	if r.GitDir != "" {
+		r.Origin = readOrigin(r.GitDir)
+	}
 	r.Branch, r.HeadSHA = head(r.GitDir)
 	return r, true
+}
+
+// NormalizeOrigin reduces a remote URL to "host/owner/repo", so two spellings
+// of the same remote — ssh and https, an upper-case owner, a trailing .git —
+// compare equal without running git.
+func NormalizeOrigin(url string) string {
+	s := strings.TrimSpace(url)
+	if s == "" {
+		return ""
+	}
+	// An absolute path is a local clone, not a remote: leave it as one for the
+	// caller to resolve.
+	if strings.HasPrefix(s, "/") {
+		return filepath.Clean(s)
+	}
+	for _, p := range []string{"ssh://", "git+ssh://", "https://", "http://", "git://"} {
+		if strings.HasPrefix(s, p) {
+			s = strings.TrimPrefix(s, p)
+			break
+		}
+	}
+	// A leading "user@" — anything up to and including the first "@", as long
+	// as it comes before the first "/" (else it is part of a path).
+	if i := strings.Index(s, "@"); i >= 0 {
+		if j := strings.Index(s, "/"); j < 0 || i < j {
+			s = s[i+1:]
+		}
+	}
+	// scp form "host:owner/repo": a ":" before the first "/" and not followed
+	// by "//" (which would make it a scheme).
+	if i := strings.Index(s, ":"); i >= 0 {
+		if j := strings.Index(s, "/"); j < 0 || i < j {
+			if !strings.HasPrefix(s[i+1:], "//") {
+				s = s[:i] + "/" + s[i+1:]
+			}
+		}
+	}
+	s = strings.ToLower(s)
+	s = strings.TrimRight(s, "/")
+	s = strings.TrimSuffix(s, ".git")
+	return s
+}
+
+// readOrigin is the normalized remote.origin.url of the checkout whose real
+// git directory is gitDir. It is a plain config read — no exec, like the rest
+// of this package — and returns "" when there is no origin, or when a local
+// clone's chain of origins cannot be resolved.
+func readOrigin(gitDir string) string {
+	return resolveOrigin(NormalizeOrigin(originURL(commonConfigDir(gitDir))), 3)
+}
+
+// commonConfigDir is where a checkout's config actually lives. A linked
+// worktree's git directory is <main>/.git/worktrees/<name>, and the origin is
+// recorded in the main repository's config, not the per-worktree one.
+func commonConfigDir(gitDir string) string {
+	if i := strings.Index(gitDir, "/.git/worktrees/"); i >= 0 {
+		return gitDir[:i+len("/.git")]
+	}
+	return gitDir
+}
+
+// resolveOrigin follows a normalized origin that turned out to be a local
+// path — a clone of a sibling checkout, whose own origin names the real
+// remote — at most depth levels deep. An absolute path it cannot resolve to a
+// remote is reported as "local:<path>" rather than as a remote it is not.
+func resolveOrigin(origin string, depth int) string {
+	if !strings.HasPrefix(origin, "/") {
+		return origin
+	}
+	if depth <= 0 {
+		return "local:" + origin
+	}
+	if fi, err := os.Stat(filepath.Join(origin, ".git")); err == nil && fi.IsDir() {
+		return resolveOrigin(NormalizeOrigin(originURL(filepath.Join(origin, ".git"))), depth-1)
+	}
+	if fi, err := os.Stat(filepath.Join(origin, "config")); err == nil && !fi.IsDir() {
+		return resolveOrigin(NormalizeOrigin(originURL(origin)), depth-1)
+	}
+	return "local:" + origin
+}
+
+// originURL reads the raw url of the [remote "origin"] section out of a git
+// config file. The parser is deliberately small: section headers in brackets,
+// key = value, comments starting with # or ;. Anything else is ignored, and a
+// missing file or section is simply no origin.
+func originURL(gitDir string) string {
+	f, err := os.Open(filepath.Join(gitDir, "config"))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	inOrigin := false
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || line[0] == '#' || line[0] == ';' {
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			inOrigin = isOriginSection(line)
+			continue
+		}
+		if !inOrigin {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(key), "url") {
+			return strings.TrimSpace(val)
+		}
+	}
+	return ""
+}
+
+// isOriginSection reports whether a bracketed config header is [remote "origin"].
+func isOriginSection(line string) bool {
+	inner := strings.TrimSpace(strings.Trim(line, "[]"))
+	name, val, ok := strings.Cut(inner, " ")
+	if !ok || !strings.EqualFold(strings.TrimSpace(name), "remote") {
+		return false
+	}
+	return strings.EqualFold(strings.Trim(strings.TrimSpace(val), `"`), "origin")
 }
 
 // HeadOf is the branch and resolved HEAD of one checkout, for the callers that

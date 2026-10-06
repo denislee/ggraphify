@@ -15,6 +15,7 @@
 package autofix
 
 import (
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -338,6 +339,69 @@ func globalCode(c Candidate, pol Policy) string {
 // done" and one that reserves an attempt, burns a slot and then reports
 // nothing happened.
 func Defect(c Candidate, pol Policy) string { return candSig(c, pol.withDefaults()) }
+
+// CanonicalByOrigin picks the one enrollable checkout per origin repository.
+// paths and origins are parallel slices; an empty origin forms its own group
+// keyed by the path.
+//
+// The global graph holds one copy of each repository; extra full clones of it
+// (task worktrees made with git clone) are not separate repositories, so only
+// the canonical checkout may be enrolled. The canonical one is the path whose
+// base name matches the origin's last segment, else the shortest base name
+// (ties broken by path).
+func CanonicalByOrigin(paths []string, origins []string) map[string]bool {
+	groups := map[string][]string{}
+	order := make([]string, 0, len(paths))
+	for i, p := range paths {
+		origin := ""
+		if i < len(origins) {
+			origin = origins[i]
+		}
+		key := origin
+		if key == "" {
+			key = "\x00" + p // an empty origin is its own group, keyed by path
+		}
+		if _, ok := groups[key]; !ok {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], p)
+	}
+
+	out := make(map[string]bool, len(paths))
+	for _, key := range order {
+		group := groups[key]
+		if key[0] == 0 {
+			out[group[0]] = true
+			continue
+		}
+		last := key
+		if i := strings.LastIndex(key, "/"); i >= 0 {
+			last = key[i+1:]
+		}
+		best := group[0]
+		for _, p := range group[1:] {
+			if betterCanonical(p, best, last) {
+				best = p
+			}
+		}
+		out[best] = true
+	}
+	return out
+}
+
+// betterCanonical reports whether a should be picked over b: the base name
+// matching the origin's last segment wins, then the shortest base name, and a
+// lexicographic tie-break keeps the choice stable.
+func betterCanonical(a, b, last string) bool {
+	ab, bb := filepath.Base(a), filepath.Base(b)
+	if (ab == last) != (bb == last) {
+		return ab == last
+	}
+	if len(ab) != len(bb) {
+		return len(ab) < len(bb)
+	}
+	return a < b
+}
 
 // globalStep is the re-merge this candidate's plan should end with, if any.
 //

@@ -124,6 +124,16 @@ func (a *App) autoFixCandidates() []autofix.Candidate {
 	for _, root := range a.opts.Store.Settings().Fleets() {
 		fleets[root] = true
 	}
+	// One canonical checkout per origin: extra full clones of the same
+	// repository are the same graph, so only the canonical one may enroll.
+	var cPaths, cOrigins []string
+	for _, r := range rows {
+		if fleets[filepath.Dir(r.Path)] && !r.NoGit {
+			cPaths = append(cPaths, r.Path)
+			cOrigins = append(cOrigins, r.Origin)
+		}
+	}
+	canonical := autofix.CanonicalByOrigin(cPaths, cOrigins)
 	out := make([]autofix.Candidate, 0, len(rows))
 	for _, r := range rows {
 		job := a.jobFor(r.Path)
@@ -145,7 +155,7 @@ func (a *App) autoFixCandidates() []autofix.Candidate {
 			Graph:      r.Graph,
 			Graft:      r.Graft,
 			Global:     r.Global,
-			Enrollable: fleets[filepath.Dir(r.Path)] && !r.NoGit,
+			Enrollable: fleets[filepath.Dir(r.Path)] && !r.NoGit && canonical[r.Path],
 			Excluded:   r.Excluded,
 			NoGit:      r.NoGit,
 			Busy:       busy,
