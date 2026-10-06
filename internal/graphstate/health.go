@@ -27,6 +27,7 @@ const (
 	IssueBehind      = "behind"        // built from a commit that is no longer HEAD
 	IssueNoCommunity = "no-community"  // clustering has not run
 	IssueUnnamed     = "unnamed"       // communities exist with placeholder names
+	IssueHubNamed    = "hub-named"     // communities renamed by hub since the last LLM labeling
 	IssueNoReport    = "no-report"     // no GRAPH_REPORT.md
 )
 
@@ -116,6 +117,13 @@ func (g Graph) Issues() []Issue {
 			Why:  "\"Community 214\" tells a reader nothing; the names are what the report is for",
 		})
 	}
+	if g.Communities > 0 && g.Labeled && g.HubNamed >= hubThreshold(g.Communities) {
+		out = append(out, Issue{
+			Code: IssueHubNamed,
+			What: itoa(g.HubNamed) + " of " + itoa(g.Communities) + " communities are named after their hub symbol, not by the LLM",
+			Why:  "a rebuild re-clusters and graphify names every changed community after its top symbol (testing.T, .Return) — names that say nothing about what the code does",
+		})
+	}
 	if !g.HasReport {
 		out = append(out, Issue{
 			Code: IssueNoReport,
@@ -124,6 +132,17 @@ func (g Graph) Issues() []Issue {
 		})
 	}
 	return out
+}
+
+// hubThreshold is how many hub-named communities make the issue worth a
+// metered relabel: at least three, and at least a tenth of them. The floor
+// keeps a single changed community from buying a relabel on its own commit.
+func hubThreshold(n int) int {
+	t := (n + 9) / 10
+	if t < 3 {
+		return 3
+	}
+	return t
 }
 
 // shortSHA is the seven-character form the UI shows commits in. A commit that

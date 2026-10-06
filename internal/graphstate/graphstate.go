@@ -76,6 +76,7 @@ type Graph struct {
 	Hyperedges  int       `json:"hyperedges"`
 	Communities int       `json:"communities"`
 	Labeled     bool      `json:"labeled"`      // .graphify_labels.json present and non-empty
+	HubNamed    int       `json:"hub_named"`    // communities named after their hub symbol by graphify rather than by the LLM
 	BuiltAt     time.Time `json:"built_at"`     // graph.json mtime
 	BuiltCommit string    `json:"built_commit"` // graph.json's built_at_commit
 	// HeadCommit is the checkout's resolved HEAD at the time of the read,
@@ -197,6 +198,11 @@ const DefaultOutName = "graphify-out"
 // through a streaming decoder.
 const MaxGraphBytes = 128 << 20
 
+// LLMLabelSigFile is ggraphify's copy of graphify's .graphify_labels.json.sig
+// taken when a label job succeeds; a community whose current signature differs
+// from it has been renamed by hub since the LLM named it.
+const LLMLabelSigFile = ".ggraphify_llm_labels.sig"
+
 // Options configures a read.
 type Options struct {
 	// Repo is the checkout root; drift is computed against its tree.
@@ -272,6 +278,7 @@ func Read(opts Options) (Graph, error) {
 	}
 
 	g.Communities, g.Labeled = readLabels(out)
+	g.HubNamed = readHubNamed(out)
 	if g.Communities == 0 {
 		// `extract` writes .graphify_analysis.json with every community it
 		// detected; .graphify_labels.json only appears once `cluster-only` or
@@ -473,6 +480,112 @@ func readLabels(out string) (n int, labeled bool) {
 		}
 	}
 	return n, labeled && n > 0
+}
+
+// readHubNamed counts the communities whose current name was chosen by
+// graphify's hub fallback rather than by the LLM.
+//
+// When ggraphify has a record of a previous successful LLM labeling, the
+// signature files are the authority: graphify's .graphify_labels.json.sig
+// carries one signature per community, and a community whose current signature
+// differs from (or is missing from) the snapshot has been re-clustered and
+// renamed by hub since that labeling. Without a snapshot we fall back to the
+// shape of the name itself: graphify's hub fallback is a single symbol or path
+// ("testing.T", ".Return"), so any name with no whitespace in it is one.
+func readHubNamed(out string) int {
+	b, err := os.ReadFile(filepath.Join(out, ".graphify_labels.json"))
+	if err != nil {
+		return 0
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		return 0
+	}
+	// Some versions nest the mapping under a "labels" key.
+	if inner, ok := m["labels"].(map[string]any); ok {
+		m = inner
+	}
+	cur, curOK := readSigMap(filepath.Join(out, ".graphify_labels.json.sig"))
+	snap, snapOK := readSigMap(filepath.Join(out, LLMLabelSigFile))
+
+	n := 0
+	for k, v := range m {
+		s, _ := v.(string)
+		if s == "" {
+			s, _ = v.(map[string]any)["name"].(string)
+		}
+		if s == "" || isPlaceholder(s) {
+			continue
+		}
+		if curOK && snapOK {
+			// Snapshot mode: the signature moved (or is new) since the LLM
+			// named it.
+			if snapV, ok := snap[k]; !ok || snapV != cur[k] {
+				n++
+			}
+			continue
+		}
+		// Heuristic mode, no snapshot yet: the hub fallback is a single symbol
+		// or path with no spaces, whereas LLM names are phrases.
+		if !strings.ContainsAny(strings.TrimSpace(s), " \t\n\r\f\v") {
+			n++
+		}
+	}
+	return n
+}
+
+// readSigMap loads a signature file as community-id to signature. The second
+// result is false when the file is missing or unreadable, which is what tells
+// readHubNamed to fall back to the name-shape heuristic rather than treat every
+// community as unchanged.
+func readSigMap(path string) (map[string]string, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var m map[string]string
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, false
+	}
+	return m, true
+}
+
+// MarkLLMLabeled records that the LLM has just named the communities of out, by
+// copying graphify's current .graphify_labels.json.sig to ggraphify's own
+// LLMLabelSigFile.
+//
+// If graphify wrote no signature file there is nothing to record and nothing is
+// written: the label job is not the thing that failed. Any other error is
+// returned. The write is atomic so a crash mid-copy cannot leave a partial
+// snapshot that would read as "every community was renamed".
+func MarkLLMLabeled(out string) error {
+	b, err := os.ReadFile(filepath.Join(out, ".graphify_labels.json.sig"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	dir := out
+	tmp, err := os.CreateTemp(dir, ".ggraphify_llm_labels.sig.*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, filepath.Join(dir, LLMLabelSigFile)); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 // readAnalysisCommunities counts the communities graphify recorded in

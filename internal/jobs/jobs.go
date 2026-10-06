@@ -34,6 +34,7 @@ import (
 
 	"github.com/dns/ggraphify/internal/applog"
 	"github.com/dns/ggraphify/internal/gfy"
+	"github.com/dns/ggraphify/internal/graphstate"
 	"github.com/dns/ggraphify/internal/ringbuf"
 )
 
@@ -1380,6 +1381,13 @@ func (r *Runner) run(j *Job, ctx context.Context, cancel context.CancelFunc) {
 	case err == nil:
 		j.Status = Succeeded
 		j.Exit = 0
+		// Record the LLM's label signature so hub-renamed communities can be
+		// told apart from LLM-named ones on the next scan.
+		if j.Kind == "label" && j.Out != "" {
+			if merr := graphstate.MarkLLMLabeled(j.Out); merr != nil {
+				j.Log.WriteString("ggraphify: recording the LLM labels: " + merr.Error() + "\n")
+			}
+		}
 	default:
 		j.Status = Failed
 		j.Err = err

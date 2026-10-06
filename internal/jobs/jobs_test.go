@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dns/ggraphify/internal/gfy"
+	"github.com/dns/ggraphify/internal/graphstate"
 )
 
 // fakeGraphify writes an executable script and points $GRAPHIFY_BIN at it, so
@@ -1542,4 +1543,40 @@ func TestPausingAMeteredJobHandsNothingOver(t *testing.T) {
 			s.Status, s.Held)
 	}
 	r.CancelAll()
+}
+
+// A label job that succeeds records graphify's signature so the next scan can
+// tell an LLM name apart from a hub name. The runner owns this because it is the
+// only place that knows the job both succeeded and was a label job.
+func TestSucceededLabelJobRecordsTheLLMSignature(t *testing.T) {
+	fakeGraphify(t, `exit 0`)
+	r := New(Options{})
+	defer r.Close()
+
+	repo := repoDir(t)
+	out := t.TempDir()
+	// NeedGraph: `label` refuses an output directory with no graph.json.
+	if err := os.WriteFile(filepath.Join(out, "graph.json"), []byte(`{"nodes":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(out, ".graphify_labels.json.sig"),
+		[]byte(`{"0":"a","1":"b"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	job, err := r.SubmitCmd("label", repo, "Label · repo", gfy.Params{Repo: repo, Out: out}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := wait(t, r, job.ID); s.Status != Succeeded {
+		t.Fatalf("Status = %v, want ok", s.Status)
+	}
+
+	got, err := os.ReadFile(filepath.Join(out, graphstate.LLMLabelSigFile))
+	if err != nil {
+		t.Fatalf("the LLM signature was not recorded: %v", err)
+	}
+	if string(got) != `{"0":"a","1":"b"}` {
+		t.Fatalf("recorded signature = %s", got)
+	}
 }

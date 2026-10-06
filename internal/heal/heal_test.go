@@ -296,3 +296,62 @@ func TestGraftCreateStepCoversNoneOnly(t *testing.T) {
 		}
 	}
 }
+
+// A graph whose only defect is that its communities were renamed by hub since
+// the LLM named them gets one full label step — not the --missing-only one,
+// which would keep the hub names.
+func TestHubNamedOnlyPlansOneFullLabel(t *testing.T) {
+	g := graphstate.Graph{
+		State: graphstate.StateFresh, Communities: 20, Labeled: true,
+		HasReport: true, HubNamed: 3,
+	}
+	p := For(g, true)
+	want(t, p, "label")
+	if len(p.Steps) != 1 {
+		t.Fatalf("steps = %v, want exactly one", kinds(p))
+	}
+	if p.Steps[0].MissingOnly {
+		t.Error("a hub-named relabel must be full, not --missing-only")
+	}
+	if !p.Metered() {
+		t.Error("naming communities is metered and the plan must say so")
+	}
+}
+
+// Free-only cannot fix hub names, and says so instead of promising a healthy it
+// will not deliver.
+func TestHubNamedFreeOnlyIsUnreachable(t *testing.T) {
+	g := graphstate.Graph{
+		State: graphstate.StateFresh, Communities: 20, Labeled: true,
+		HasReport: true, HubNamed: 3,
+	}
+	p := For(g, false)
+	for _, s := range p.Steps {
+		if s.Kind == "label" {
+			t.Fatalf("a free-only plan queued a label step: %v", kinds(p))
+		}
+	}
+	var found bool
+	for _, u := range p.Unreachable {
+		if u.Code == graphstate.IssueHubNamed {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Unreachable = %+v, want the hub-named issue", p.Unreachable)
+	}
+}
+
+// Drift is repaired first, then the hub names are fixed: update re-clusters (and
+// re-introduces hub names), so the label has to come after it.
+func TestDriftAndHubNamedUpdateThenFullLabel(t *testing.T) {
+	g := graphstate.Graph{
+		State: graphstate.StateStale, Communities: 20, Labeled: true,
+		HasReport: true, DriftAdded: 1, HubNamed: 3,
+	}
+	p := For(g, true)
+	want(t, p, "update", "label")
+	if p.Steps[1].MissingOnly {
+		t.Error("the label step after an update must be full, not --missing-only")
+	}
+}

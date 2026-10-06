@@ -187,5 +187,30 @@ func For(g graphstate.Graph, allowMetered bool) Plan {
 		}
 	}
 
+	if has(graphstate.IssueHubNamed) {
+		// graphify's --missing-only only replaces "Community N" placeholders,
+		// so it would keep the hub names; a full label is required.
+		if allowMetered {
+			step := Step{
+				Kind:        "label",
+				Why:         "rename the hub-named communities with the LLM — METERED",
+				MissingOnly: false,
+			}
+			found := false
+			for i := range p.Steps {
+				if p.Steps[i].Kind == "label" {
+					p.Steps[i].MissingOnly = false
+					found = true
+					break
+				}
+			}
+			if !found {
+				p.Steps = append(p.Steps, step)
+			}
+		} else {
+			unreachable(graphstate.IssueHubNamed)
+		}
+	}
+
 	return p
 }
