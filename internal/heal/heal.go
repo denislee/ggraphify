@@ -8,9 +8,20 @@
 package heal
 
 import (
+	"time"
+
 	"github.com/dns/ggraphify/internal/gfy"
 	"github.com/dns/ggraphify/internal/graphstate"
 )
+
+// HubRelabelCooldown is how long after a successful LLM labeling the hub-named
+// relabel is not planned again. An actively-edited repository re-clusters on
+// every rebuild, and without this it re-qualifies for a full METERED relabel
+// within minutes of the last one.
+const HubRelabelCooldown = 24 * time.Hour
+
+// now is the planner's clock; tests replace it.
+var now = time.Now
 
 // Step is one command in a fix plan.
 type Step struct {
@@ -190,7 +201,15 @@ func For(g graphstate.Graph, allowMetered bool) Plan {
 	if has(graphstate.IssueHubNamed) {
 		// graphify's --missing-only only replaces "Community N" placeholders,
 		// so it would keep the hub names; a full label is required.
-		if allowMetered {
+		if allowMetered && !g.LLMLabeledAt.IsZero() && now().Sub(g.LLMLabeledAt) < HubRelabelCooldown {
+			// Cooldown: the LLM named these communities less than a day ago, so
+			// the issue stays on the board but no relabel is bought for it.
+			p.Unreachable = append(p.Unreachable, graphstate.Issue{
+				Code: graphstate.IssueHubNamed,
+				What: "hub-named relabel cooldown (last LLM labels <24h ago)",
+				Why:  "a busy repository re-clusters on every rebuild; relabelling it each time would spend on names that move again within minutes",
+			})
+		} else if allowMetered {
 			step := Step{
 				Kind:        "label",
 				Why:         "rename the hub-named communities with the LLM — METERED",

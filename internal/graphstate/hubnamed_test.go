@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // writeFile is a tiny helper so the hub-named tests do not need a full fixture.
@@ -125,5 +126,38 @@ func TestIssueHubNamedThreshold(t *testing.T) {
 			t.Errorf("%s: IssueHubNamed present = %v, want %v (issues=%v)",
 				c.name, got, c.want, g.IssueSummary())
 		}
+	}
+}
+
+// Read carries the LLM-label snapshot's mtime, which is what the planner's
+// relabel cooldown is measured from; with no snapshot it stays zero.
+func TestReadRecordsLLMLabeledAt(t *testing.T) {
+	repo := t.TempDir()
+	out := filepath.Join(repo, "out")
+	if err := os.Mkdir(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(out, "graph.json"), `{"nodes":[],"links":[]}`)
+
+	g, err := Read(Options{Repo: repo, Out: out, SkipDrift: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !g.LLMLabeledAt.IsZero() {
+		t.Fatalf("LLMLabeledAt = %v with no snapshot, want zero", g.LLMLabeledAt)
+	}
+
+	sig := filepath.Join(out, LLMLabelSigFile)
+	writeFile(t, sig, `{"0":"a"}`)
+	when := time.Date(2026, 10, 6, 16, 50, 0, 0, time.UTC)
+	if err := os.Chtimes(sig, when, when); err != nil {
+		t.Fatal(err)
+	}
+	g, err = Read(Options{Repo: repo, Out: out, SkipDrift: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !g.LLMLabeledAt.Equal(when) {
+		t.Fatalf("LLMLabeledAt = %v, want %v", g.LLMLabeledAt, when)
 	}
 }

@@ -83,6 +83,11 @@ type Graph struct {
 	// supplied by the caller — this package runs no git. It is what turns
 	// BuiltCommit from a fact into a verdict: see Behind.
 	HeadCommit string `json:"head_commit,omitempty"`
+	// LLMLabeledAt is the mtime of LLMLabelSigFile — when ggraphify last
+	// recorded a successful LLM labeling — and zero when there is none. The
+	// planner reads it to keep a busy repository from buying a full relabel on
+	// every rebuild.
+	LLMLabeledAt time.Time `json:"llm_labeled_at"`
 
 	DriftAdded   int  `json:"drift_added"`   // in the tree, absent from the manifest
 	DriftChanged int  `json:"drift_changed"` // newer than the manifest's mtime
@@ -279,6 +284,9 @@ func Read(opts Options) (Graph, error) {
 
 	g.Communities, g.Labeled = readLabels(out)
 	g.HubNamed = readHubNamed(out)
+	if fi, err := os.Stat(filepath.Join(out, LLMLabelSigFile)); err == nil {
+		g.LLMLabeledAt = fi.ModTime()
+	}
 	if g.Communities == 0 {
 		// `extract` writes .graphify_analysis.json with every community it
 		// detected; .graphify_labels.json only appears once `cluster-only` or

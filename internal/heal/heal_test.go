@@ -3,6 +3,7 @@ package heal
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dns/ggraphify/internal/gfy"
 	"github.com/dns/ggraphify/internal/graftstate"
@@ -353,5 +354,59 @@ func TestDriftAndHubNamedUpdateThenFullLabel(t *testing.T) {
 	want(t, p, "update", "label")
 	if p.Steps[1].MissingOnly {
 		t.Error("the label step after an update must be full, not --missing-only")
+	}
+}
+
+// A repository whose LLM labels were recorded under 24h ago must not be bought
+// another hub-named relabel; an older record, or none, plans it as before.
+func TestHubNamedRelabelCooldown(t *testing.T) {
+	base := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	old := now
+	now = func() time.Time { return base }
+	t.Cleanup(func() { now = old })
+
+	cases := []struct {
+		name         string
+		labeledAt    time.Time
+		wantLabel    bool
+		wantCooldown bool
+	}{
+		{"sig 1h old", base.Add(-time.Hour), false, true},
+		{"sig 25h old", base.Add(-25 * time.Hour), true, false},
+		{"no sig", time.Time{}, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := graphstate.Graph{
+				State: graphstate.StateFresh, Communities: 20, Labeled: true,
+				HasReport: true, HubNamed: 3, LLMLabeledAt: tc.labeledAt,
+			}
+			p := For(g, true)
+			hasLabel := false
+			for _, s := range p.Steps {
+				if s.Kind == "label" {
+					hasLabel = true
+				}
+			}
+			if hasLabel != tc.wantLabel {
+				t.Fatalf("label planned = %v, want %v (steps %v)", hasLabel, tc.wantLabel, kinds(p))
+			}
+			if tc.wantLabel {
+				if len(p.Steps) != 1 || p.Steps[0].MissingOnly || !p.Metered() {
+					t.Fatalf("steps = %+v, want exactly one full metered label", p.Steps)
+				}
+			} else if !p.Empty() || p.Metered() {
+				t.Fatalf("steps = %v, want an empty, unmetered plan", kinds(p))
+			}
+			cooldown := false
+			for _, u := range p.Unreachable {
+				if u.Code == graphstate.IssueHubNamed {
+					cooldown = true
+				}
+			}
+			if cooldown != tc.wantCooldown {
+				t.Fatalf("hub-named in Unreachable = %v, want %v (%+v)", cooldown, tc.wantCooldown, p.Unreachable)
+			}
+		})
 	}
 }
