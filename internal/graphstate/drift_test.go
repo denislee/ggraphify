@@ -114,6 +114,63 @@ func TestDriftSkipsWhatGraphifyRefuses(t *testing.T) {
 	}
 }
 
+// graft's hook shims are vendored into .claude/helpers/ of every graft-wired
+// checkout and are excluded from graphify's extraction, so they must not read
+// as drift. The negative control pins that the exclusion is the directory and
+// not a blanket over .cjs.
+func TestDriftIgnoresGraftShims(t *testing.T) {
+	f := newFixture(t)
+	f.write("a.cjs", "module.exports = 1")
+	f.write(".claude/helpers/graft-hooks.cjs", "module.exports = 2")
+	// a.cjs in the manifest puts .cjs in scope, so an unfiltered walk would
+	// report the shim as added.
+	f.manifest(map[string]float64{"a.cjs": future()})
+
+	d := DriftOf(f.repo, f.out, nil, Baseline{})
+	if len(d.Added) != 0 || len(d.Removed) != 0 {
+		t.Fatalf("Added = %v, Removed = %v, want neither — the shim is excluded",
+			d.Added, d.Removed)
+	}
+
+	// The rule is a directory rule, not a blanket: an untracked .cjs at the
+	// root is still drift.
+	f.write("b.cjs", "module.exports = 3")
+	d = DriftOf(f.repo, f.out, nil, Baseline{})
+	if len(d.Added) != 1 || d.Added[0] != "b.cjs" {
+		t.Fatalf("Added = %v, want exactly [b.cjs]", d.Added)
+	}
+}
+
+// graft wires every checkout for its agent hosts by writing files graphify must
+// not index: its skill copy under .claude/skills/graft/ and, at the root,
+// AGENTS.md, .mcp.json and opencode.json. Untracked and usually not gitignored,
+// they would otherwise read as drift in every graft-wired repository. The
+// negative control pins that the rule is these paths and not a blanket over
+// Markdown.
+func TestDriftIgnoresGraftAgentFiles(t *testing.T) {
+	f := newFixture(t)
+	f.write("a.md", "# a")
+	// a.md in the manifest puts .md in scope, so an unfiltered walk would
+	// report the untracked graft files as added.
+	f.manifest(map[string]float64{"a.md": future()})
+	f.write("AGENTS.md", "# agents")
+	f.write(".claude/skills/graft/SKILL.md", "# graft")
+
+	d := DriftOf(f.repo, f.out, nil, Baseline{})
+	if len(d.Added) != 0 || len(d.Removed) != 0 {
+		t.Fatalf("Added = %v, Removed = %v, want neither — graft's files are excluded",
+			d.Added, d.Removed)
+	}
+
+	// The rule is these paths, not a blanket: an unrelated untracked .md at
+	// the root is still drift.
+	f.write("b.md", "# b")
+	d = DriftOf(f.repo, f.out, nil, Baseline{})
+	if len(d.Added) != 1 || d.Added[0] != "b.md" {
+		t.Fatalf("Added = %v, want exactly [b.md]", d.Added)
+	}
+}
+
 // The baseline is the answer to drift that is real, permanent and not
 // graphify's fault: a file it read and got nothing from is absent from the
 // manifest forever. Once a successful run has settled it, it stops counting —

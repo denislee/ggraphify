@@ -42,7 +42,7 @@ func TestArgvGolden(t *testing.T) {
 			name: "extract restates no defaults",
 			kind: "extract",
 			p:    Params{Repo: repo, Out: out},
-			want: "/fake/graphify extract " + repo,
+			want: "/fake/graphify extract " + repo + " --exclude .claude/helpers/ --exclude .claude/skills/graft/",
 		},
 		{
 			name: "extract with every knob",
@@ -55,7 +55,7 @@ func TestArgvGolden(t *testing.T) {
 			},
 			want: "/fake/graphify extract " + repo +
 				" --backend gemini --model g-2 --mode deep --force --code-only" +
-				" --no-cluster --no-gitignore --max-workers 8 --token-budget 60000" +
+				" --no-cluster --no-gitignore --exclude .claude/helpers/ --exclude .claude/skills/graft/ --max-workers 8 --token-budget 60000" +
 				" --max-concurrency 4 --api-timeout 600 --global --as svc",
 		},
 		{

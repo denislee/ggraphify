@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/dns/ggraphify/internal/graftart"
 )
 
 // Drift is the per-file answer behind the board's `+12 ~30 −3`.
@@ -104,6 +106,22 @@ func MakeBaseline(repo string, d Drift, before time.Time) Baseline {
 		b.Removed[rel] = true
 	}
 	return b
+}
+
+// graftShimDir is where graft vendors its hook shims. ggraphify passes graphify
+// --exclude for it (gfy.GraftShimExclude), so the files are not drift.
+const graftShimDir = ".claude/helpers"
+
+// isGraftRootFile reports whether rel is one of the root files graft writes for
+// its agent hosts (graftart.RootFiles). Only the ones a checkout does not track
+// are graft's own; the walk checks that separately.
+func isGraftRootFile(rel string) bool {
+	for _, f := range graftart.RootFiles {
+		if rel == f {
+			return true
+		}
+	}
+	return false
 }
 
 // driftSkip are directories the drift walk never descends. They mirror what
@@ -246,9 +264,20 @@ func DriftOf(repo, out string, ignore map[string]bool, base Baseline) Drift {
 				(ignore != nil && ignore[name]) {
 				return fs.SkipDir
 			}
+			if rel == graftShimDir {
+				return fs.SkipDir
+			}
+			if rel == graftart.SkillDir {
+				return fs.SkipDir
+			}
 			if gi.Match(rel, true) || isNestedCheckout(path) {
 				return fs.SkipDir
 			}
+			return nil
+		}
+		if isGraftRootFile(rel) && graftart.Untracked(repo, rel) {
+			// graphify is passed --exclude for these (gfy via
+			// graftart.Excludes), so they are not drift.
 			return nil
 		}
 		ext := filepath.Ext(name)

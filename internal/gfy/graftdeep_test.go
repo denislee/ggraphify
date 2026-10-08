@@ -80,6 +80,7 @@ func TestGraftDeepRefusesAMeteredPinWithNoKey(t *testing.T) {
 }
 
 func TestGraftDeepEnvSuppliesThePlaceholderKey(t *testing.T) {
+	t.Setenv(OllamaKeyVar, "") // an exported key is used ahead of the placeholder
 	e := GraftDeepEnv(Env{}, GraftDeepKind, OllamaBackend)
 	if e[GraftKeyVar] != GraftLocalKey {
 		t.Fatalf("key = %q, want %q", e[GraftKeyVar], GraftLocalKey)
@@ -177,6 +178,7 @@ func indexOf(ss []string, want string) int {
 // Against a server on this machine the retry budget is capped.
 func TestGraftDeepEnvCapsRetriesOnALocalServer(t *testing.T) {
 	t.Setenv(GraftRetriesVar, "")
+	t.Setenv(OllamaKeyVar, "")
 
 	e := GraftDeepEnv(Env{}, GraftDeepKind, OllamaBackend)
 	if e[GraftRetriesVar] != GraftLocalRetries {

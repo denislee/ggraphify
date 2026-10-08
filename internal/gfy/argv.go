@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/dns/ggraphify/internal/graftart"
 )
 
 // Cost says whether running a command spends money.
@@ -25,6 +27,15 @@ func (c Cost) String() string {
 	}
 	return "free"
 }
+
+// GraftShimExclude keeps graft's vendored hook shims (<repo>/.claude/helpers/graft-*.cjs,
+// copied into every graft-wired checkout) out of the graph. Indexed, they put the same
+// 22 nodes (entry(), best(), newer()...) into every repo and make ggq lookups ambiguous.
+// graphify persists --exclude beside the graph, so later updates honour it too.
+// graft's other agent-host files — its skill copy and the root AGENTS.md,
+// .mcp.json and opencode.json it may have written — are excluded alongside it
+// via graftart.Excludes.
+const GraftShimExclude = ".claude/helpers/"
 
 // Spec is one command ggraphify knows how to run: what it is called, what it
 // costs, and how to turn parameters into an argv.
@@ -241,6 +252,10 @@ func Argv(kind string, p Params) []string {
 		}
 		if p.NoGitignore {
 			add("--no-gitignore")
+		}
+		add("--exclude", GraftShimExclude)
+		for _, e := range graftart.Excludes(p.Repo) {
+			add("--exclude", e)
 		}
 		num("--max-workers", p.MaxWorkers)
 		num("--token-budget", p.TokenBudget)
