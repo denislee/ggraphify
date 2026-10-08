@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -49,7 +50,7 @@ type record struct {
 	SessionID string    `json:"sessionId"`
 
 	Message *struct {
-		Content json.RawMessage `json:"content"`
+		Content content `json:"content"`
 	} `json:"message"`
 
 	Attachment *struct {
@@ -58,11 +59,45 @@ type record struct {
 	} `json:"attachment"`
 }
 
+// content is a message's content, decoded in place while the record is.
+//
+// It used to be a json.RawMessage decoded a second time, which copied the
+// whole of it — on a tool_result line, megabytes — before a single block was
+// looked at. Decoding it inside the record's own pass skips that copy, and the
+// blocks it decodes into leave the result output out entirely (see block).
+//
+// The outcome is the one the two-step decode had: a string, a list of blocks,
+// or neither — and neither is never an error for the record around it.
+type content struct {
+	set    bool
+	str    string
+	isStr  bool
+	blocks []block
+	ok     bool
+}
+
+func (c *content) UnmarshalJSON(b []byte) error {
+	*c = content{set: len(b) > 0}
+	if len(b) > 0 && b[0] == '"' {
+		if err := json.Unmarshal(b, &c.str); err == nil {
+			c.isStr, c.ok = true, true
+		}
+		return nil
+	}
+	if err := json.Unmarshal(b, &c.blocks); err != nil {
+		c.blocks = nil
+		return nil
+	}
+	c.ok = true
+	return nil
+}
+
 // block is one content block of an assistant or user message.
 //
 // The tool_use half carries the call; the tool_result half carries what came
-// back for it, joined on ID. Content is the result's output, which is read
-// only far enough to classify a failure (see failure.go) and never retained.
+// back for it, joined on ID. The result's output is deliberately not a field:
+// it is read only for a result some call is still waiting on — see
+// resultContent — and never retained.
 type block struct {
 	Type  string `json:"type"`
 	Name  string `json:"name"`
@@ -72,9 +107,30 @@ type block struct {
 		Skill   string `json:"skill"`
 	} `json:"input"`
 
-	ToolUseID string          `json:"tool_use_id"`
-	IsError   bool            `json:"is_error"`
-	Content   json.RawMessage `json:"content"`
+	ToolUseID string `json:"tool_use_id"`
+	IsError   bool   `json:"is_error"`
+}
+
+// resultContent re-reads a line for the output of its i-th content block. It
+// runs only for a tool_result that resolves an outstanding call, which is the
+// one case the output is needed, so the copy it makes is paid once per answer
+// instead of once per result line.
+func resultContent(line []byte, i int) json.RawMessage {
+	var rec struct {
+		Message *struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(line, &rec); err != nil || rec.Message == nil {
+		return nil
+	}
+	var blocks []struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(rec.Message.Content, &blocks); err != nil || i >= len(blocks) {
+		return nil
+	}
+	return blocks[i].Content
 }
 
 // sessionScan is what one pass over one transcript learnt about the session
@@ -121,16 +177,24 @@ func scanTranscript(ctx context.Context, path, account string, off int64, since 
 		}
 	}
 
-	r := bufio.NewReaderSize(f, 256<<10)
+	// One pooled reader per pass, reset onto this file: the board re-reads
+	// every live transcript every two seconds, and a fresh 256 KB buffer plus
+	// a fresh slice per line was most of what this package allocated.
+	lr := getLineReader(f)
+	defer putLineReader(lr)
+	var pending func(string) bool
+	if pend != nil {
+		pending = pend.has
+	}
 	pos := off
 	n := 0
-	// The first and last timestamped lines of THIS pass. bufio.ReadBytes
-	// returns a fresh slice per call, so holding on to two of them costs
-	// nothing beyond the two lines themselves.
-	var firstTS, lastTS []byte
+	// The first and last timestamped lines of THIS pass. The line returned by
+	// the reader is only valid until the next read, so both are copied — into
+	// buffers the pooled reader keeps, which costs a memmove and no garbage.
+	haveFirst := false
 	tools := 0
 	for {
-		line, err := r.ReadBytes('\n')
+		line, err := lr.next()
 		if len(line) > 0 && line[len(line)-1] != '\n' {
 			// A partial final line: a session still being written. Leave the
 			// offset before it so the next scan reads it whole.
@@ -139,14 +203,15 @@ func scanTranscript(ctx context.Context, path, account string, off int64, since 
 		if len(line) > 0 {
 			pos += int64(len(line))
 			if n++; n%512 == 0 && ctx.Err() != nil {
-				return pos, sessionOf(path, account, firstTS, lastTS, tools), ctx.Err()
+				return pos, sessionOf(path, account, lr.first, lr.last, tools), ctx.Err()
 			}
 			tools += countToolUses(line)
 			if bytes.Contains(line, needleTimestamp) {
-				if firstTS == nil {
-					firstTS = line
+				if !haveFirst {
+					lr.first = append(lr.first[:0], line...)
+					haveFirst = true
 				}
-				lastTS = line
+				lr.last = append(lr.last[:0], line...)
 			}
 			// Two ways a line is worth decoding: it names one of the tools,
 			// or it is the answer to a call that is still outstanding. The
@@ -155,14 +220,77 @@ func scanTranscript(ctx context.Context, path, account string, off int64, since 
 			// graphify — so the result of a call cannot be found by the same
 			// byte scan that finds the call.
 			if mentions(line) || (pend != nil && pend.match(line)) {
-				parseLine(line, account, since, emit, emitR)
+				parseLine(line, account, since, pending, emit, emitR)
 			}
 		}
 		if err != nil {
 			break
 		}
 	}
-	return pos, sessionOf(path, account, firstTS, lastTS, tools), nil
+	return pos, sessionOf(path, account, lr.first, lr.last, tools), nil
+}
+
+// lineReader is a pooled bufio.Reader plus the scratch a long line needs.
+//
+// next hands out ReadSlice's view into the reader's buffer when the line fits,
+// and only a line longer than the buffer is assembled — into scratch, which is
+// reused for the next one. Either way the slice is valid until the next call,
+// which is all parseLine needs: the decoder copies what it keeps.
+type lineReader struct {
+	r       *bufio.Reader
+	scratch []byte
+	first   []byte
+	last    []byte
+}
+
+const (
+	lineReaderSize = 256 << 10
+	// maxPooledLine is the largest scratch a pooled reader keeps. A transcript
+	// line can run to tens of megabytes; holding that much in a pool between
+	// ticks would trade a transient spike for a permanent one.
+	maxPooledLine = 4 << 20
+)
+
+var lineReaders = sync.Pool{New: func() any {
+	return &lineReader{r: bufio.NewReaderSize(nil, lineReaderSize)}
+}}
+
+func getLineReader(rd io.Reader) *lineReader {
+	lr := lineReaders.Get().(*lineReader)
+	lr.r.Reset(rd)
+	lr.first, lr.last = lr.first[:0], lr.last[:0]
+	return lr
+}
+
+func putLineReader(lr *lineReader) {
+	lr.r.Reset(nil)
+	if cap(lr.scratch) > maxPooledLine {
+		lr.scratch = nil
+	}
+	if cap(lr.first) > maxPooledLine {
+		lr.first = nil
+	}
+	if cap(lr.last) > maxPooledLine {
+		lr.last = nil
+	}
+	lineReaders.Put(lr)
+}
+
+// next returns the next line including its '\n', with ReadBytes' contract:
+// err is non-nil exactly when the line does not end in the delimiter.
+func (lr *lineReader) next() ([]byte, error) {
+	line, err := lr.r.ReadSlice('\n')
+	if err != bufio.ErrBufferFull {
+		return line, err
+	}
+	lr.scratch = append(lr.scratch[:0], line...)
+	for {
+		line, err = lr.r.ReadSlice('\n')
+		lr.scratch = append(lr.scratch, line...)
+		if err != bufio.ErrBufferFull {
+			return lr.scratch, err
+		}
+	}
 }
 
 // sessionOf assembles the pass's session record.
@@ -198,8 +326,25 @@ func sessionOf(path, account string, firstTS, lastTS []byte, tools int) sessionS
 	return sc
 }
 
-func decodeRecord(line []byte) (record, bool) {
-	var rec record
+// stamp is the part of a record sessionOf reads. message and attachment are
+// still declared, with the same shapes as in record, so a line whose message
+// is not an object is rejected exactly as decoding a whole record would — but
+// their content is skipped, not copied: the line that carries the timestamp is
+// usually the biggest one in the pass.
+type stamp struct {
+	Timestamp time.Time `json:"timestamp"`
+	Cwd       string    `json:"cwd"`
+	GitBranch string    `json:"gitBranch"`
+	SessionID string    `json:"sessionId"`
+
+	Message    *struct{} `json:"message"`
+	Attachment *struct {
+		Type string `json:"type"`
+	} `json:"attachment"`
+}
+
+func decodeRecord(line []byte) (stamp, bool) {
+	var rec stamp
 	if len(line) == 0 {
 		return rec, false
 	}
@@ -226,16 +371,39 @@ var (
 	needleToolResult = []byte(`"tool_result"`)
 	needleToolUse    = []byte(`"type":"tool_use"`)
 	needleTimestamp  = []byte(`"timestamp":"`)
+
+	// The three places an Event can come from, as bytes: a tool call, a hook's
+	// injected context, a slash command's preamble. "command-name" is matched
+	// without its angle brackets so an encoder that escapes them still passes.
+	needleCall    = []byte(`"tool_use"`)
+	needleHook    = []byte(hookAttachment)
+	needleCommand = []byte("command-name")
 )
 
+// mentions is the prefilter: could parseLine emit an Event for this line?
+//
+// Naming a tool is necessary but, on its own, loose — measured on a real
+// corpus it let through 28 % of lines and 42 % of bytes, almost all of them
+// tool_result lines whose output merely quotes the word (a file read, a grep).
+// parseLine can only emit from a tool_use block, a hook attachment or a slash
+// command, so a line carrying none of those markers is rejected here too. A
+// result that answers an outstanding call is not this filter's job: it comes
+// through pendingSet.match.
 func mentions(line []byte) bool {
-	return bytes.Contains(line, needleGraphify) || bytes.Contains(line, needleGraft)
+	if !bytes.Contains(line, needleGraphify) && !bytes.Contains(line, needleGraft) {
+		return false
+	}
+	return bytes.Contains(line, needleCall) || bytes.Contains(line, needleHook) || bytes.Contains(line, needleCommand)
 }
 
 // parseLine turns one transcript record into zero or more events, and
 // resolves the results of calls this scan — or an earlier one — is still
 // waiting on.
-func parseLine(line []byte, account string, since time.Time, emit func(Event), emitR func(string, Fail)) {
+//
+// pending, when set, says whether a tool_use id is still waiting on its
+// result; a result for any other id is skipped before its output is read.
+// Nil means every result goes to emitR.
+func parseLine(line []byte, account string, since time.Time, pending func(string) bool, emit func(Event), emitR func(string, Fail)) {
 	var rec record
 	if err := json.Unmarshal(line, &rec); err != nil {
 		return
@@ -261,32 +429,37 @@ func parseLine(line []byte, account string, since time.Time, emit func(Event), e
 			emit(e)
 		}
 	}
-	if rec.Message == nil || len(rec.Message.Content) == 0 {
+	if rec.Message == nil || !rec.Message.Content.set {
 		return
 	}
 
 	// Content is either a plain string — a user turn, where the only thing
 	// worth counting is a slash command — or the list of blocks an assistant
 	// turn is made of.
-	if s, ok := decodeString(rec.Message.Content); ok {
-		if t, verb, ok := slashCommand(s); ok {
+	c := &rec.Message.Content
+	if c.isStr {
+		if t, verb, ok := slashCommand(c.str); ok {
 			e := base
 			e.Tool, e.Kind, e.Verb = t, Skill, verb
 			emit(e)
 		}
 		return
 	}
-	var blocks []block
-	if err := json.Unmarshal(rec.Message.Content, &blocks); err != nil {
+	if !c.ok {
 		return
 	}
-	for _, b := range blocks {
+	for i, b := range c.blocks {
 		if b.Type == "tool_result" {
 			// A result for a call this scan is not tracking is not an error:
 			// it is every other tool the agent ran. match() already made that
-			// rare, and take() is what makes it free.
+			// rare, and take() is what makes it free. Asking pending first is
+			// what keeps it free: classifying means unescaping the output, and
+			// for a result nobody is waiting on that work was thrown away.
 			if emitR != nil && b.ToolUseID != "" {
-				emitR(b.ToolUseID, classifyFail(resultText(b.Content), b.IsError))
+				if pending != nil && !pending(b.ToolUseID) {
+					continue
+				}
+				emitR(b.ToolUseID, classifyFail(resultText(resultContent(line, i)), b.IsError))
 			}
 			continue
 		}
@@ -394,38 +567,4 @@ func hookVerb(s string) string {
 		return "session-start"
 	}
 	return "context"
-}
-
-// transcripts lists the transcript files under one account directory.
-//
-// The layout is projects/<slugified-cwd>/<session-id>.jsonl, with sidecar
-// directories of the same name beside the files; only the .jsonl files are
-// returned, and the slug is not decoded — the cwd inside each record is the
-// authoritative one, and the slug is lossy about separators.
-func transcripts(dir string) ([]string, error) {
-	root := filepath.Join(dir, "projects")
-	projects, err := os.ReadDir(root)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	var out []string
-	for _, p := range projects {
-		if !p.IsDir() {
-			continue
-		}
-		files, err := os.ReadDir(filepath.Join(root, p.Name()))
-		if err != nil {
-			continue
-		}
-		for _, f := range files {
-			if f.IsDir() || !strings.HasSuffix(f.Name(), ".jsonl") {
-				continue
-			}
-			out = append(out, filepath.Join(root, p.Name(), f.Name()))
-		}
-	}
-	return out, nil
 }

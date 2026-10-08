@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -55,6 +56,37 @@ type Index struct {
 	// opposed to skipped on a stat. It is shown in the UI because "this
 	// number did not move" and "nothing was read" are different answers.
 	Scanned int `json:"-"`
+
+	// scan is the state that only Update touches, behind its own mutex so two
+	// updates never share it: directory listings cached by mtime, and buffers
+	// reused from one tick to the next. None of it is persisted.
+	scan scanCache
+
+	// gen counts updates that changed anything Save would write; savedGen and
+	// savedPath are what the file on disk was last written from. Together they
+	// let Save skip rewriting a rollup that has not moved — UpdatedAt aside,
+	// which is a clock reading and not a change.
+	gen       uint64
+	savedGen  uint64
+	savedPath string
+}
+
+// scanCache is Update's private working state. See Index.scan.
+type scanCache struct {
+	mu       sync.Mutex
+	accounts map[string]*acctListing
+	sessDirs map[string]*dirStamp
+	paths    []string
+	spareF   map[string]FileState
+	keepG    []keptState
+	present  map[string]struct{}
+	listed   []string
+}
+
+// keptState is one graft session file whose state changed this tick.
+type keptState struct {
+	path string
+	st   SessionState
 }
 
 // Day is one calendar day's usage, by repository.
@@ -155,20 +187,46 @@ func Load(path string) *Index {
 	}
 	x.Recent = in.Recent
 	x.UpdatedAt = in.UpdatedAt
+	// What is in memory is what is on disk, so the first Save before anything
+	// changes has nothing to write.
+	x.savedPath = path
 	return x
 }
 
 // DefaultPath is the rollup's place beside the rest of the sidecar state.
 func DefaultPath(dir string) string { return filepath.Join(dir, "usage.json") }
 
-// Save writes the rollup atomically.
+// saveBufs holds the encode buffer between saves. The rollup runs to a couple
+// of megabytes; marshalling it into a fresh slice every five minutes was the
+// largest single allocation the board made while idle.
+var saveBufs = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+// Save writes the rollup atomically. It writes nothing when the rollup has
+// not changed since it was last saved to — or loaded from — the same path and
+// that file is still there.
 func (x *Index) Save(path string) error {
 	x.mu.RLock()
-	b, err := json.Marshal(x)
+	clean := x.savedPath == path && x.savedGen == x.gen
+	x.mu.RUnlock()
+	if clean {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+	}
+
+	buf := saveBufs.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer saveBufs.Put(buf)
+	x.mu.RLock()
+	gen := x.gen
+	err := json.NewEncoder(buf).Encode(x.alias())
 	x.mu.RUnlock()
 	if err != nil {
 		return err
 	}
+	// Encode terminates the value with a newline Marshal never wrote; drop it
+	// so the file is byte-for-byte what it always was.
+	buf.Truncate(buf.Len() - 1)
 	// Same directory and the same reasoning as the state file beside it: this
 	// is per-user state, and it records which repositories on this machine the
 	// user works on.
@@ -176,30 +234,46 @@ func (x *Index) Save(path string) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	if err := os.WriteFile(tmp, buf.Bytes(), 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	x.mu.Lock()
+	if gen >= x.savedGen || x.savedPath != path {
+		x.savedGen, x.savedPath = gen, path
+	}
+	x.mu.Unlock()
+	return nil
 }
 
-// MarshalJSON serialises under the read lock.
-func (x *Index) MarshalJSON() ([]byte, error) {
-	type alias struct {
-		Ver        int                     `json:"version"`
-		Files      map[string]FileState    `json:"files"`
-		GraftFiles map[string]SessionState `json:"graft_files"`
-		Days       map[string]*Day         `json:"days"`
-		Owners     map[string]string       `json:"owners"`
-		Sessions   map[string]*SessionRoll `json:"sessions"`
-		Pending    map[string]pendingCall  `json:"pending"`
-		Recent     []Event                 `json:"recent"`
-		UpdatedAt  time.Time               `json:"updated_at"`
-	}
-	return json.Marshal(alias{
+// indexJSON is the on-disk shape of the rollup.
+type indexJSON struct {
+	Ver        int                     `json:"version"`
+	Files      map[string]FileState    `json:"files"`
+	GraftFiles map[string]SessionState `json:"graft_files"`
+	Days       map[string]*Day         `json:"days"`
+	Owners     map[string]string       `json:"owners"`
+	Sessions   map[string]*SessionRoll `json:"sessions"`
+	Pending    map[string]pendingCall  `json:"pending"`
+	Recent     []Event                 `json:"recent"`
+	UpdatedAt  time.Time               `json:"updated_at"`
+}
+
+// alias is the rollup in its on-disk shape. Caller holds a lock.
+func (x *Index) alias() indexJSON {
+	return indexJSON{
 		Ver: Version, Files: x.Files, GraftFiles: x.GraftFiles,
 		Days: x.Days, Owners: x.Owners, Sessions: x.Sessions,
 		Pending: x.Pending, Recent: x.Recent, UpdatedAt: x.UpdatedAt,
-	})
+	}
+}
+
+// MarshalJSON serialises the rollup in its on-disk shape. Save does not go
+// through it; callers that do are responsible for holding the read lock.
+func (x *Index) MarshalJSON() ([]byte, error) {
+	return json.Marshal(x.alias())
 }
 
 // Update folds everything that has happened since the last update into the
@@ -215,33 +289,61 @@ func (x *Index) Update(ctx context.Context, opts Options) error {
 	if since.IsZero() {
 		since = now.Add(-Retain)
 	}
+	// stale is the age past which a file cannot hold anything this update
+	// would count: its newest line is older than both the window and the
+	// retention period. Such a file is neither read nor remembered — see prune.
+	stale := since
+	if r := now.Add(-Retain); r.Before(stale) {
+		stale = r
+	}
 
+	sc := &x.scan
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	// Only Update writes Files and GraftFiles, and sc.mu makes it the only
+	// one running, so both are read here without a copy: readers elsewhere
+	// hold the read lock, and every write below happens under the write lock.
 	x.mu.Lock()
-	files := make(map[string]FileState, len(x.Files))
-	for k, v := range x.Files {
-		files[k] = v
-	}
-	graftFiles := make(map[string]SessionState, len(x.GraftFiles))
-	for k, v := range x.GraftFiles {
-		graftFiles[k] = v
-	}
+	files := x.Files
+	graftFiles := x.GraftFiles
+	prevPending := len(x.Pending)
 	// The calls still waiting on a result, carried over from the last scan.
 	// Anything older than the TTL is dropped here rather than re-persisted: a
 	// session that was interrupted mid-call never produces the answer.
 	pend := newPendingSet(x.Pending, now.Add(-pendingTTL))
 	x.mu.Unlock()
 
+	// nextF is built into the map the previous update replaced, so the
+	// per-tick cost of "which transcripts exist" is a clear, not a new map.
+	nextF := sc.spareF
+	if nextF == nil {
+		nextF = make(map[string]FileState, len(files))
+	}
+	clear(nextF)
+	sc.keepG = sc.keepG[:0]
+	sc.listed = sc.listed[:0]
+	if sc.present == nil {
+		sc.present = map[string]struct{}{}
+	}
+	clear(sc.present)
+
 	var (
-		events   []Event
-		fails    []failure
-		deltas   []delta
-		scans    []sessionScan
-		scanned  int
-		nextF    = map[string]FileState{}
-		nextG    = map[string]SessionState{}
-		emitE    = func(e Event) { events = append(events, e); pend.add(e, now) }
-		emitD    = func(d delta) { deltas = append(deltas, d) }
-		keepSess = func(p string, s SessionState) { nextG[p] = s }
+		events  []Event
+		fails   []failure
+		deltas  []delta
+		scans   []sessionScan
+		scanned int
+		emitE   = func(e Event) { events = append(events, e); pend.add(e, now) }
+		emitD   = func(d delta) { deltas = append(deltas, d) }
+		// Only a state that moved is recorded; an unchanged one is already
+		// in GraftFiles and writing it back would be a no-op.
+		keepSess = func(p string, s SessionState) {
+			sc.present[p] = struct{}{}
+			if old, ok := graftFiles[p]; !ok || old != s {
+				sc.keepG = append(sc.keepG, keptState{p, s})
+			}
+		}
 		// A result resolves the call it answers: a failing one is recorded,
 		// a successful one simply stops being waited on.
 		emitR = func(id string, f Fail) {
@@ -255,17 +357,23 @@ func (x *Index) Update(ctx context.Context, opts Options) error {
 		}
 	)
 
+	sc.paths = sc.paths[:0]
 	for _, acct := range opts.Accounts {
-		paths, err := transcripts(acct.Dir)
+		start := len(sc.paths)
+		var err error
+		sc.paths, err = sc.transcripts(acct.Dir, sc.paths)
 		if err != nil {
 			continue
 		}
-		for _, p := range paths {
+		for _, p := range sc.paths[start:] {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			fi, err := os.Stat(p)
 			if err != nil {
+				continue
+			}
+			if fi.ModTime().Before(stale) {
 				continue
 			}
 			st := files[p]
@@ -281,7 +389,7 @@ func (x *Index) Update(ctx context.Context, opts Options) error {
 				off = 0
 			}
 			scanned++
-			end, sc, err := scanTranscript(ctx, p, acct.Name, off, since, pend, emitE, emitR)
+			end, ss, err := scanTranscript(ctx, p, acct.Name, off, since, pend, emitE, emitR)
 			if err != nil && ctx.Err() != nil {
 				return err
 			}
@@ -289,40 +397,61 @@ func (x *Index) Update(ctx context.Context, opts Options) error {
 				// Re-read from the start: this pass counted the whole file, so
 				// what the old one contributed has to come back off. The result
 				// is the new file's count, not the sum of both.
-				sc.Tools -= st.Tools
+				ss.Tools -= st.Tools
 			}
-			scans = append(scans, sc)
+			scans = append(scans, ss)
 			nextF[p] = FileState{
 				Size: fi.Size(), ModNS: fi.ModTime().UnixNano(), Offset: end,
-				Tools: st.Tools + sc.Tools,
+				Tools: st.Tools + ss.Tools,
 			}
 		}
 	}
+	sc.forgetAccounts(opts.Accounts)
 
 	for _, repo := range opts.Repos {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		scanGraftSessions(repo, graftFiles, since, emitD, keepSess)
+		dir, changed := sc.sessionDirChanged(repo)
+		if !changed {
+			continue
+		}
+		sc.listed = append(sc.listed, dir)
+		scanGraftSessions(repo, graftFiles, since, stale, emitD, keepSess)
 	}
 
 	x.mu.Lock()
 	defer x.mu.Unlock()
+	dirty := scanned > 0 || len(sc.keepG) > 0 || len(nextF) != len(files) || len(pend.byID) != prevPending
 	x.Ver = Version
-	x.Files = nextF
+	sc.spareF, x.Files = x.Files, nextF
+	if x.GraftFiles == nil {
+		x.GraftFiles = map[string]SessionState{}
+	}
 	// A repository the board no longer lists keeps its state: dropping it
 	// would make every counter in it look new the next time it is boarded,
-	// and re-emit a whole session's worth of deltas.
-	for k, v := range nextG {
-		graftFiles[k] = v
+	// and re-emit a whole session's worth of deltas. A file that is gone from
+	// a directory this update did list, though, is gone.
+	for _, k := range sc.keepG {
+		x.GraftFiles[k.path] = k.st
 	}
-	x.GraftFiles = graftFiles
+	if len(sc.listed) > 0 {
+		for p := range x.GraftFiles {
+			if _, ok := sc.present[p]; ok {
+				continue
+			}
+			if i := strings.LastIndexByte(p, filepath.Separator); i >= 0 && contains(sc.listed, p[:i]) {
+				delete(x.GraftFiles, p)
+				dirty = true
+			}
+		}
+	}
 	// The session registry is folded before the events, so a roll already
 	// knows its working directory and its start by the time a call is counted
 	// into it. It also covers the sessions no event will ever name — the ones
 	// that used neither tool, which are the denominator.
-	for _, sc := range scans {
-		x.addScan(sc)
+	for _, s := range scans {
+		x.addScan(s)
 	}
 	for _, e := range events {
 		x.add(e)
@@ -338,7 +467,12 @@ func (x *Index) Update(ctx context.Context, opts Options) error {
 		x.addDelta(d)
 	}
 	x.Pending = pend.snapshot()
-	x.prune(since)
+	if x.prune(since, stale) {
+		dirty = true
+	}
+	if dirty {
+		x.gen++
+	}
 	x.UpdatedAt = now
 	x.Scanned = scanned
 	return nil
@@ -400,7 +534,7 @@ func (x *Index) addFail(f failure) {
 	key := failKey(e.Tool, f.Reason, e.Verb)
 	rd.Fails[key]++
 	if e.Session != "" {
-		r := x.session(e.Session)
+		r := x.sessionRoll(e.Session)
 		if r.Fails == nil {
 			r.Fails = map[string]int{}
 		}
@@ -432,7 +566,7 @@ func (x *Index) addDelta(d delta) {
 	if !contains(rd.Sessions, d.Session) {
 		rd.Sessions = append(rd.Sessions, d.Session)
 	}
-	r := x.session(d.Session)
+	r := x.sessionRoll(d.Session)
 	r.GraftReads += d.Reads
 	r.SourceReads += d.Source
 	r.Nudges += d.Nudges
@@ -463,7 +597,7 @@ func (x *Index) addScan(sc sessionScan) {
 	if sc.Session == "" {
 		return
 	}
-	r := x.session(sc.Session)
+	r := x.sessionRoll(sc.Session)
 	if sc.Account != "" {
 		r.Account = sc.Account
 		x.Owners[sc.Session] = sc.Account
@@ -492,18 +626,29 @@ func (x *Index) addScan(sc sessionScan) {
 }
 
 // session returns the roll for one session id, creating it if this is the
-// first thing ever seen from it. Caller holds the lock.
+// first thing ever seen from it, with its Counts map ready to write. Caller
+// holds the lock.
 func (x *Index) session(id string) *SessionRoll {
+	r := x.sessionRoll(id)
+	if r.Counts == nil {
+		r.Counts = map[string]int{}
+	}
+	return r
+}
+
+// sessionRoll is session without the Counts map. Most sessions never call
+// either tool — they are in the registry as the denominator — and an empty
+// map apiece was a few hundred kilobytes of nothing; Counts is omitted from
+// the file when empty, so nil and empty read back the same. Caller holds the
+// lock.
+func (x *Index) sessionRoll(id string) *SessionRoll {
 	if x.Sessions == nil {
 		x.Sessions = map[string]*SessionRoll{}
 	}
 	r := x.Sessions[id]
 	if r == nil {
-		r = &SessionRoll{Session: id, Counts: map[string]int{}}
+		r = &SessionRoll{Session: id}
 		x.Sessions[id] = r
-	}
-	if r.Counts == nil {
-		r.Counts = map[string]int{}
 	}
 	return r
 }
@@ -533,11 +678,16 @@ func (x *Index) repoDay(day, repo string) *RepoDay {
 
 // prune drops days that have fallen out of the retention window, the events
 // that belong to them, and the session-to-account mapping nothing references.
-func (x *Index) prune(since time.Time) {
+// It also forgets the transcripts and graft counter files older than stale:
+// Update no longer reads them, so their offsets would only ever grow the map.
+// It reports whether it removed anything.
+func (x *Index) prune(since, stale time.Time) bool {
+	changed := false
 	cut := DayKey(since)
 	for day := range x.Days {
 		if day < cut {
 			delete(x.Days, day)
+			changed = true
 		}
 	}
 	// A session is dropped on its last line of activity, not on the day it
@@ -546,6 +696,20 @@ func (x *Index) prune(since time.Time) {
 	for id, r := range x.Sessions {
 		if r == nil || r.Last.Before(since) {
 			delete(x.Sessions, id)
+			changed = true
+		}
+	}
+	staleNS := stale.UnixNano()
+	for p, st := range x.Files {
+		if st.ModNS < staleNS {
+			delete(x.Files, p)
+			changed = true
+		}
+	}
+	for p, st := range x.GraftFiles {
+		if st.ModNS < staleNS {
+			delete(x.GraftFiles, p)
+			changed = true
 		}
 	}
 	live := map[string]bool{}
@@ -562,9 +726,11 @@ func (x *Index) prune(since time.Time) {
 	for s := range x.Owners {
 		if !live[s] {
 			delete(x.Owners, s)
+			changed = true
 		}
 	}
 	sort.SliceStable(x.Recent, func(i, j int) bool { return x.Recent[i].At.Before(x.Recent[j].At) })
+	before := len(x.Recent)
 	keep := x.Recent[:0]
 	for _, e := range x.Recent {
 		if !e.At.Before(since) {
@@ -575,11 +741,16 @@ func (x *Index) prune(since time.Time) {
 	if len(x.Recent) > MaxRecent {
 		x.Recent = x.Recent[len(x.Recent)-MaxRecent:]
 	}
+	if len(x.Recent) != before {
+		changed = true
+	}
 	for id, c := range x.Pending {
 		if c.Seen.Before(since) {
 			delete(x.Pending, id)
+			changed = true
 		}
 	}
+	return changed
 }
 
 func contains(ss []string, s string) bool {
@@ -601,5 +772,8 @@ func RepoMatch(repo, cwd string) bool {
 	if repo == cwd {
 		return true
 	}
-	return strings.HasPrefix(cwd, strings.TrimSuffix(repo, string(filepath.Separator))+string(filepath.Separator))
+	// The same test as HasPrefix(cwd, TrimSuffix(repo, sep)+sep), without
+	// building the prefix: this runs per day x directory x checkout.
+	root := strings.TrimSuffix(repo, string(filepath.Separator))
+	return len(cwd) > len(root) && cwd[len(root)] == filepath.Separator && cwd[:len(root)] == root
 }

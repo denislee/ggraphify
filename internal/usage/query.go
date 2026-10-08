@@ -338,6 +338,13 @@ func (x *Index) RepoUses(repos []string, w Window) map[string]RepoUse {
 	x.mu.RLock()
 	defer x.mu.RUnlock()
 
+	// A working directory turns up on many days; which checkout owns it is
+	// the same answer every time, and finding it walks every checkout.
+	type owner struct {
+		repo string
+		ok   bool
+	}
+	owners := map[string]owner{}
 	for i := 0; i < days; i++ {
 		dayTime := from.AddDate(0, 0, i)
 		key := DayKey(dayTime)
@@ -346,7 +353,12 @@ func (x *Index) RepoUses(repos []string, w Window) map[string]RepoUse {
 			continue
 		}
 		for cwd, rd := range day.Repos {
-			repo, ok := ownerOf(repos, cwd)
+			o, seen := owners[cwd]
+			if !seen {
+				o.repo, o.ok = ownerOf(repos, cwd)
+				owners[cwd] = o
+			}
+			repo, ok := o.repo, o.ok
 			if !ok {
 				continue
 			}

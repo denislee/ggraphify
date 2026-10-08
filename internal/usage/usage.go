@@ -166,16 +166,22 @@ func counterKey(t Tool, k Kind, verb string) string {
 // silently dropped: a rollup written by a newer version should degrade to a
 // strange-looking row, not to a wrong total.
 func splitCounter(s string) (Tool, Kind, string) {
-	parts := strings.SplitN(s, "/", 3)
-	if len(parts) != 3 {
+	// Two Cuts are SplitN(s, "/", 3) without the slice it allocates; this runs
+	// once per counter per day per repository on every repaint.
+	tool, rest, ok := strings.Cut(s, "/")
+	if !ok {
+		return Graphify, CLI, s
+	}
+	kind, verb, ok := strings.Cut(rest, "/")
+	if !ok {
 		return Graphify, CLI, s
 	}
 	t := Graphify
-	if parts[0] == "graft" {
+	if tool == "graft" {
 		t = Graft
 	}
 	k := CLI
-	switch parts[1] {
+	switch kind {
 	case "mcp":
 		k = MCP
 	case "skill":
@@ -183,7 +189,7 @@ func splitCounter(s string) (Tool, Kind, string) {
 	case "hook":
 		k = Hook
 	}
-	return t, k, parts[2]
+	return t, k, verb
 }
 
 // Count is one line of a breakdown: a name and how often it happened.

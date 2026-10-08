@@ -80,7 +80,10 @@ func GraftSessionDir(repo string) string {
 // reused — is taken as a fresh start rather than as a negative delta: the
 // whole current value is emitted and the state is rebased. Subtracting into
 // negatives would silently eat a day's real usage.
-func scanGraftSessions(repo string, prev map[string]SessionState, since time.Time, emit func(delta), keep func(string, SessionState)) {
+//
+// A file last written before stale is skipped outright — not read, not kept:
+// nothing in it can count, and Index.prune forgets its state.
+func scanGraftSessions(repo string, prev map[string]SessionState, since, stale time.Time, emit func(delta), keep func(string, SessionState)) {
 	dir := GraftSessionDir(repo)
 	ents, err := os.ReadDir(dir)
 	if err != nil {
@@ -93,6 +96,9 @@ func scanGraftSessions(repo string, prev map[string]SessionState, since time.Tim
 		path := filepath.Join(dir, e.Name())
 		fi, err := e.Info()
 		if err != nil {
+			continue
+		}
+		if fi.ModTime().Before(stale) {
 			continue
 		}
 		st, seen := prev[path]

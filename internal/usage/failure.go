@@ -330,6 +330,12 @@ func (p *pendingSet) add(e Event, now time.Time) {
 	p.put(e.ID, pendingCall{Event: e, Seen: now})
 }
 
+// has reports whether a call is still waiting on its result.
+func (p *pendingSet) has(id string) bool {
+	_, ok := p.byID[id]
+	return ok
+}
+
 // take resolves a call: the result for it has arrived.
 func (p *pendingSet) take(id string) (Event, bool) {
 	c, ok := p.byID[id]
