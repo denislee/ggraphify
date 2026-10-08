@@ -50,7 +50,20 @@ func (a *App) persistJobs() {
 	}
 	snaps := a.runner.Snapshot() // newest first
 	list := make([]store.JobEntry, 0, len(snaps))
+	// A finished job's entry cannot change any more, so it is built once and
+	// reused: this runs several times per job, and rebuilding every retired
+	// job's entry each time was a TailBytes copy of up to 8 KB apiece. The
+	// cache is rebuilt from what is still listed, so it never outlives the
+	// runner's own history.
+	cache := make(map[uint64]store.JobEntry, len(snaps))
 	for _, s := range snaps {
+		if s.Status.Done() {
+			if e, ok := a.jobEntries[s.ID]; ok {
+				cache[s.ID] = e
+				list = append(list, e)
+				continue
+			}
+		}
 		e := store.JobEntry{
 			Kind: s.Kind, Repo: s.Repo, Label: s.Label, Argv: s.Argv,
 			Cost: s.Cost.String(), Local: s.Local, Dir: s.Dir, Out: s.Out,
@@ -60,8 +73,12 @@ func (a *App) persistJobs() {
 		if s.Log != nil {
 			e.Log = s.Log.TailBytes(store.MaxLogTail)
 		}
+		if s.Status.Done() {
+			cache[s.ID] = e
+		}
 		list = append(list, e)
 	}
+	a.jobEntries = cache
 	a.opts.Store.SetJobs(list)
 }
 

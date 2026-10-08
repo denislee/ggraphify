@@ -118,4 +118,14 @@ fi
 : "${GSK_RENDERER:=vulkan}"
 export GSK_RENDERER
 
+# glibc malloc arenas — cap at two, unless the caller set it. glibc creates up
+# to 8 × cores arenas as threads contend, and the Go runtime's and GTK's
+# threads are many: each arena keeps its own freed-but-mapped pages, so the
+# C heap (GTK, Pango, WebKit's client side) grew per arena and never came
+# back. Two keeps the main thread's arena separate from everything else while
+# making the board's periodic malloc_trim (internal/ui/trim.go) effective.
+# Override with e.g. MALLOC_ARENA_MAX=8 ggraphify for an A/B measurement.
+: "${MALLOC_ARENA_MAX:=2}"
+export MALLOC_ARENA_MAX
+
 exec "$BIN" "$@"

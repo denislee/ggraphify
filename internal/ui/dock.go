@@ -70,6 +70,10 @@ type dockPane struct {
 	logView *gtk.TextView
 	logSW   *gtk.ScrolledWindow
 	logGen  uint64
+	// logSync appends new entries to the pane instead of re-setting up to
+	// 2,000 of them per generation; a level switch, an eviction or a Clear
+	// changes the text's front and falls back to a full redraw on its own.
+	logSync textSync
 	follow  bool
 	// verbose shows the debug level too, which in practice means GTK's own
 	// narration. Off by default and remembered for the session only: it is a
@@ -417,7 +421,13 @@ func (d *dockPane) reloadJobs() {
 	if d.widget == nil || !d.widget.Visible() {
 		return
 	}
-	entries := d.dockEntries()
+	d.reloadJobsWith(d.dockEntries())
+}
+
+// reloadJobsWith is reloadJobs over entries the caller already computed, so
+// the one-second tick builds them once for both the rebuild check and the
+// in-place repaint instead of taking two runner snapshots.
+func (d *dockPane) reloadJobsWith(entries []dockEntry) {
 	d.setJobsSummary(entries)
 	key := dockKey(entries)
 	if key == d.key {
@@ -743,11 +753,10 @@ func dockRowTooltip(e dockEntry) string {
 
 // tickJobs repaints only what changes second to second: a running job's
 // elapsed time, a queued job's reason for waiting, and the summary line.
-func (d *dockPane) tickJobs() {
+func (d *dockPane) tickJobs(entries []dockEntry) {
 	if len(d.rows) == 0 {
 		return
 	}
-	entries := d.dockEntries()
 	byID := map[uint64]dockEntry{}
 	for _, e := range entries {
 		if !e.isHeader() {
@@ -896,7 +905,10 @@ func (d *dockPane) renderLog(force bool) {
 		return
 	}
 	d.logGen = gen
-	d.logView.Buffer().SetText(applog.Default.TextFrom(d.logLevel()))
+	if force {
+		d.logSync.reset()
+	}
+	d.logSync.update(d.logView.Buffer(), applog.Default.TextFrom(d.logLevel()))
 	if d.follow {
 		d.scrollLogToEnd()
 	}
@@ -935,8 +947,11 @@ func (d *dockPane) tick() {
 	}
 	switch d.stack.VisibleChildName() {
 	case dockPageJobs:
-		d.reloadJobs()
-		d.tickJobs()
+		// Snapshot rather than Live: the Finished header counts and
+		// summarises the retired jobs even when they are not listed.
+		entries := d.dockEntries()
+		d.reloadJobsWith(entries)
+		d.tickJobs(entries)
 	case dockPageLog:
 		d.renderLog(false)
 	}

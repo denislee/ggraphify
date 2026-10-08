@@ -183,6 +183,18 @@ func (v *vizPage) show(r *board.Row) {
 	}
 }
 
+// leave releases the document when the page goes off screen. The one web view
+// is kept, but left pointing at graph.html it holds the whole file and keeps
+// a D3 force layout running for nobody; about:blank drops both. The next show
+// loads the file again, since loaded no longer names it.
+func (v *vizPage) leave() {
+	if v == nil || v.view == nil || v.loaded == "" {
+		return
+	}
+	v.view.LoadURI("about:blank")
+	v.loaded = ""
+}
+
 func (v *vizPage) openExternal() {
 	p := v.path()
 	if p == "" {

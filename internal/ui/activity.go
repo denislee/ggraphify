@@ -128,7 +128,10 @@ func (a *App) refreshActivity() {
 // business — this widget answers "what is happening", not "what happened".
 func (a *App) liveJobs() []jobs.Snapshot {
 	var running, queued []jobs.Snapshot
-	for _, s := range a.runner.Snapshot() {
+	// Live, not Snapshot: this runs every second and never shows a finished
+	// job, so copying and sorting the whole retired history only to drop it
+	// was the cost of this function. Same order — newest first, by ID.
+	for _, s := range a.runner.Live() {
 		switch s.Status {
 		case jobs.Running:
 			running = append(running, s)

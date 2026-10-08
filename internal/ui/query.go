@@ -49,6 +49,9 @@ type queryPage struct {
 	row     *board.Row
 	jobID   uint64
 	lastGen uint64
+	// outSync appends a running query's new output instead of re-rendering
+	// (and re-parsing as JSON) the whole buffer on every generation.
+	outSync textSync
 	// lastQ and lastA are what `save-result` would record: the question asked
 	// and the answer graphify gave, kept so the feedback loop is one click.
 	lastQ, lastA string
@@ -169,6 +172,7 @@ func (q *queryPage) show(r *board.Row) {
 		return
 	}
 	if r.Graph.Nodes == 0 {
+		q.outSync.reset()
 		q.out.Buffer().SetText("This repository has no graph yet.\n\n" +
 			"Run Update on the Overview page — it is free and needs no API key.")
 	}
@@ -223,6 +227,7 @@ func (q *queryPage) run() {
 	q.lastQ = p.Question
 	q.lastA = ""
 	q.save.SetSensitive(false)
+	q.outSync.reset()
 	q.out.Buffer().SetText("$ " + gfy.Quote(job.Argv) + "\n\nrunning…\n")
 }
 
@@ -243,12 +248,18 @@ func (q *queryPage) tick() {
 	}
 	q.lastGen = gen
 	out := s.Log.String()
-	q.out.Buffer().SetText(prettyIfJSON(out))
-	if s.Status.Done() {
-		q.lastA = out
-		q.save.SetSensitive(s.Status == jobs.Succeeded && q.lastQ != "")
-		q.jobID = 0
+	if !s.Status.Done() {
+		// Streaming: raw text, appended. A partial JSON payload does not parse,
+		// so prettyIfJSON would have returned it unchanged anyway; the one
+		// re-indent happens below, once, on the finished output.
+		q.outSync.update(q.out.Buffer(), out)
+		return
 	}
+	q.outSync.reset()
+	q.out.Buffer().SetText(prettyIfJSON(out))
+	q.lastA = out
+	q.save.SetSensitive(s.Status == jobs.Succeeded && q.lastQ != "")
+	q.jobID = 0
 }
 
 // prettyIfJSON re-indents a --json response so god-nodes and diagnose are

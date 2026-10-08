@@ -40,10 +40,19 @@ type jobsView struct {
 	// rebuilt on a transition, so the tick needs a handle on the widgets it
 	// repaints between rebuilds.
 	bars map[uint64]*gtk.ProgressBar
+	// open is false between the dialog's closed signal and its next Present.
+	// The view is kept for reuse, but a closed dialog must not keep rebuilding
+	// 200 rows and redrawing a 256 KiB log every second for nobody.
+	open bool
+	// logSync keeps the log view in step with the selected job's ring buffer
+	// by appending only new bytes; logID is the job it is tracking.
+	logSync textSync
+	logID   uint64
 }
 
 func (a *App) showJobs() {
 	if a.jobsPage != nil {
+		a.jobsPage.open = true
 		a.jobsPage.dlg.Present(a.win)
 		a.jobsPage.reload()
 		return
@@ -182,8 +191,10 @@ func (a *App) showJobs() {
 	v.dlg.SetContentWidth(1100)
 	v.dlg.SetContentHeight(700)
 	v.dlg.SetChild(toolbar)
+	v.dlg.ConnectClosed(func() { v.open = false })
 
 	a.jobsPage = v
+	v.open = true
 	v.reload()
 	v.dlg.Present(a.win)
 }
@@ -201,6 +212,9 @@ func (v *jobsView) selected() *jobs.Snapshot {
 // full rebuild is the honest thing: the list is bounded at the runner's
 // history size and diffing it would cost more than it saves.
 func (v *jobsView) reload() {
+	if !v.open {
+		return
+	}
 	snaps := v.a.runner.Snapshot()
 	v.rows = snaps
 	v.bars = map[uint64]*gtk.ProgressBar{}
@@ -312,16 +326,25 @@ func (v *jobsView) showSelected() {
 	if s == nil {
 		v.head.SetText("")
 		v.log.Buffer().SetText("")
+		v.logSync.reset()
+		v.logID = 0
 		return
 	}
 	v.head.SetText(jobHeadline(s) + "\n" + s.Command())
-	v.log.Buffer().SetText(s.Log.String())
+	if s.ID != v.logID {
+		v.logSync.reset()
+		v.logID = s.ID
+	}
+	v.logSync.update(v.log.Buffer(), s.Log.String())
 	v.lastGen = s.Log.Gen()
 	v.refreshStart()
 }
 
 // tick refreshes the selected job's log when it has moved, and nothing else.
 func (v *jobsView) tick() {
+	if !v.open {
+		return
+	}
 	// Before the early return below: the count on Stop all has to keep up with
 	// a draining queue even when nothing is selected, which is exactly the
 	// state a finished sweep leaves the dialog in.
@@ -334,7 +357,7 @@ func (v *jobsView) tick() {
 	}
 	if gen := s.Log.Gen(); gen != v.lastGen {
 		v.lastGen = gen
-		v.log.Buffer().SetText(s.Log.String())
+		v.logSync.update(v.log.Buffer(), s.Log.String())
 	}
 	if !s.Status.Done() {
 		v.head.SetText(jobHeadline(s) + "\n" + s.Command())

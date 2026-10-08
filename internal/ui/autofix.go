@@ -78,10 +78,13 @@ func (a *App) autoFixTick() {
 	// The fleet pass runs alongside the repository one rather than inside it:
 	// its subjects are directories and deleted members, neither of which is a
 	// candidate, and it has its own in-flight accounting.
-	a.fleetTick(set, a.allRows())
+	// One copy of the board serves all three readers below, rather than one
+	// each.
+	rows := a.allRows()
+	a.fleetTick(set, rows)
 
-	cands := a.autoFixCandidates()
-	owners := worktreeOwners(a.allRows())
+	cands := a.autoFixCandidatesFrom(rows)
+	owners := worktreeOwners(rows)
 	if len(cands) == 0 && len(owners) == 0 {
 		return
 	}
@@ -92,6 +95,17 @@ func (a *App) autoFixTick() {
 		if pol.Graft {
 			cands = append(cands, a.worktreeCandidates(owners, cands)...)
 		}
+		// cands is now every repository subject there is — the whole board
+		// plus the off-board worktrees — so it is the one place the engine
+		// can be told which repository records are for checkouts that no
+		// longer exist. (Never from autoFixNow: its candidates are a scope.)
+		keep := repoKeep(cands)
+		a.autofix.Prune(keep)
+		graftKeep := make(map[string]bool, len(cands))
+		for _, c := range cands {
+			graftKeep[c.Path] = true
+		}
+		a.grafts.Prune(graftKeep)
 		actions, skips := a.autofix.Plan(cands, pol)
 		stuck := a.autofix.Declare(cands, pol)
 		idle(func() {
@@ -116,7 +130,12 @@ func (a *App) autoFixTick() {
 // search box happened to hide would repair a different set of repositories
 // depending on what was typed in a text field.
 func (a *App) autoFixCandidates() []autofix.Candidate {
-	rows := a.allRows()
+	return a.autoFixCandidatesFrom(a.allRows())
+}
+
+// autoFixCandidatesFrom is autoFixCandidates over rows the caller already
+// copied, so a tick that needs the board three times copies it once.
+func (a *App) autoFixCandidatesFrom(rows []board.Row) []autofix.Candidate {
 	// Which roots the user nominated as fleets, as a set — the fact that
 	// turns "not in the global graph" from a choice into a defect. Resolved
 	// once per tick rather than per row: Fleets cleans and expands paths.
@@ -610,5 +629,21 @@ func (a *App) onAutoFixStuck(s autofix.Stuck) {
 func logAutoFixSkips(skips []autofix.Skip) {
 	for _, s := range skips {
 		applog.Debugf("auto-fix skip %s: %s", board.Tilde(s.Path), s.Why)
+	}
+}
+
+// repoKeep is the Engine.Prune predicate for the repository pass: keep a
+// repository record only while its path is a candidate, and leave every fleet
+// record to the fleet pass, which is the one that knows the roots and tags.
+func repoKeep(cands []autofix.Candidate) func(string) bool {
+	have := make(map[string]bool, len(cands))
+	for _, c := range cands {
+		have[c.Path] = true
+	}
+	return func(key string) bool {
+		if _, _, fleet := autofix.ParseFleetKey(key); fleet {
+			return true
+		}
+		return have[key]
 	}
 }

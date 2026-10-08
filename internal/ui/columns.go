@@ -27,6 +27,11 @@ type colSpec struct {
 	// render fills a cell. It is handed a fresh label per realised cell and
 	// the row currently bound to it.
 	render func(a *App, l *gtk.Label, r *board.Row) (text, class string)
+	// tip is the cell's tooltip, built on hover through query-tooltip rather
+	// than on every render: render runs for every realised cell on every
+	// one-second repaint, and a tooltip is a paragraph. Nil means none; an
+	// empty result shows none.
+	tip func(a *App, r *board.Row) string
 }
 
 // columns is the whole board. Adding one here is the only thing needed to add
@@ -127,9 +132,9 @@ var columns = []colSpec{
 		ID: "global", Title: "Global", Width: 100,
 		cmp: func(a *App, x, y *board.Row) int { return globalWeight(x) - globalWeight(y) },
 		render: func(a *App, l *gtk.Label, r *board.Row) (string, string) {
-			l.SetTooltipText(globalTooltip(*r))
 			return globalCell(r.Global, r.Name)
 		},
+		tip: func(a *App, r *board.Row) string { return globalTooltip(*r) },
 	},
 	{
 		// Whether anything actually READS the two indexes the columns to the
@@ -141,10 +146,10 @@ var columns = []colSpec{
 		ID: "usage", Title: "Used", Width: 120,
 		cmp: func(a *App, x, y *board.Row) int { return usageWeight(a, y) - usageWeight(a, x) },
 		render: func(a *App, l *gtk.Label, r *board.Row) (string, string) {
-			u := a.usageFor(r.Path)
-			gap := a.usageGap(r)
-			l.SetTooltipText(usageTooltip(r, u, gap))
-			return usageCell(u, gap)
+			return usageCell(a.usageFor(r.Path), a.usageGap(r))
+		},
+		tip: func(a *App, r *board.Row) string {
+			return usageTooltip(r, a.usageFor(r.Path), a.usageGap(r))
 		},
 	},
 	{
@@ -318,10 +323,12 @@ type rowCell struct {
 	label *gtk.Label
 	text  string
 	class string
-	// row is what this cell is currently bound to, so a column whose value
-	// lives beside the row rather than in it can re-render the realised cells
-	// in place when that value arrives. Nil while unbound.
-	row *board.Row
+	// path is the checkout path of the row this cell is currently bound to,
+	// so a column whose value lives beside the row rather than in it can
+	// re-render the realised cells in place when that value arrives. Empty
+	// while unbound. The path is stored rather than a *board.Row so a rebind
+	// does not pin the previous scan's whole rows array.
+	path string
 }
 
 // buildBoard constructs the ColumnView and its models.
@@ -396,7 +403,29 @@ func (a *App) addColumn(spec colSpec, width int) *gtk.ColumnViewColumn {
 			l.SetXAlign(0.5)
 		}
 		li.SetChild(cell(l))
-		cells[li.Native()] = &rowCell{label: l}
+		c := &rowCell{label: l}
+		cells[li.Native()] = c
+		if tipFn := spec.tip; tipFn != nil {
+			// Resolved through the path at hover time, so the text is the
+			// current row's — the same text the old per-render
+			// SetTooltipText left on the label, without building it for
+			// every cell every second.
+			l.ConnectQueryTooltip(func(x, y int, keyboard bool, tip *gtk.Tooltip) bool {
+				if c.path == "" {
+					return false
+				}
+				r := a.row(c.path)
+				if r == nil {
+					return false
+				}
+				text := tipFn(a, r)
+				if text == "" {
+					return false
+				}
+				tip.SetText(text)
+				return true
+			})
+		}
 	})
 	factory.ConnectBind(func(obj *coreglib.Object) {
 		li := asCell(obj)
@@ -411,7 +440,7 @@ func (a *App) addColumn(spec colSpec, width int) *gtk.ColumnViewColumn {
 		if r == nil {
 			return
 		}
-		c.row = r
+		c.path = r.Path
 		text, class := spec.render(a, c.label, r)
 		if c.text != text {
 			c.label.SetText(text)
@@ -426,7 +455,7 @@ func (a *App) addColumn(spec colSpec, width int) *gtk.ColumnViewColumn {
 		if li := asCell(obj); li != nil {
 			if c := cells[li.Native()]; c != nil {
 				c.label.SetHasTooltip(false)
-				c.row = nil
+				c.path = ""
 			}
 		}
 	})
@@ -443,14 +472,13 @@ func (a *App) addColumn(spec colSpec, width int) *gtk.ColumnViewColumn {
 	// about to be unbound by the splice that removed it.
 	a.repaints = append(a.repaints, func() {
 		for _, c := range cells {
-			if c == nil || c.row == nil || c.label == nil {
+			if c == nil || c.path == "" || c.label == nil {
 				continue
 			}
-			r := a.row(c.row.Path)
+			r := a.row(c.path)
 			if r == nil {
 				continue
 			}
-			c.row = r
 			text, class := spec.render(a, c.label, r)
 			if c.text != text {
 				c.label.SetText(text)

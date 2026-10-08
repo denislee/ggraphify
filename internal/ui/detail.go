@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -76,6 +77,11 @@ type detailPane struct {
 	histBox  *gtk.Box
 
 	row *board.Row
+	// loadedKey is the identity of what the visible page last loaded — see
+	// pageKey. Every scan calls reload, and re-reading a 2 MB report or
+	// rebuilding the wiki list and facts grid when nothing moved was the
+	// widget churn this skips.
+	loadedKey string
 }
 
 func (a *App) newDetailPane() *detailPane {
@@ -132,6 +138,7 @@ func (d *detailPane) show(r *board.Row) {
 		return
 	}
 	d.bin.SetChild(d.stack)
+	d.loadedKey = ""
 	d.reload()
 }
 
@@ -170,7 +177,16 @@ func (d *detailPane) reload() {
 	if r := d.a.row(d.row.Path); r != nil {
 		d.row = r
 	}
-	switch d.stack.VisibleChildName() {
+	page := d.stack.VisibleChildName()
+	if page != "viz" {
+		d.viz.leave()
+	}
+	key := d.pageKey(page)
+	if key != "" && key == d.loadedKey {
+		return
+	}
+	d.loadedKey = key
+	switch page {
 	case "overview":
 		d.loadOverview()
 	case "report":
@@ -184,6 +200,45 @@ func (d *detailPane) reload() {
 	case "jobs":
 		d.reloadJobs()
 	}
+}
+
+// pageKey is what a page's content is a function of, for the pages whose load
+// is expensive and whose inputs can be named. "" means "always reload": the
+// pages that are cheap (query), carry their own guard (viz), or follow a job
+// rather than a scan (jobs).
+func (d *detailPane) pageKey(page string) string {
+	r := d.row
+	switch page {
+	case "overview":
+		// Everything loadOverview renders: the row itself, the state word
+		// with a job folded in, the last job's headline, the relative age it
+		// prints, and the per-repository overrides in the form below.
+		var job string
+		if s := d.a.jobFor(r.Path); s != nil {
+			job = jobHeadline(s)
+		}
+		var o any
+		if d.a.opts.Store != nil {
+			o = d.a.opts.Store.Override(r.Path)
+		}
+		return fmt.Sprintf("overview|%+v|%v|%s|%s|%+v",
+			*r, d.a.displayState(r), job, board.Age(r.Graph.BuiltAt), o)
+	case "report":
+		return "report|" + statKey(filepath.Join(r.Graph.Out, "GRAPH_REPORT.md"))
+	case "wiki":
+		return "wiki|" + r.Graph.BuiltAt.String() + "|" + statKey(filepath.Join(r.Graph.Out, "wiki"))
+	}
+	return ""
+}
+
+// statKey is a file's identity for change detection: path, size and mtime.
+// A missing file is a key too, so a report appearing is a change.
+func statKey(path string) string {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return path + "|missing"
+	}
+	return fmt.Sprintf("%s|%d|%d", path, fi.Size(), fi.ModTime().UnixNano())
 }
 
 // tick is the once-a-second repaint: only the job log needs it, and only when

@@ -749,6 +749,35 @@ func (e *Engine) Reset() {
 	e.seen = map[string]*record{}
 }
 
+// Prune forgets every record whose key keep rejects, and reports how many it
+// dropped. Nothing else ever removes a record for a subject that is simply no
+// longer there — a deleted checkout, an agent worktree that was cleaned up, a
+// fleet root taken out of settings — so without it the memory holds every
+// subject the loop has ever seen for the life of the process.
+//
+// A record whose chain is still running is kept whatever keep says: it is the
+// in-flight count Plan throttles on, and Done for it has yet to arrive.
+//
+// Keys are repository paths for Plan's records and fleet keys (see
+// ParseFleetKey) for PlanFleet's; keep must answer for both. Call it only with
+// the full current subject set — a partial candidate list would wipe the
+// attempt budget of everything it happened to leave out.
+func (e *Engine) Prune(keep func(key string) bool) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	n := 0
+	for k, r := range e.seen {
+		if r != nil && r.running {
+			continue
+		}
+		if !keep(k) {
+			delete(e.seen, k)
+			n++
+		}
+	}
+	return n
+}
+
 // Running is how many chains the loop believes it has in flight, for the
 // status line.
 func (e *Engine) Running() int {

@@ -98,6 +98,18 @@ func fleetKey(kind, path, tag string) string {
 	return "fleet:" + kind + ":" + path
 }
 
+// ParseFleetKey splits an engine-memory key made by fleetKey into its kind
+// ("workspace", whose subject is a root path, or "prune", whose subject is a
+// member tag). ok is false for a repository key, which is a bare path.
+func ParseFleetKey(key string) (kind, subject string, ok bool) {
+	rest, isFleet := strings.CutPrefix(key, "fleet:")
+	if !isFleet {
+		return "", "", false
+	}
+	kind, subject, ok = strings.Cut(rest, ":")
+	return kind, subject, ok
+}
+
 // PlanFleet chooses which root-level repairs to run now, and marks them in
 // flight, exactly as Plan does for repositories. Call FleetDone for each
 // action returned, or the slot it reserved is never released.

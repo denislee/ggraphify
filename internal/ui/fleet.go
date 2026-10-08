@@ -58,7 +58,9 @@ func (a *App) fleetTick(set store.Settings, rows []board.Row) {
 				Busy:      r.busy,
 			})
 		}
-		stranded := strandedMembers(a.globals.Load())
+		m := a.globals.Load()
+		stranded := strandedMembers(m)
+		a.autofix.Prune(fleetKeep(inspected, m))
 		actions, skips := a.autofix.PlanFleet(inspected, stranded, pol)
 		idle(func() {
 			if len(actions) == 0 {
@@ -283,4 +285,36 @@ func (a *App) autoFixEnrollSubtitle(set store.Settings) string {
 		"dropped, and graft's workspace.json at each root is re-federated so a query there " +
 		"covers the checkouts that are actually present. Free. It never touches a " +
 		"repository outside those roots — that is what the list below is for."
+}
+
+// fleetKeep is the Engine.Prune predicate for the fleet pass. A workspace
+// record lives while its root is still a fleet root; a prune record lives
+// while its tag is still in the manifest — once the member is gone the prune
+// succeeded and there is nothing left to remember. An unreadable manifest
+// keeps every prune record, for the same reason strandedMembers derives
+// nothing from one. Repository records belong to the repository pass.
+func fleetKeep(roots []autofix.Root, m *globalgraph.Manifest) func(string) bool {
+	rootSet := make(map[string]bool, len(roots))
+	for _, r := range roots {
+		rootSet[r.Path] = true
+	}
+	var tags map[string]bool
+	if m != nil && m.Exists && m.Err == nil {
+		tags = make(map[string]bool, len(m.Entries))
+		for _, e := range m.Entries {
+			tags[e.Tag] = true
+		}
+	}
+	return func(key string) bool {
+		kind, subject, fleet := autofix.ParseFleetKey(key)
+		switch {
+		case !fleet:
+			return true
+		case kind == "workspace":
+			return rootSet[subject]
+		case kind == "prune":
+			return tags == nil || tags[subject]
+		}
+		return true
+	}
 }

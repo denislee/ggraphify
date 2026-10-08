@@ -336,3 +336,50 @@ func TestADriftThatClearsForgetsItsAttempts(t *testing.T) {
 		t.Fatalf("returning drift got %v, want attempt 1", back)
 	}
 }
+
+func TestParseFleetKeyRoundTrips(t *testing.T) {
+	cases := []struct {
+		key           string
+		kind, subject string
+		ok            bool
+	}{
+		{fleetKey("workspace", "/git/nova", ""), "workspace", "/git/nova", true},
+		{fleetKey("prune", "", "gone"), "prune", "gone", true},
+		{"/git/nova/repo", "", "", false},
+	}
+	for _, c := range cases {
+		kind, subject, ok := ParseFleetKey(c.key)
+		if kind != c.kind || subject != c.subject || ok != c.ok {
+			t.Errorf("ParseFleetKey(%q) = %q,%q,%v; want %q,%q,%v",
+				c.key, kind, subject, ok, c.kind, c.subject, c.ok)
+		}
+	}
+}
+
+func TestPruneDropsRejectedKeysButNeverARunningOne(t *testing.T) {
+	e := New()
+	e.seen["/gone"] = &record{}
+	e.seen["/kept"] = &record{}
+	e.seen["/gone-but-running"] = &record{running: true}
+	e.seen[fleetKey("prune", "", "old")] = &record{}
+
+	keep := map[string]bool{"/kept": true}
+	n := e.Prune(func(k string) bool { return keep[k] })
+
+	if n != 2 {
+		t.Fatalf("Prune dropped %d, want 2", n)
+	}
+	for _, k := range []string{"/kept", "/gone-but-running"} {
+		if e.seen[k] == nil {
+			t.Errorf("%s was dropped", k)
+		}
+	}
+	for _, k := range []string{"/gone", fleetKey("prune", "", "old")} {
+		if e.seen[k] != nil {
+			t.Errorf("%s was kept", k)
+		}
+	}
+	if got := e.Running(); got != 1 {
+		t.Errorf("Running() = %d after Prune, want 1", got)
+	}
+}

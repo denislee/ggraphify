@@ -279,6 +279,14 @@ type App struct {
 	items     []*coreglib.Object
 	jobByRepo map[string]*jobs.Snapshot
 	jobIDs    map[string]uint64
+	// rowsGen counts setRows calls: a cheap "the rows may have moved" stamp
+	// for views that derive from them without holding a copy (usage page).
+	rowsGen uint64
+	// jobEntries is persistJobs' cache of finished jobs' sidecar entries, by
+	// job id. Main thread only.
+	jobEntries map[uint64]store.JobEntry
+	// trim returns glibc's freed arena pages to the kernel — see trim.go.
+	trim *trimmer
 	// pausing is the set of jobs whose pause or resume is still in flight.
 	// Both halves run off the main thread and a resume can sit inside
 	// lease.Resume for the ten seconds a cold model server takes, so without
@@ -467,6 +475,8 @@ func (a *App) activate() {
 	// dropped anyway.
 	restored, held, resumed := a.restoreJobs()
 	go a.pumpJobs()
+	a.trim = newTrimmer()
+	a.trim.start(nil) // for the life of the process
 
 	a.win = adw.NewApplicationWindow(&a.app.Application)
 	a.win.SetTitle(WindowTitle)
@@ -733,6 +743,9 @@ func (a *App) refresh(full bool) {
 			},
 			Baseline: st.DriftBaseline,
 		})
+		if err == nil && st != nil {
+			pruneBaselines(st, rows)
+		}
 		coreglib.IdleAdd(func() {
 			a.refreshing = false
 			if err != nil {
@@ -783,12 +796,54 @@ func (a *App) setRows(rows []board.Row) {
 			a.byPtr[a.items[i].Native()] = r
 		}
 	}
+	a.rowsGen++
+	// Forget the last job of every repository that has left the board, once
+	// that job is over: the per-repo cache otherwise grows with every
+	// checkout ever scanned and pins each one's last Snapshot. A queued or
+	// running job is kept even for a path with no row — fleet directories are
+	// asked about through jobFor too (busyAt), and a repository that comes
+	// back must still show the work in flight, which emits no new event.
+	for path, s := range a.jobByRepo {
+		if _, ok := a.byPath[path]; ok || (s != nil && !s.Status.Done()) {
+			continue
+		}
+		delete(a.jobByRepo, path)
+		delete(a.jobIDs, path)
+	}
+	for path := range a.jobIDs {
+		if _, ok := a.jobByRepo[path]; !ok {
+			if _, onBoard := a.byPath[path]; !onBoard {
+				delete(a.jobIDs, path)
+			}
+		}
+	}
+	keep := make(map[string]bool, len(a.byPath))
+	for path := range a.byPath {
+		keep[path] = true
+	}
 	items := a.items
 	a.mu.Unlock()
+
+	// The per-repository graph cache only ever added keys: every checkout a
+	// scan has seen, agent worktrees above all, stayed in it for the life of
+	// the process. A repository dropped here and scanned again is simply
+	// re-read.
+	a.graphs.Prune(keep)
+	// The graft cache also holds the off-board worktrees the auto-fix loop
+	// reads (worktreeCandidates), which no row names: with the loop on, it is
+	// pruned there against the full candidate set instead, so those entries
+	// are not evicted and re-read on every scan.
+	if a.opts.Store == nil || !a.opts.Store.Settings().AutoFix() {
+		a.grafts.Prune(keep)
+	}
 
 	if !same {
 		a.model.Splice(0, a.model.NItems(), items)
 		a.restoreSelection()
+		// A splice tears down and rebuilds every realised cell: the largest
+		// single release of C heap the board does, and the moment a trim
+		// actually has something to hand back.
+		a.trim.soon()
 	} else {
 		// The rows are the same rows, but their state may have moved across a
 		// filter boundary or a sort key — so the filter and sorter are told,
@@ -891,7 +946,11 @@ func (a *App) refreshStatus() {
 	// Rides the same refresh as the status bar's "(N held)" clause, and for
 	// the same reason: both are the held queue, and they may not disagree.
 	a.refreshHeldBanner()
-	c := board.Summarize(a.allRows())
+	// Summarized in place under the read lock: allRows would copy ~300 Rows
+	// every second just to count them.
+	a.mu.RLock()
+	c := board.Summarize(a.rows)
+	a.mu.RUnlock()
 	queued, running := a.runner.Active()
 	free, metered, localLanes := a.runner.Lanes()
 
@@ -1051,6 +1110,12 @@ func (a *App) probeVersion() {
 // pumpJobs forwards runner events onto the main thread.
 func (a *App) pumpJobs() {
 	for ev := range a.runner.Events() {
+		if ev.Output {
+			// onJobEvent drops output events unread; posting one IdleAdd
+			// (closure + registry entry + C GSource) per log write only to
+			// discard it was thousands of allocations a second in a sweep.
+			continue
+		}
 		ev := ev
 		coreglib.IdleAdd(func() { a.onJobEvent(ev) })
 	}
@@ -1500,4 +1565,24 @@ func (a *App) loadCSS() {
 	}
 	gtk.StyleContextAddProviderForDisplay(
 		displayDefault(), css, uint(gtk.STYLE_PROVIDER_PRIORITY_APPLICATION))
+}
+
+// pruneBaselines drops the drift baselines of checkouts that are gone: not on
+// the board AND no longer on disk. A row hidden by a setting (worktrees,
+// dot-directories) or a root that is briefly unmounted keeps its baseline,
+// because dropping one turns acknowledged drift back into live drift.
+func pruneBaselines(st *store.Store, rows []board.Row) {
+	on := make(map[string]bool, len(rows))
+	for i := range rows {
+		on[rows[i].Path] = true
+	}
+	if n := st.PruneDriftBaselines(func(repo string) bool {
+		if on[repo] {
+			return true
+		}
+		_, err := os.Stat(repo)
+		return err == nil || !errors.Is(err, fs.ErrNotExist)
+	}); n > 0 {
+		applog.Infof("dropped %d drift baseline(s) of deleted checkouts", n)
+	}
 }

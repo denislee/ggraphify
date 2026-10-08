@@ -68,10 +68,14 @@ func (a *App) refreshUsage() {
 	a.usageBusy = true
 
 	accounts := a.usageAccounts()
-	repos := make([]string, 0, len(a.allRows()))
-	for _, r := range a.allRows() {
-		repos = append(repos, r.Path)
+	// The paths only, read under the lock: two allRows copies of the whole
+	// board to collect one string per row was the old cost of this.
+	a.mu.RLock()
+	repos := make([]string, 0, len(a.rows))
+	for i := range a.rows {
+		repos = append(repos, a.rows[i].Path)
 	}
+	a.mu.RUnlock()
 	idx := a.usage
 	path := a.usagePath
 
@@ -157,7 +161,7 @@ func (a *App) publishUsage(repos []string) {
 		a.view.QueueDraw()
 	}
 	if a.onUsagePage() && a.usagePane != nil {
-		a.usagePane.reload()
+		a.usagePane.reloadIfChanged()
 	}
 }
 
@@ -165,11 +169,15 @@ func (a *App) publishUsage(repos []string) {
 // for the rows they are currently bound to. Main thread only.
 func (a *App) repaintUsageCells() {
 	for _, c := range a.usageCells {
-		if c == nil || c.row == nil || c.label == nil {
+		if c == nil || c.path == "" || c.label == nil {
 			continue
 		}
-		u := a.usageFor(c.row.Path)
-		gap := a.usageGap(c.row)
+		r := a.row(c.path)
+		if r == nil {
+			continue
+		}
+		u := a.usageFor(r.Path)
+		gap := a.usageGap(r)
 		text, class := usageCell(u, gap)
 		if c.text != text {
 			c.label.SetText(text)
@@ -364,6 +372,10 @@ type usagePane struct {
 	sessions *gtk.Box
 	recent   *gtk.Box
 	foot     *gtk.Label
+	// sig is the identity of what the sections last drew. The live watch
+	// republishes every couple of seconds; rebuilding ~100 widgets when the
+	// rollup did not move is the C-heap churn reloadIfChanged exists to skip.
+	sig string
 }
 
 // usageWindows are the windows the page offers. Seven days is the board
@@ -599,12 +611,30 @@ func (p *usagePane) repo() string {
 }
 
 // reload repaints the whole page from the rollup.
-func (p *usagePane) reload() {
+func (p *usagePane) reload() { p.render(true) }
+
+// reloadIfChanged repaints the sections only when what they would show has
+// moved; otherwise it refreshes the small print, whose "last read N ago" is
+// the one line that changes on every republish, and the Fix-all button,
+// which follows the settings rather than the rollup.
+func (p *usagePane) reloadIfChanged() { p.render(false) }
+
+func (p *usagePane) render(force bool) {
 	if p == nil || p.a.usage == nil {
 		return
 	}
 	repo := p.repo()
 	s := p.a.usage.Summarize(usage.Window{Days: p.days, Repo: repo})
+	total, used := p.a.usage.SessionCount(usage.Window{Days: p.days, Repo: repo})
+	rolls := p.a.usage.SessionRolls(usage.Window{Days: p.days, Repo: repo}, usageSessions)
+	events := p.a.usage.Recents(repo, 14)
+	sig := usagePageSig(repo, p.days, s, total, used, rolls, events, p.a.rowsGen)
+	if !force && sig == p.sig {
+		p.syncFixAll()
+		p.foot.SetText(p.footText(s))
+		return
+	}
+	p.sig = sig
 
 	if repo == "" {
 		p.head.SetText(fmt.Sprintf("%d uses over %d days, every repository", s.Events, s.Days))
@@ -619,7 +649,6 @@ func (p *usagePane) reload() {
 	// transcripts recorded, not only the ones that touched a tool. A machine
 	// where forty sittings ran and three used graft is the whole finding, and
 	// it is invisible in a count of the three.
-	total, used := p.a.usage.SessionCount(usage.Window{Days: p.days, Repo: repo})
 	if total > used {
 		p.tiles.Append(usageTile(fmt.Sprint(total), fmt.Sprintf("agent sessions — %d used a tool", used)))
 	} else {
@@ -667,10 +696,9 @@ func (p *usagePane) reload() {
 		}
 	}
 
-	p.fillSessions(repo)
+	p.fillSessions(repo, rolls)
 
 	clearBox(p.recent)
-	events := p.a.usage.Recents(repo, 14)
 	if len(events) == 0 {
 		p.recent.Append(dimLabel("Nothing recorded here yet."))
 	}
@@ -1231,9 +1259,7 @@ const usageSessions = 16
 // Sessions that used neither are shown, dimmed, rather than filtered out. They
 // are the denominator — a list of only the sessions that used something cannot
 // answer "and how many did not".
-func (p *usagePane) fillSessions(repo string) {
-	rolls := p.a.usage.SessionRolls(usage.Window{Days: p.days, Repo: repo}, usageSessions)
-
+func (p *usagePane) fillSessions(repo string, rolls []usage.SessionRoll) {
 	clearBox(p.sessions)
 	if len(rolls) == 0 {
 		if repo == "" {
@@ -1424,4 +1450,18 @@ func shortCount(n int64) string {
 		return fmt.Sprintf("%.0fk", float64(n)/1e3)
 	}
 	return fmt.Sprint(n)
+}
+
+// usagePageSig is the identity of everything the usage page's sections draw:
+// the scope, the summary's numbers (not its From/To, which move with the
+// clock), the session and recent-event lists, and the board's row generation,
+// which the recommendations are computed against. The footer's relative age
+// is deliberately left out — reloadIfChanged rewrites that line every time.
+func usagePageSig(repo string, days int, s usage.Summary, total, used int,
+	rolls []usage.SessionRoll, events []usage.Event, rowsGen uint64) string {
+	return fmt.Sprintf("%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%v|%v|%v|%v|%v|%d|%d|%v|%v|%d",
+		repo, days, s.Days, s.Events, s.Hooks, s.Sessions, s.Fails,
+		s.GraftReads, s.SourceReads, s.Nudges, s.SavedTokens, s.BilledTokens, s.CostMicros,
+		len(s.Repos), s.Series, s.ByTool, s.FailByReason, s.Repos, s.Verbs,
+		total, used, rolls, events, rowsGen)
 }

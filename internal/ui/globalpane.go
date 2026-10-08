@@ -503,7 +503,9 @@ func (p *globalPane) reloadIfChanged() {
 	if p.signature(members, candidates, ungraphed) == p.sig {
 		return
 	}
-	p.reload()
+	// The model just built is the one reload would build again — with an
+	// os.Stat per member — so it is handed over rather than recomputed.
+	p.reloadWith(members, candidates, ungraphed)
 }
 
 // signature is the cheap identity of what the lists show — including both
@@ -543,8 +545,13 @@ func (p *globalPane) reload() {
 	if p == nil || p.a == nil {
 		return
 	}
-	m := p.a.globals.Load()
 	members, candidates, ungraphed := p.model()
+	p.reloadWith(members, candidates, ungraphed)
+}
+
+// reloadWith is reload over a model the caller already built.
+func (p *globalPane) reloadWith(members []globalMember, candidates, ungraphed []board.Row) {
+	m := p.a.globals.Load()
 	p.sig = p.signature(members, candidates, ungraphed)
 
 	p.head.SetText("Global graph")
@@ -721,8 +728,13 @@ func (p *globalPane) memberRow(m globalMember) gtk.Widgetter {
 		re.AddCSSClass("flat")
 		re.SetVAlign(gtk.AlignCenter)
 		re.SetTooltipText("Merge this repository's current graph again")
-		r := *m.row
-		re.ConnectClicked(func() { p.a.runGlobalChain("global-add", []board.Row{r}) })
+		// Capture the path, not a Row copy: the row is looked up again on click.
+		path := m.row.Path
+		re.ConnectClicked(func() {
+			if r := p.a.row(path); r != nil {
+				p.a.runGlobalChain("global-add", []board.Row{*r})
+			}
+		})
 		row.Append(re)
 	}
 
@@ -765,8 +777,11 @@ func (p *globalPane) candidateRow(r board.Row) gtk.Widgetter {
 	add.AddCSSClass("flat")
 	add.SetVAlign(gtk.AlignCenter)
 	add.SetTooltipText("Merge this repository into the global graph")
-	row := r
-	add.ConnectClicked(func() { p.a.globalAdd([]board.Row{row}) })
+	add.ConnectClicked(func() {
+		if r := p.a.row(path); r != nil {
+			p.a.globalAdd([]board.Row{*r})
+		}
+	})
 
 	box := gtk.NewBox(gtk.OrientationHorizontal, 10)
 	box.Append(check)
