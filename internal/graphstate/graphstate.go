@@ -11,11 +11,9 @@ package graphstate
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -229,6 +227,13 @@ type Options struct {
 	// supplies it from its sidecar; a one-shot scan can leave it zero and see
 	// the raw walk.
 	Baseline Baseline
+	// CommitOnly reads graph.json's built_at_commit (a tail read) and nothing
+	// else of it: no element counts, no labels, no communities, no directory
+	// size. It is for callers that ask only where a graph is, whether it is
+	// behind HEAD and what tier it reached — `ggraphify doctor`. Counters stay
+	// zero and an unlabelled-looking graph reads as Raw rather than Fresh,
+	// because a read that never opened the labels must not vouch for them.
+	CommitOnly bool
 }
 
 // Read derives the graph state for one repository.
@@ -237,19 +242,32 @@ type Options struct {
 // StateNone, an ordinary and very common answer. An error comes back only
 // when the arguments themselves are unusable.
 func Read(opts Options) (Graph, error) {
+	g, final, err := readStatic(opts)
+	if err != nil || final {
+		return g, err
+	}
+	return finishRead(g, opts), nil
+}
+
+// readStatic is the half of Read that depends only on the output directory —
+// everything but drift and the verdict that drift decides. Cache keeps it
+// across ticks for as long as the directory's stamp holds still. final reports
+// a Graph that is already its own answer (no graph, or a broken one), which
+// finishRead must not touch.
+func readStatic(opts Options) (g Graph, final bool, err error) {
 	if opts.Repo == "" {
-		return Graph{}, errors.New("graphstate: no repo path")
+		return Graph{}, true, errors.New("graphstate: no repo path")
 	}
 	out := opts.Out
 	if out == "" {
 		out = filepath.Join(opts.Repo, DefaultOutName)
 	}
-	g := Graph{Out: out, HeadCommit: opts.Head}
+	g = Graph{Out: out, HeadCommit: opts.Head}
 
 	fi, err := os.Stat(out)
 	if err != nil || !fi.IsDir() {
 		g.State = StateNone
-		return g, nil
+		return g, true, nil
 	}
 
 	g.HasReport = exists(filepath.Join(out, "GRAPH_REPORT.md"))
@@ -259,17 +277,35 @@ func Read(opts Options) (Graph, error) {
 	g.HasWiki = exists(filepath.Join(out, "wiki", "index.md"))
 	g.HasCache = exists(filepath.Join(out, "cache"))
 	g.NeedsUpdate = exists(filepath.Join(out, "needs_update"))
-	g.SizeBytes = dirSize(out)
+	if !opts.CommitOnly {
+		g.SizeBytes = dirSize(out)
+	}
 
 	gj := filepath.Join(out, "graph.json")
 	gfi, err := os.Stat(gj)
 	if err != nil {
 		g.State = StateBroken
 		g.Err = "graph.json is missing"
-		return g, nil
+		return g, true, nil
 	}
 	g.BuiltAt = gfi.ModTime()
 	g.GraphBytes = gfi.Size()
+
+	if opts.CommitOnly {
+		if gfi.Size() > MaxGraphBytes {
+			// The same verdict the full read gives, so the two never disagree
+			// about whether a huge graph is behind.
+			g.State = StateRaw
+			g.Err = "graph.json is larger than the parse ceiling; counters not read"
+		} else if c, err := ReadBuiltCommit(out); err != nil {
+			g.State = StateBroken
+			g.Err = "graph.json: " + err.Error()
+			return g, true, nil
+		} else {
+			g.BuiltCommit = c
+		}
+		return g, false, nil
+	}
 
 	if gfi.Size() > MaxGraphBytes {
 		// Deliberately not parsed. The row still carries size, age and drift,
@@ -279,11 +315,10 @@ func Read(opts Options) (Graph, error) {
 	} else if err := readGraph(gj, &g); err != nil {
 		g.State = StateBroken
 		g.Err = "graph.json: " + err.Error()
-		return g, nil
+		return g, true, nil
 	}
 
-	g.Communities, g.Labeled = readLabels(out)
-	g.HubNamed = readHubNamed(out)
+	g.Communities, g.Labeled, g.HubNamed = readLabelState(out)
 	if fi, err := os.Stat(filepath.Join(out, LLMLabelSigFile)); err == nil {
 		g.LLMLabeledAt = fi.ModTime()
 	}
@@ -296,7 +331,13 @@ func Read(opts Options) (Graph, error) {
 		// "nothing to see" and "one free command away from a report".
 		g.Communities = readAnalysisCommunities(out)
 	}
+	return g, false, nil
+}
 
+// finishRead is the other half: the drift walk, which no stamp on the output
+// directory can vouch for, and the verdict.
+func finishRead(g Graph, opts Options) Graph {
+	out := g.Out
 	if !opts.SkipDrift {
 		d := DriftOf(opts.Repo, out, opts.Ignore, opts.Baseline)
 		g.DriftAdded, g.DriftChanged, g.DriftRemoved = len(d.Added), len(d.Changed), len(d.Removed)
@@ -325,113 +366,7 @@ func Read(opts Options) (Graph, error) {
 	default:
 		g.State = StateFresh
 	}
-	return g, nil
-}
-
-// readGraph pulls the counters out of graph.json with a streaming decoder.
-//
-// The whole point is not to materialise the node and link arrays: on the
-// reference graph that is 2 047 nodes and 4 835 links, and a board that
-// unmarshalled all of them for 130 repositories every tick would allocate
-// hundreds of megabytes to render six integers. json.Decoder.Token walks the
-// structure without building it.
-func readGraph(path string, g *Graph) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	dec := json.NewDecoder(f)
-	tok, err := dec.Token()
-	if err != nil {
-		return err
-	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return errors.New("not a JSON object")
-	}
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		key, _ := keyTok.(string)
-		switch key {
-		case "nodes":
-			n, err := countArray(dec)
-			if err != nil {
-				return err
-			}
-			g.Nodes = n
-		case "links", "edges":
-			n, err := countArray(dec)
-			if err != nil {
-				return err
-			}
-			g.Links += n
-		case "hyperedges":
-			n, err := countArray(dec)
-			if err != nil {
-				return err
-			}
-			g.Hyperedges = n
-		case "built_at_commit":
-			var v string
-			if err := dec.Decode(&v); err != nil {
-				return err
-			}
-			g.BuiltCommit = v
-		case "graph":
-			// Some versions carry built_at_commit inside a "graph" object;
-			// 0.9.58 writes a bare 0 here and puts the commit at top level.
-			// Decode into a RawMessage so either shape is survivable — a
-			// struct decode against `0` would fail the whole read and show
-			// the repository as broken.
-			var raw json.RawMessage
-			if err := dec.Decode(&raw); err != nil {
-				return err
-			}
-			var meta struct {
-				BuiltAtCommit string `json:"built_at_commit"`
-			}
-			if json.Unmarshal(raw, &meta) == nil && g.BuiltCommit == "" {
-				g.BuiltCommit = meta.BuiltAtCommit
-			}
-		default:
-			if err := skipValue(dec); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// countArray consumes one JSON array, counting its elements and allocating
-// nothing for their contents.
-func countArray(dec *json.Decoder) (int, error) {
-	tok, err := dec.Token()
-	if err != nil {
-		return 0, err
-	}
-	d, ok := tok.(json.Delim)
-	if !ok || d != '[' {
-		// Not an array after all — skip whatever it is and report none.
-		if ok && (d == '{') {
-			if err := skipRest(dec); err != nil {
-				return 0, err
-			}
-		}
-		return 0, nil
-	}
-	n := 0
-	for dec.More() {
-		if err := skipValue(dec); err != nil {
-			return n, err
-		}
-		n++
-	}
-	_, err = dec.Token() // the closing ]
-	return n, err
+	return g
 }
 
 // skipValue consumes exactly one JSON value, however nested.
@@ -458,6 +393,67 @@ func skipRest(dec *json.Decoder) error {
 	return err
 }
 
+// labelName is one community's entry in .graphify_labels.json: a bare name,
+// or an object carrying one under "name". Anything else is a nameless entry —
+// still a community, never a label.
+type labelName string
+
+func (l *labelName) UnmarshalJSON(b []byte) error {
+	*l = ""
+	switch {
+	case len(b) > 0 && b[0] == '"':
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		*l = labelName(s)
+	case len(b) > 0 && b[0] == '{':
+		var o struct {
+			Name any `json:"name"`
+		}
+		if err := json.Unmarshal(b, &o); err != nil {
+			return err
+		}
+		s, _ := o.Name.(string)
+		*l = labelName(s)
+	}
+	return nil
+}
+
+// readLabelFile reads .graphify_labels.json once, into a typed map. Some
+// versions nest the mapping under a "labels" key; that layout costs a second
+// decode of the same bytes, the flat one does not.
+func readLabelFile(out string) (map[string]labelName, bool) {
+	b, err := os.ReadFile(filepath.Join(out, ".graphify_labels.json"))
+	if err != nil {
+		return nil, false
+	}
+	var m map[string]labelName
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, false
+	}
+	if _, nested := m["labels"]; nested {
+		var doc struct {
+			Labels map[string]labelName `json:"labels"`
+		}
+		if json.Unmarshal(b, &doc) == nil && doc.Labels != nil {
+			m = doc.Labels
+		}
+	}
+	return m, true
+}
+
+// readLabelState is readLabels and readHubNamed over a single read of the
+// labels file.
+func readLabelState(out string) (n int, labeled bool, hubNamed int) {
+	m, ok := readLabelFile(out)
+	if !ok {
+		return 0, false, 0
+	}
+	n, labeled = countLabels(m)
+	return n, labeled, countHubNamed(out, m)
+}
+
 // readLabels counts communities from .graphify_labels.json.
 //
 // "Labeled" means the file exists and names at least one community with a
@@ -465,25 +461,17 @@ func skipRest(dec *json.Decoder) error {
 // before the LLM labelling pass has run, and a row that claimed to be labelled
 // on the strength of those would be lying about the expensive step.
 func readLabels(out string) (n int, labeled bool) {
-	b, err := os.ReadFile(filepath.Join(out, ".graphify_labels.json"))
-	if err != nil {
+	m, ok := readLabelFile(out)
+	if !ok {
 		return 0, false
 	}
-	var m map[string]any
-	if err := json.Unmarshal(b, &m); err != nil {
-		return 0, false
-	}
-	// Some versions nest the mapping under a "labels" key.
-	if inner, ok := m["labels"].(map[string]any); ok {
-		m = inner
-	}
+	return countLabels(m)
+}
+
+func countLabels(m map[string]labelName) (n int, labeled bool) {
 	for k, v := range m {
-		s, _ := v.(string)
-		if s == "" {
-			s, _ = v.(map[string]any)["name"].(string)
-		}
 		n++
-		if s != "" && !isPlaceholder(s) && !isPlaceholder(k) {
+		if s := string(v); s != "" && !isPlaceholder(s) && !isPlaceholder(k) {
 			labeled = true
 		}
 	}
@@ -501,31 +489,38 @@ func readLabels(out string) (n int, labeled bool) {
 // shape of the name itself: graphify's hub fallback is a single symbol or path
 // ("testing.T", ".Return"), so any name with no whitespace in it is one.
 func readHubNamed(out string) int {
-	b, err := os.ReadFile(filepath.Join(out, ".graphify_labels.json"))
-	if err != nil {
+	m, ok := readLabelFile(out)
+	if !ok {
 		return 0
 	}
-	var m map[string]any
-	if err := json.Unmarshal(b, &m); err != nil {
-		return 0
+	return countHubNamed(out, m)
+}
+
+func countHubNamed(out string, m map[string]labelName) int {
+	// The signatures are decoded only when both exist: one without the other
+	// is heuristic mode, and decoding it would be work thrown away.
+	var (
+		cur, snap map[string]string
+		sigs      bool
+	)
+	curPath := filepath.Join(out, ".graphify_labels.json.sig")
+	snapPath := filepath.Join(out, LLMLabelSigFile)
+	if exists(curPath) && exists(snapPath) {
+		var curOK, snapOK bool
+		cur, curOK = readSigMap(curPath)
+		if curOK {
+			snap, snapOK = readSigMap(snapPath)
+		}
+		sigs = curOK && snapOK
 	}
-	// Some versions nest the mapping under a "labels" key.
-	if inner, ok := m["labels"].(map[string]any); ok {
-		m = inner
-	}
-	cur, curOK := readSigMap(filepath.Join(out, ".graphify_labels.json.sig"))
-	snap, snapOK := readSigMap(filepath.Join(out, LLMLabelSigFile))
 
 	n := 0
 	for k, v := range m {
-		s, _ := v.(string)
-		if s == "" {
-			s, _ = v.(map[string]any)["name"].(string)
-		}
+		s := string(v)
 		if s == "" || isPlaceholder(s) {
 			continue
 		}
-		if curOK && snapOK {
+		if sigs {
 			// Snapshot mode: the signature moved (or is new) since the LLM
 			// named it.
 			if snapV, ok := snap[k]; !ok || snapV != cur[k] {
@@ -699,63 +694,6 @@ func dirSize(dir string) int64 {
 		return nil
 	})
 	return n
-}
-
-// Node is one entry of graph.json's nodes array, for the detail pane — which
-// is the only caller that needs the graph itself rather than its counters.
-type Node struct {
-	ID            string `json:"id"`
-	Label         string `json:"label"`
-	FileType      string `json:"file_type"`
-	SourceFile    string `json:"source_file"`
-	SourceLoc     string `json:"source_location"`
-	Community     any    `json:"community"`
-	CommunityName string `json:"community_name"`
-}
-
-// Nodes loads the node array in full. Callers must be off the GTK main thread
-// and must respect MaxGraphBytes; the board only ever calls this for one
-// selected repository at a time.
-func Nodes(out string, limit int) ([]Node, error) {
-	f, err := os.Open(filepath.Join(out, "graph.json"))
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	dec := json.NewDecoder(f)
-	if _, err := dec.Token(); err != nil {
-		return nil, err
-	}
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		if key, _ := keyTok.(string); key != "nodes" {
-			if err := skipValue(dec); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if _, err := dec.Token(); err != nil { // opening [
-			return nil, err
-		}
-		var nodes []Node
-		for dec.More() {
-			var n Node
-			if err := dec.Decode(&n); err != nil {
-				return nil, err
-			}
-			nodes = append(nodes, n)
-			if limit > 0 && len(nodes) >= limit {
-				break
-			}
-		}
-		sort.Slice(nodes, func(i, j int) bool { return nodes[i].Label < nodes[j].Label })
-		return nodes, nil
-	}
-	return nil, io.EOF
 }
 
 func itoa(n int) string {

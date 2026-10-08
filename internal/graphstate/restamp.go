@@ -1,7 +1,6 @@
 package graphstate
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -34,10 +33,11 @@ var ErrNoStamp = errors.New("graphstate: graph.json carries no top-level built_a
 // an out-of-date graph into a fresh-looking row, which is the exact failure
 // the behind check exists to catch.
 //
-// The rewrite is a byte splice — the stamp's value range is located with a
-// streaming decoder and the file is copied around it — so a 200 MB graph.json
-// costs one pass and no allocation of its node array, and a graph too large to
-// parse is restamped as readily as a small one.
+// The rewrite is a byte splice — the stamp's value range is located in the
+// file's last few kilobytes, where graphify writes it, and the file is copied
+// around it — so a 500 MB graph.json costs one copy and no parse. Only a
+// layout that puts the stamp elsewhere needs the full scan, and that is
+// bounded by MaxStampScanBytes.
 func Restamp(out, head string) (bool, error) {
 	if out == "" || head == "" {
 		return false, nil
@@ -55,7 +55,11 @@ func Restamp(out, head string) (bool, error) {
 	}
 	defer f.Close()
 
-	start, end, cur, err := locateStamp(f)
+	fi, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	start, end, cur, err := locateStamp(f, fi.Size())
 	if err != nil {
 		return false, err
 	}
@@ -63,10 +67,6 @@ func Restamp(out, head string) (bool, error) {
 		return false, nil
 	}
 
-	fi, err := f.Stat()
-	if err != nil {
-		return false, err
-	}
 	tmp, err := os.CreateTemp(out, ".graph.stamp-*")
 	if err != nil {
 		return false, err
@@ -111,41 +111,42 @@ func Restamp(out, head string) (bool, error) {
 	return true, nil
 }
 
+// MaxStampScanBytes bounds the full scan locateStamp falls back to when the
+// stamp is not where graphify writes it. The tail read has no ceiling — it is
+// 4 KB whatever the file's size — but a front-to-back walk of a graph this
+// large is the stall the parse ceiling exists to prevent.
+const MaxStampScanBytes = MaxGraphBytes
+
+// errStampTooLarge is locateStamp's answer for a graph past MaxStampScanBytes
+// whose stamp is not in its tail.
+var errStampTooLarge = errors.New("graphstate: graph.json is larger than the stamp scan ceiling and its built_at_commit is not at the end")
+
 // locateStamp finds the byte range of the top-level built_at_commit's value,
 // and its current contents.
 //
 // start is the offset just past the key — the range it returns therefore spans
-// the colon and the value, which is why the replacement writes both back. The
-// walk stops at the key, so on graphify's own layout (the stamp is the last
-// top-level member) it costs one pass and on any other it costs less.
-func locateStamp(r io.Reader) (start, end int64, cur string, err error) {
-	dec := json.NewDecoder(r)
-	tok, err := dec.Token()
-	if err != nil {
+// the colon and the value, which is why the replacement writes both back.
+// graphify writes the stamp as the root's last member, so the tail read
+// answers on its own layout; any other layout gets a full scan from the start
+// of the file, up to MaxStampScanBytes.
+func locateStamp(f *os.File, size int64) (start, end int64, cur string, err error) {
+	if at, ok := tailStamp(f, size); ok {
+		return at.start, at.end, at.cur, nil
+	}
+	if size > MaxStampScanBytes {
+		return 0, 0, "", errStampTooLarge
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return 0, 0, "", err
 	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return 0, 0, "", errors.New("graphstate: graph.json is not a JSON object")
+	at, err := scanStamp(f)
+	if err != nil {
+		if errors.Is(err, errNotObject) {
+			return 0, 0, "", errors.New("graphstate: graph.json is not a JSON object")
+		}
+		return 0, 0, "", err
 	}
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return 0, 0, "", err
-		}
-		key, _ := keyTok.(string)
-		if key == "built_at_commit" {
-			start = dec.InputOffset()
-			var v string
-			if err := dec.Decode(&v); err != nil {
-				return 0, 0, "", err
-			}
-			return start, dec.InputOffset(), v, nil
-		}
-		if err := skipValue(dec); err != nil {
-			return 0, 0, "", err
-		}
-	}
-	return 0, 0, "", ErrNoStamp
+	return at.start, at.end, at.cur, nil
 }
 
 // reportCommitPrefix is how graphify's report names the commit it was built

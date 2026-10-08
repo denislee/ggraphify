@@ -202,8 +202,30 @@ type Options struct {
 // As in graphstate, "this repository has no graft index" is not an error —
 // it is StateNone, and it is the common answer.
 func Read(opts Options) (Index, error) {
+	st, err := readStatic(opts)
+	if err != nil || st.final {
+		return st.i, err
+	}
+	return finishRead(st.i, st.fp, st.fpOK, opts), nil
+}
+
+// static is readStatic's result. fp is the fingerprint it decoded to count
+// files; the drift half uses it on the same pass, and Cache drops it rather
+// than keep a record per source file alive between ticks.
+type static struct {
+	i      Index
+	fpPath string
+	fp     map[string]print
+	fpOK   bool
+	final  bool // already the whole answer: no index, or a broken one
+}
+
+// readStatic is the half of Read that depends only on the graft directory:
+// everything but drift and the verdict drift decides. Cache keeps it until the
+// directory's stamp moves.
+func readStatic(opts Options) (static, error) {
 	if opts.Repo == "" {
-		return Index{}, errors.New("graftstate: no repo path")
+		return static{final: true}, errors.New("graftstate: no repo path")
 	}
 	dir := opts.Dir
 	if dir == "" {
@@ -214,7 +236,7 @@ func Read(opts Options) (Index, error) {
 	fi, err := os.Stat(dir)
 	if err != nil || !fi.IsDir() {
 		i.State = StateNone
-		return i, nil
+		return static{i: i, final: true}, nil
 	}
 
 	i.HasIndex = exists(filepath.Join(dir, indexFile))
@@ -230,7 +252,7 @@ func Read(opts Options) (Index, error) {
 		// has nothing to do with graft.
 		i.State = StateNone
 		i.Dir = dir
-		return i, nil
+		return static{i: i, final: true}, nil
 	}
 	i.Exposed = exposedToGit(opts.Repo, dir)
 	i.SizeBytes = dirSize(dir)
@@ -239,7 +261,7 @@ func Read(opts Options) (Index, error) {
 	if err != nil || wfi.Size() == 0 {
 		i.State = StateBroken
 		i.Err = filepath.Join(graphDir, wiringFile) + " is missing or empty — an interrupted build leaves this"
-		return i, nil
+		return static{i: i, final: true}, nil
 	}
 	i.BuiltAt = wfi.ModTime()
 	if wfi.Size() > MaxWiringBytes {
@@ -248,11 +270,17 @@ func Read(opts Options) (Index, error) {
 	} else if err := readMeta(wiring, &i); err != nil {
 		i.State = StateBroken
 		i.Err = wiringFile + ": " + err.Error()
-		return i, nil
+		return static{i: i, final: true}, nil
 	}
-
 	fp, ok := readFingerprint(fpPath)
 	i.Files = len(fp)
+	return static{i: i, fpPath: fpPath, fp: fp, fpOK: ok}, nil
+}
+
+// finishRead is the drift half: fp is the fingerprint readStatic located,
+// read afresh by the caller (ok false when there is none, or when drift is
+// skipped), and the verdict.
+func finishRead(i Index, fp map[string]print, ok bool, opts Options) Index {
 	if ok && !opts.SkipDrift {
 		driftOf(opts.Repo, fp, &i)
 	}
@@ -270,7 +298,7 @@ func Read(opts Options) (Index, error) {
 	default:
 		i.State = StateFresh
 	}
-	return i, nil
+	return i
 }
 
 // readMeta pulls the counters out of wiring.json's `meta` object and stops
@@ -342,6 +370,57 @@ type print struct {
 	size   int64
 	mtime  float64
 	digest string
+	// whole is false for a record with fewer than three fields, which the
+	// fingerprint reader drops: there is nothing in it to compare.
+	whole bool
+}
+
+// printField is one element of a fingerprint record. Each is decoded straight
+// into its typed slot; a value of the wrong type reads as zero, as the
+// []any-and-type-assert decode it replaces did.
+type printField struct {
+	num   float64
+	str   string
+	isNum bool
+	isStr bool
+	set   bool
+}
+
+func (f *printField) UnmarshalJSON(b []byte) error {
+	*f = printField{set: true}
+	if len(b) == 0 {
+		return nil
+	}
+	switch c := b[0]; {
+	case c == '"':
+		f.isStr = true
+		return json.Unmarshal(b, &f.str)
+	case c == '-' || (c >= '0' && c <= '9'):
+		f.isNum = true
+		return json.Unmarshal(b, &f.num)
+	}
+	return nil
+}
+
+// UnmarshalJSON decodes graft's [size, mtime, digest] record without the
+// intermediate []any.
+func (p *print) UnmarshalJSON(b []byte) error {
+	var rec [3]printField
+	if err := json.Unmarshal(b, &rec); err != nil {
+		// Not an array: the old decode failed the whole file here too.
+		return err
+	}
+	*p = print{whole: rec[2].set}
+	if rec[0].isNum {
+		p.size = int64(rec[0].num)
+	}
+	if rec[1].isNum {
+		p.mtime = rec[1].num
+	}
+	if rec[2].isStr {
+		p.digest = rec[2].str
+	}
+	return nil
 }
 
 // readFingerprint reads graft's probe sidecar, already resolved by
@@ -364,22 +443,20 @@ func readFingerprint(path string) (map[string]print, bool) {
 
 	var doc struct {
 		Version int              `json:"version"`
-		Files   map[string][]any `json:"files"`
+		Files   map[string]print `json:"files"`
 	}
 	if err := json.NewDecoder(f).Decode(&doc); err != nil {
 		return nil, false
 	}
-	out := make(map[string]print, len(doc.Files))
 	for rel, rec := range doc.Files {
-		if len(rec) < 3 {
-			continue
+		if !rec.whole {
+			delete(doc.Files, rel)
 		}
-		size, _ := rec[0].(float64)
-		mtime, _ := rec[1].(float64)
-		digest, _ := rec[2].(string)
-		out[rel] = print{size: int64(size), mtime: mtime, digest: digest}
 	}
-	return out, true
+	if doc.Files == nil {
+		doc.Files = map[string]print{}
+	}
+	return doc.Files, true
 }
 
 // newestFingerprint picks the most recently written fingerprint.<stamp>.json.

@@ -79,6 +79,10 @@ Exit status is 0 when every invariant holds and 1 when one is broken.
 		// asks about drift: what doctor wants is where each graph is, what
 		// commit it came from and what tier it reached.
 		SkipDrift: true,
+		// Nor does any check count nodes, read labels or size a directory:
+		// the commit stamp is a tail read, where the full one is a scan of
+		// every graph.json on the machine.
+		CommitOnly: true,
 		Override: func(path string) (string, bool, bool) {
 			o := st.Override(path)
 			return o.Out, o.ExcludeBatch, o.Pinned

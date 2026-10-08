@@ -1,6 +1,7 @@
 package graphstate
 
 import (
+	"bufio"
 	"encoding/json"
 	"io/fs"
 	"os"
@@ -189,6 +190,50 @@ type manifestEntry struct {
 	SemanticHash string  `json:"semantic_hash"`
 }
 
+// driftRecord is the one field of a manifest record DriftOf reads, plus the
+// walk's own "seen" mark. The hashes CoverageOf counts are never decoded here:
+// on the largest manifest they are most of its bytes.
+type driftRecord struct {
+	MTime float64 `json:"mtime"`
+	seen  bool
+}
+
+// readDriftManifest streams manifest.json into path → mtime, so the raw bytes
+// and the map never coexist. ok is false for anything the whole-file decode
+// would have refused, which DriftOf answers with "no drift" exactly as before.
+func readDriftManifest(path string) (map[string]driftRecord, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	dec := json.NewDecoder(bufio.NewReaderSize(f, 64<<10))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, false
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil, false
+	}
+	man := map[string]driftRecord{}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, false
+		}
+		rel, _ := keyTok.(string)
+		var r driftRecord
+		if err := dec.Decode(&r); err != nil {
+			return nil, false
+		}
+		man[rel] = r
+	}
+	if _, err := dec.Token(); err != nil { // the closing brace
+		return nil, false
+	}
+	return man, true
+}
+
 // mtimeSlack is how far a file's mtime may exceed the manifest's before it
 // counts as changed. graphify records mtimes as floats and rounds them, and
 // filesystems disagree about sub-second precision; without slack every
@@ -214,12 +259,8 @@ const driftPathsMax = 100
 //     of a monorepo, and every one of those files read as drift.
 func DriftOf(repo, out string, ignore map[string]bool, base Baseline) Drift {
 	var d Drift
-	b, err := os.ReadFile(filepath.Join(out, "manifest.json"))
-	if err != nil {
-		return d
-	}
-	var man map[string]manifestEntry
-	if err := json.Unmarshal(b, &man); err != nil || len(man) == 0 {
+	man, ok := readDriftManifest(filepath.Join(out, "manifest.json"))
+	if !ok || len(man) == 0 {
 		return d
 	}
 	// Only file types the manifest already contains are considered. graphify
@@ -239,7 +280,6 @@ func DriftOf(repo, out string, ignore map[string]bool, base Baseline) Drift {
 		}
 	}
 
-	seen := make(map[string]bool, len(man))
 	outBase := filepath.Base(out)
 	gi := newIgnoreTree(repo)
 	_ = filepath.WalkDir(repo, func(path string, de fs.DirEntry, err error) error {
@@ -284,7 +324,8 @@ func DriftOf(repo, out string, ignore map[string]bool, base Baseline) Drift {
 		if e, ok := man[rel]; ok {
 			// A manifest hit is checked for an edit whatever else is true of
 			// the file: it is in the graph, so its mtime is the question.
-			seen[rel] = true
+			e.seen = true
+			man[rel] = e
 			if fi, err := de.Info(); err == nil &&
 				fi.ModTime().After(floatTime(e.MTime).Add(mtimeSlack)) {
 				d.Changed = append(d.Changed, rel)
@@ -319,8 +360,8 @@ func DriftOf(repo, out string, ignore map[string]bool, base Baseline) Drift {
 		return nil
 	})
 
-	for rel := range man {
-		if seen[rel] {
+	for rel, e := range man {
+		if e.seen {
 			continue
 		}
 		// The file was not reached by the walk, which is not the same as gone:
@@ -381,5 +422,7 @@ func capPaths(xs []string) []string {
 	if len(xs) <= driftPathsMax {
 		return xs
 	}
-	return xs[:driftPathsMax]
+	// A copy, not a reslice: the cached Graph keeps this list, and a reslice
+	// would keep the whole backing array — every drifted path — alive with it.
+	return append([]string(nil), xs[:driftPathsMax]...)
 }

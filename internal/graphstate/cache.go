@@ -20,8 +20,12 @@ import (
 //
 // Drift is deliberately NOT covered by the key: editing a source file changes
 // nothing in graphify-out/, and a cached "no drift" answer would be exactly
-// wrong. Entries therefore also expire on a short TTL, which is what lets the
-// board notice an edit without re-reading every graph.json every tick.
+// wrong. So an entry has two layers. The static layer — counters, labels,
+// communities, Has* flags, size — is keyed on the directory's stamp alone and
+// never expires: it is re-read only when a graphify run moves the stamp, and
+// those numbers cannot change any other way. The drift layer expires on a
+// short TTL, which is what lets the board notice an edit without re-reading
+// any graph.json at all.
 type Cache struct {
 	mu sync.Mutex
 	m  map[string]entry
@@ -56,8 +60,14 @@ const DefaultTTL = 45 * time.Second
 
 type entry struct {
 	key string
-	at  time.Time
-	g   Graph
+	// static is readStatic's result for key; final says it is already the
+	// whole answer (no graph, or a broken one) and has no drift layer.
+	static Graph
+	final  bool
+	// at is when the drift layer was last derived, and g is static plus
+	// drift plus the verdict.
+	at time.Time
+	g  Graph
 }
 
 // Read returns the cached derivation when the output directory is unchanged
@@ -72,6 +82,9 @@ func (c *Cache) Read(opts Options) (Graph, error) {
 	// went stale on commit should say so on the next tick, not up to a TTL
 	// later.
 	key := outKey(out) + "@" + opts.Head
+	if opts.CommitOnly {
+		key += "|commit-only"
+	}
 	ttl := c.TTL
 	if ttl <= 0 {
 		ttl = DefaultTTL
@@ -85,9 +98,24 @@ func (c *Cache) Read(opts Options) (Graph, error) {
 		return e.g, nil
 	}
 
-	g, err := Read(opts)
-	if err != nil {
-		return g, err
+	var (
+		static Graph
+		final  bool
+	)
+	if ok && e.key == key {
+		// Only the drift layer has expired: the directory has not moved, so
+		// nothing readStatic would read has either.
+		static, final = e.static, e.final
+	} else {
+		var err error
+		static, final, err = readStatic(opts)
+		if err != nil {
+			return static, err
+		}
+	}
+	g := static
+	if !final {
+		g = finishRead(static, opts)
 	}
 	if derived != nil {
 		// Test seam: the whole question this function answers is what happens
@@ -100,7 +128,7 @@ func (c *Cache) Read(opts Options) (Graph, error) {
 		if c.m == nil {
 			c.m = map[string]entry{}
 		}
-		c.m[opts.Repo] = entry{key: key, at: time.Now(), g: g}
+		c.m[opts.Repo] = entry{key: key, static: static, final: final, at: time.Now(), g: g}
 	}
 	c.mu.Unlock()
 	return g, nil
@@ -119,6 +147,28 @@ func (c *Cache) Invalidate(repo string) {
 	c.mu.Unlock()
 }
 
+// Prune drops every repository not in keep, both its entry and its
+// invalidation counter. Checkouts come and go — agent worktrees above all —
+// and a cache that only ever adds keys holds every one it has ever seen. It
+// returns how many entries it dropped.
+func (c *Cache) Prune(keep map[string]bool) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for repo := range c.m {
+		if !keep[repo] {
+			delete(c.m, repo)
+			n++
+		}
+	}
+	for repo := range c.gen {
+		if !keep[repo] {
+			delete(c.gen, repo)
+		}
+	}
+	return n
+}
+
 // Clear drops everything, for an explicit rescan.
 func (c *Cache) Clear() {
 	c.mu.Lock()
@@ -128,10 +178,21 @@ func (c *Cache) Clear() {
 	c.mu.Unlock()
 }
 
-// outKey fingerprints an output directory cheaply: three stats, no reads.
+// outKeyFiles are what readStatic reads, or whose existence it reports. "."
+// is the directory itself: creating or removing anything in it — a report, an
+// HTML view, the cache — moves its mtime, which is what keeps the Has* flags
+// and the size honest without a TTL.
+var outKeyFiles = []string{
+	".", "graph.json", "manifest.json", ".graphify_labels.json", "needs_update",
+	".graphify_labels.json.sig", LLMLabelSigFile, ".graphify_analysis.json",
+	filepath.Join("wiki", "index.md"),
+}
+
+// outKey fingerprints an output directory cheaply: a handful of stats, no
+// reads.
 func outKey(out string) string {
 	var b []byte
-	for _, name := range []string{"graph.json", "manifest.json", ".graphify_labels.json", "needs_update"} {
+	for _, name := range outKeyFiles {
 		b = append(b, name...)
 		b = append(b, ':')
 		if fi, err := os.Stat(filepath.Join(out, name)); err == nil {

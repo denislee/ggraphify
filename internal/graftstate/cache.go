@@ -17,7 +17,10 @@ import (
 //
 // Drift is deliberately NOT part of the key: editing a source file changes
 // nothing inside graft/, and a cached "no drift" answer would be exactly
-// wrong. Entries therefore also expire on a short TTL.
+// wrong. So an entry has two layers, as graphstate.Cache's does: the static
+// layer (counters, size, Has*/Deep/Exposed, the file count) is keyed on the
+// stamp alone and never expires, and only the drift layer — the fingerprint
+// re-read and the per-file stat pass — runs on the TTL.
 type Cache struct {
 	mu sync.Mutex
 	m  map[string]entry
@@ -37,8 +40,11 @@ const DefaultTTL = 45 * time.Second
 
 type entry struct {
 	key string
-	at  time.Time
-	i   Index
+	// st is readStatic's result for key, without its fingerprint records:
+	// those are re-read when the drift layer expires rather than kept.
+	st static
+	at time.Time // when the drift layer was last derived
+	i  Index
 }
 
 type stamp struct {
@@ -54,6 +60,11 @@ func (c *Cache) Read(opts Options) (Index, error) {
 		dir = DirFor(opts.Repo)
 	}
 	key := dirKey(dir)
+	if dir == DirFor(opts.Repo) {
+		// exposedToGit reads the checkout's root .gitignore, which is
+		// outside the graft directory and moves on its own.
+		key = string(appendStat([]byte(key), ".gitignore", filepath.Join(opts.Repo, ".gitignore")))
+	}
 	ttl := c.TTL
 	if ttl <= 0 {
 		ttl = DefaultTTL
@@ -67,16 +78,31 @@ func (c *Cache) Read(opts Options) (Index, error) {
 		return e.i, nil
 	}
 
-	i, err := Read(opts)
-	if err != nil {
-		return i, err
+	var st static
+	if ok && e.key == key {
+		// Only the drift layer has expired.
+		st = e.st
+		if !st.final && !opts.SkipDrift {
+			st.fp, st.fpOK = readFingerprint(st.fpPath)
+		}
+	} else {
+		var err error
+		st, err = readStatic(opts)
+		if err != nil {
+			return st.i, err
+		}
 	}
+	i := st.i
+	if !st.final {
+		i = finishRead(st.i, st.fp, st.fpOK, opts)
+	}
+	st.fp, st.fpOK = nil, false
 	c.mu.Lock()
 	if (stamp{clears: c.clears, repo: c.gen[opts.Repo]}) == at {
 		if c.m == nil {
 			c.m = map[string]entry{}
 		}
-		c.m[opts.Repo] = entry{key: key, at: time.Now(), i: i}
+		c.m[opts.Repo] = entry{key: key, st: st, at: time.Now(), i: i}
 	}
 	c.mu.Unlock()
 	return i, nil
@@ -94,6 +120,28 @@ func (c *Cache) Invalidate(repo string) {
 	c.mu.Unlock()
 }
 
+// Prune drops every repository not in keep, both its entry and its
+// invalidation counter, and returns how many entries it dropped. Checkouts
+// come and go — agent worktrees above all — and a cache that only adds keys
+// holds every one it has ever seen.
+func (c *Cache) Prune(keep map[string]bool) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for repo := range c.m {
+		if !keep[repo] {
+			delete(c.m, repo)
+			n++
+		}
+	}
+	for repo := range c.gen {
+		if !keep[repo] {
+			delete(c.gen, repo)
+		}
+	}
+	return n
+}
+
 // Clear drops everything, for an explicit rescan.
 func (c *Cache) Clear() {
 	c.mu.Lock()
@@ -107,6 +155,7 @@ func (c *Cache) Clear() {
 // directory read, no file contents.
 func dirKey(dir string) string {
 	var b []byte
+	b = appendStat(b, ".", dir) // a file created or removed at the top
 	for _, rel := range []string{
 		filepath.Join(graphDir, wiringFile),
 		manifestFile,

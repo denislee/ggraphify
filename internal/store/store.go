@@ -989,6 +989,30 @@ func (s *Store) SetDriftBaseline(repo string, b graphstate.Baseline) {
 	s.schedule()
 }
 
+// PruneDriftBaselines drops the baseline of every repository not in keep and
+// returns how many it dropped. A baseline outlives its checkout otherwise —
+// agent worktrees are created and deleted by the dozen — and each one is a
+// path list of up to graphstate.MaxBaselinePaths entries in the sidecar.
+//
+// keep must answer for the full set of checkouts the board knows: a baseline pruned
+// because a scan root was briefly unmounted is drift the next graphify run
+// has to adjudicate all over again.
+func (s *Store) PruneDriftBaselines(keep func(repo string) bool) int {
+	s.mu.Lock()
+	n := 0
+	for repo := range s.s.Baselines {
+		if !keep(repo) {
+			delete(s.s.Baselines, repo)
+			n++
+		}
+	}
+	s.mu.Unlock()
+	if n > 0 {
+		s.schedule()
+	}
+	return n
+}
+
 // Scheme is the colour-scheme preference.
 func (s *Store) Scheme() string {
 	v := s.Settings().Scheme

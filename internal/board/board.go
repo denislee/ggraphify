@@ -82,6 +82,10 @@ type Options struct {
 	// SkipDrift omits the per-repo tree walk. The walk is the expensive half
 	// of a refresh and a caller that only wants counters can skip it.
 	SkipDrift bool
+	// CommitOnly reads each graph's commit stamp and nothing else of it — see
+	// graphstate.Options.CommitOnly. For callers that ask only where a graph
+	// is and whether it is behind, such as `ggraphify doctor`.
+	CommitOnly bool
 	// Workers bounds the concurrent graph reads. Zero means NumCPU, capped at
 	// 8: the work is IO-bound on a page cache that is usually warm, and more
 	// goroutines past that only add contention.
@@ -142,6 +146,7 @@ func Scan(opts Options) ([]Row, error) {
 	if err != nil {
 		return nil, err
 	}
+	pruneCaches(opts, repos)
 
 	workers := opts.Workers
 	if workers <= 0 {
@@ -186,6 +191,25 @@ func Scan(opts Options) ([]Row, error) {
 	return rows, nil
 }
 
+// pruneCaches drops the memoised state of every checkout this walk did not
+// find. Agent worktrees come and go, and caches that only ever add keys would
+// hold each one for the life of the board.
+func pruneCaches(opts Options, repos []discover.Repo) {
+	if opts.Graphs == nil && opts.Grafts == nil {
+		return
+	}
+	keep := make(map[string]bool, len(repos))
+	for _, r := range repos {
+		keep[r.Path] = true
+	}
+	if opts.Graphs != nil {
+		opts.Graphs.Prune(keep)
+	}
+	if opts.Grafts != nil {
+		opts.Grafts.Prune(keep)
+	}
+}
+
 func derive(repo discover.Repo, opts Options) Row {
 	r := Row{Repo: repo}
 	if opts.Override != nil {
@@ -199,10 +223,11 @@ func derive(repo discover.Repo, opts Options) Row {
 		}
 	}
 	gopts := graphstate.Options{
-		Repo:      repo.Path,
-		Out:       r.Out,
-		Head:      repo.HeadSHA,
-		SkipDrift: opts.SkipDrift,
+		Repo:       repo.Path,
+		Out:        r.Out,
+		Head:       repo.HeadSHA,
+		SkipDrift:  opts.SkipDrift,
+		CommitOnly: opts.CommitOnly,
 	}
 	if opts.Baseline != nil {
 		gopts.Baseline = opts.Baseline(repo.Path)
