@@ -7,6 +7,9 @@ Restart=on-failure
 RestartSec=10
 Nice=5
 MemoryHigh=6G
+MemoryMax=4500M
+MemorySwapMax=512M
+Environment=MALLOC_ARENA_MAX=2
 
 [Install]
 WantedBy=default.target

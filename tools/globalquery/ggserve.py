@@ -20,6 +20,8 @@ Routes (GET only):
 from __future__ import annotations
 
 import argparse
+import ctypes
+import gc
 import json
 import os
 import sys
@@ -27,15 +29,30 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import networkx as nx
 from graphify.serve import (
     _find_node,
-    _load_graph,
     _query_graph_text,
     _shortest_path_text,
     find_node_ambiguity,
 )
+
+# String values repeated across hundreds of thousands of records: one shared
+# object each instead of one per node/edge.
+_INTERN_KEYS = (
+    "relation", "confidence", "context", "file_type", "repo",
+    "community_name", "source_file",
+)
+# Attributes no ggserve output path reads (graphify's _subgraph_to_text,
+# _shortest_path_text, _find_node and the scorers never touch them).
+_DROP_KEYS = ("_origin", "local_id")
+# graphify.export's defaults: a confidence_score equal to these carries nothing.
+_CONFIDENCE_SCORE_DEFAULTS = {"EXTRACTED": 1.0, "INFERRED": 0.55, "AMBIGUOUS": 0.2}
+# Trigram id-set memo kept by graphify on G; cleared once it grows past this.
+SET_CACHE_MAX = 2000
 
 DEFAULT_GRAPH = "~/.graphify/global-graph.json"
 DEFAULT_MANIFEST = "~/.graphify/global-manifest.json"
@@ -43,6 +60,7 @@ DEFAULT_MANIFEST = "~/.graphify/global-manifest.json"
 USAGE_QUERY = "usage: /query?q=<question>[&budget=2000][&depth=3]"
 USAGE_PATH = "usage: /path?a=<source>&b=<target>"
 USAGE_EXPLAIN = "usage: /explain?node=<symbol or node id>"
+NOT_READY = "global graph is still loading — retry in a few seconds"
 
 
 # --------------------------------------------------------------------------- #
@@ -79,17 +97,111 @@ def _home_display(root: str) -> str:
     return root
 
 
+def _slim(attrs: dict, edge: bool) -> dict:
+    """Drop unread attributes and intern repeated string values, in place."""
+    for k in _DROP_KEYS:
+        attrs.pop(k, None)
+    for k in _INTERN_KEYS:
+        v = attrs.get(k)
+        if type(v) is str:
+            attrs[k] = sys.intern(v)
+    if edge:
+        if attrs.get("weight") == 1.0:
+            del attrs["weight"]
+        cs = attrs.get("confidence_score")
+        if cs is not None and cs == _CONFIDENCE_SCORE_DEFAULTS.get(
+            attrs.get("confidence", "EXTRACTED"), 1.0
+        ):
+            del attrs["confidence_score"]
+    return attrs
+
+
+def _load_lean(graph_path: str) -> nx.Graph:
+    """Load a node-link graph as ONE undirected ``nx.Graph`` with ``_src``/``_tgt``.
+
+    Equivalent to graphify's ``_load_graph`` followed by ``_traversal_view``
+    (which otherwise rebuilds an undirected copy of the whole graph on every
+    query): edges are added in the order ``_traversal_view`` would add them —
+    grouped by source node in node order, file order within a source — so
+    adjacency order, and therefore traversal and rendering, match.  Markers
+    already in the file win, as in graphify's CLI loader (#2309).
+
+    The JSON dict tree is released record by record while the graph is built.
+    """
+    try:
+        from graphify.serve import check_graph_file_size_cap
+        check_graph_file_size_cap(Path(graph_path).resolve())
+    except ImportError:
+        pass
+    with open(graph_path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    links = data.get("links")
+    if links is None:
+        links = data.get("edges") or []
+    nodes = data.get("nodes") or []
+    if data.get("multigraph"):
+        raise ValueError("ggserve: multigraph global graphs are not supported")
+
+    G = nx.Graph()
+    G.graph.update(data.get("graph") or {})
+    G.graph["_logical_directed"] = bool(data.get("directed", False))
+    del data
+
+    for i, node in enumerate(nodes):
+        nodes[i] = None
+        nid = node.pop("id")
+        G.add_node(nid, **_slim(node, edge=False))
+    del nodes
+
+    # Node position as a DiGraph built from this file would order them: listed
+    # nodes first, then link endpoints seen for the first time, in file order.
+    pos = {nid: i for i, nid in enumerate(G)}
+    for link in links:
+        for end in (link["source"], link["target"]):
+            if end not in pos:
+                pos[end] = len(pos)
+                G.add_node(end)
+    order = sorted(range(len(links)), key=lambda i: pos[links[i]["source"]])
+    del pos
+    for i in order:
+        link = links[i]
+        links[i] = None
+        u = link.pop("source")
+        v = link.pop("target")
+        link.pop("key", None)
+        link.setdefault("_src", u)
+        link.setdefault("_tgt", v)
+        G.add_edge(u, v, **_slim(link, edge=True))
+    del order, links
+
+    try:
+        from graphify.reflect import load_learning_overlay as _llo
+        G.graph["_learning_overlay"] = _llo(Path(graph_path).resolve())
+    except Exception:
+        G.graph["_learning_overlay"] = {}
+    return G
+
+
+def _trim_memory() -> None:
+    """Return freed heap to the OS after a (re)load."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def load(graph_path, manifest_path):
     """Load the global graph and make every hit openable.
 
-    Returns ``(G, stats)``.  graphify's ``_load_graph`` calls ``sys.exit(1)``
-    on corrupt/unreadable JSON, so callers must catch ``BaseException``.
+    Returns ``(G, stats)``.  Corrupt/unreadable JSON raises; callers catch
+    ``BaseException``.
     """
     started = time.monotonic()
     graph_path = str(graph_path)
     manifest_path = str(manifest_path)
 
-    G = _load_graph(graph_path)
+    G = _load_lean(graph_path)
     graph_mtime = os.stat(graph_path).st_mtime
 
     repos = {}
@@ -116,7 +228,7 @@ def load(graph_path, manifest_path):
         if not repo or not src or os.path.isabs(src):
             continue
         display = displays.get(repo, "")
-        data["source_file"] = (
+        data["source_file"] = sys.intern(
             display + "/" + src if display else str(repo) + ":" + src
         )
 
@@ -159,6 +271,17 @@ class State:
             self.key = key
             self.ready = True
 
+    def release(self):
+        """Drop the current graph before a reload, so two never coexist.
+
+        Queries answer 503 until the next ``install``; /health stays up and
+        reports ``ready: false``.
+        """
+        with self.query_lock:
+            self.G = None
+            self.ready = False
+        _trim_memory()
+
 
 def reloader_loop(state: State, poll: float, settle: float) -> None:
     """Initial load, then poll for changes and swap in a fresh copy."""
@@ -173,6 +296,8 @@ def reloader_loop(state: State, poll: float, settle: float) -> None:
             time.sleep(poll)
             continue
         state.install(G, stats, key)
+        del G
+        _trim_memory()
         break
 
     while True:
@@ -193,12 +318,19 @@ def reloader_loop(state: State, poll: float, settle: float) -> None:
         if settled != key:
             continue
 
+        # Release the old graph first: holding it while the new one parses is
+        # what doubled peak memory.  A failed reload leaves the service not
+        # ready; the key is unchanged, so the next tick retries the load.
+        state.release()
         try:
             G, stats = load(state.graph_path, state.manifest_path)
         except BaseException as e:
             print(f"ggserve: reload failed: {e}", file=sys.stderr)
+            _trim_memory()
             continue
         state.install(G, stats, settled)
+        del G
+        _trim_memory()
 
 
 def _safe_key(path):
@@ -263,19 +395,32 @@ def _explain(G, node: str) -> str:
         f"  Community: {data.get('community', '')}",
     ]
 
-    count = 0
-    for n in G.successors(nid):
-        if count >= 40:
-            break
-        out.append(_edge_line(G, nid, n, n, "->"))
-        count += 1
-    for n in G.predecessors(nid):
-        if count >= 40:
-            break
-        out.append(_edge_line(G, n, nid, n, "<-"))
-        count += 1
+    # G is undirected; each edge's _src says which way it really points.
+    # Outgoing first, then incoming, 40 lines in all.  A self-loop is both.
+    outgoing, incoming = [], []
+    for n in G.neighbors(nid):
+        ed = G.get_edge_data(nid, n) or {}
+        if n == nid:
+            outgoing.append(n)
+            incoming.append(n)
+        elif ed.get("_src", nid) == nid:
+            outgoing.append(n)
+        else:
+            incoming.append(n)
+    shown = [(nid, n, "->") for n in outgoing] + [(n, nid, "<-") for n in incoming]
+    for u, v, arrow in shown[:40]:
+        out.append(_edge_line(G, u, v, v if arrow == "->" else u, arrow))
 
     return "\n".join(out) + "\n"
+
+
+def _cap_caches(G) -> None:
+    """Bound graphify's per-graph trigram id-set memo (grows with every query)."""
+    if G is None:
+        return
+    idx = G.graph.get("_trigram_index")
+    if idx is not None and len(idx.get("set_cache", ())) > SET_CACHE_MAX:
+        idx["set_cache"].clear()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -316,7 +461,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if not state.ready:
-            self._send(503, "global graph is still loading — retry in a few seconds")
+            self._send(503, NOT_READY)
             return
 
         if route == "/query":
@@ -327,6 +472,9 @@ class Handler(BaseHTTPRequestHandler):
             budget = _clamp_int(_one(qs, "budget"), 2000, 200, 8000)
             depth = _clamp_int(_one(qs, "depth"), 3, 1, 4)
             with state.query_lock:
+                if state.G is None:
+                    self._send(503, NOT_READY)
+                    return
                 text = _query_graph_text(
                     state.G,
                     q,
@@ -334,6 +482,7 @@ class Handler(BaseHTTPRequestHandler):
                     token_budget=budget,
                     graph_path=state.graph_path,
                 )
+                _cap_caches(state.G)
             stats = state.stats
             header = (
                 f"# global graph · {stats.get('nodes')} nodes · "
@@ -349,7 +498,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, USAGE_PATH)
                 return
             with state.query_lock:
+                if state.G is None:
+                    self._send(503, NOT_READY)
+                    return
                 text = _shortest_path_text(state.G, {"source": a, "target": b})
+                _cap_caches(state.G)
             self._send(200, text)
             return
 
@@ -359,7 +512,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, USAGE_EXPLAIN)
                 return
             with state.query_lock:
+                if state.G is None:
+                    self._send(503, NOT_READY)
+                    return
                 text = _explain(state.G, node)
+                _cap_caches(state.G)
             self._send(200, text)
             return
 
