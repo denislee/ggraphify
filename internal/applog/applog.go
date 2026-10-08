@@ -19,9 +19,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // DefaultMax is how many entries are retained. Entries are small and the
@@ -105,9 +107,27 @@ func (l *Log) SetMirror(w io.Writer) {
 	l.mu.Unlock()
 }
 
-// Add records one entry.
+// MaxEntryBytes bounds one entry's message. The entry cap alone is a count,
+// not a size: two thousand entries of a pasted subprocess dump each would be
+// tens of megabytes. 4 KiB keeps any real diagnostic whole.
+const MaxEntryBytes = 4 << 10
+
+// clip cuts msg to MaxEntryBytes on a UTF-8 boundary and says so. The result is
+// a fresh string, so a clipped entry never pins the larger one it came from.
+func clip(msg string) string {
+	if len(msg) <= MaxEntryBytes {
+		return msg
+	}
+	cut := MaxEntryBytes
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + " … [" + strconv.Itoa(len(msg)-cut) + " bytes clipped]"
+}
+
+// Add records one entry. Messages longer than MaxEntryBytes are clipped.
 func (l *Log) Add(level Level, msg string) {
-	e := Entry{Time: time.Now(), Level: level, Msg: strings.TrimRight(msg, "\n")}
+	e := Entry{Time: time.Now(), Level: level, Msg: clip(strings.TrimRight(msg, "\n"))}
 	l.mu.Lock()
 	l.entries = append(l.entries, e)
 	if len(l.entries) > l.max {
@@ -153,6 +173,12 @@ func (l *Log) Write(p []byte) (int, error) {
 			continue
 		}
 		level, msg := classify(line)
+		// line is a substring of string(p), and so is msg: kept as is, one
+		// short entry would pin the whole write for as long as it is retained.
+		// clip already copies anything it cuts.
+		if len(msg) <= MaxEntryBytes {
+			msg = strings.Clone(msg)
+		}
 		l.Add(level, msg)
 	}
 	return len(p), nil

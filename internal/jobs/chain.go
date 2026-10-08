@@ -61,7 +61,20 @@ func (r *Runner) SubmitChain(steps []ChainStep, done func(ChainResult)) {
 				res.Stopped, res.Err = s, err
 				break
 			}
-			<-j.Done()
+			// Bounded by the runner's life, not by a timeout. A held step
+			// legitimately waits for a Release click for as long as the
+			// person takes, so no deadline is right for it; what makes the
+			// wait pointless is the runner closing, after which nothing will
+			// ever dispatch or release the step and this goroutine — and
+			// whatever done captured — would otherwise live forever.
+			select {
+			case <-j.Done():
+			case <-r.quit:
+				res.Stopped, res.Err = s, errors.New(gfy.Title(s.Kind)+" did not run: the job runner closed")
+			}
+			if res.Err != nil {
+				break
+			}
 
 			r.mu.Lock()
 			status := j.Status

@@ -69,14 +69,6 @@ func TestTail(t *testing.T) {
 	}
 }
 
-func TestLastLine(t *testing.T) {
-	b := New(0)
-	b.WriteString("first\nsecond\n")
-	if got := b.LastLine(); got != "second" {
-		t.Fatalf("LastLine = %q", got)
-	}
-}
-
 // Gen is what lets the UI's render tick skip the whole render — and the cgo
 // calls inside it — when the buffer has not moved.
 func TestGenMovesOnlyOnWrite(t *testing.T) {
@@ -107,7 +99,7 @@ func TestConcurrentWriteAndRead(t *testing.T) {
 		for i := 0; i < 5000; i++ {
 			_ = b.Tail(40)
 			_ = b.Gen()
-			_ = b.LastLine()
+			_ = b.TailBytes(512)
 		}
 	}()
 	wg.Wait()
@@ -148,25 +140,6 @@ func TestTailBytesReturnsAllOfAShortBuffer(t *testing.T) {
 	}
 	if got := b.TailBytes(0); got != "" {
 		t.Errorf("TailBytes(0) = %q, want empty", got)
-	}
-}
-
-// LastLine is documented as the final NON-EMPTY line; a trailing blank line
-// used to reduce a failed job's badge to nothing.
-func TestLastLineSkipsTrailingBlankLines(t *testing.T) {
-	b := New(0)
-	b.WriteString("[graphify watch] No code files found - nothing to rebuild.\n   \n\n")
-	want := "[graphify watch] No code files found - nothing to rebuild."
-	if got := b.LastLine(); got != want {
-		t.Errorf("LastLine() = %q, want %q", got, want)
-	}
-}
-
-func TestLastLineOfAnAllBlankBufferIsEmpty(t *testing.T) {
-	b := New(0)
-	b.WriteString("  \n\t\n\n")
-	if got := b.LastLine(); got != "" {
-		t.Errorf("LastLine() = %q, want empty", got)
 	}
 }
 
@@ -253,8 +226,8 @@ func TestTailBytesSurvivesANewlineFreeStream(t *testing.T) {
 	if got := b.TailBytes(8 << 10); got == "" {
 		t.Fatal("TailBytes returned nothing to persist")
 	}
-	if got := b.LastLine(); !strings.HasPrefix(got, "summarizing 19999/") {
-		t.Errorf("LastLine = %q, want the newest progress line", ellipsis(got))
+	if got := b.Tail(1); !strings.HasPrefix(got, "summarizing 19999/") {
+		t.Errorf("Tail(1) = %q, want the newest progress line", ellipsis(got))
 	}
 }
 

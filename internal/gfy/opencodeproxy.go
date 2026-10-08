@@ -307,23 +307,35 @@ func openCodeProxyHandler() http.Handler {
 		target.Path = strings.TrimSuffix(up.Path, "/") + "/v1" + rest
 		target.RawQuery = r.URL.RawQuery
 
-		// The body is read whole so the log can name the model the client
-		// asked for — the one fact that says which model a job is really
-		// running on. A chunk is at most a few hundred kilobytes, and the
-		// request was never streamed to begin with.
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxProxyBody))
-		if err != nil {
-			applog.Warnf("opencode proxy: reading the request for %s: %v", r.URL.Path, err)
-			http.Error(w, "opencode-go: "+err.Error(), http.StatusBadRequest)
+		// The log names the model the client asked for — the one fact that
+		// says which model a job is really running on — so the body has to be
+		// looked at. It is streamed upstream rather than held whole whenever
+		// the model can be read off its first modelSniffBytes; see
+		// proxyRequestBody. Over maxProxyBody is a 413, never a silent
+		// truncation into broken JSON.
+		if r.ContentLength > maxProxyBody {
+			applog.Warnf("opencode proxy: refused %s %s — %d-byte body is over the %d-byte limit",
+				r.Method, r.URL.Path, r.ContentLength, int64(maxProxyBody))
+			http.Error(w, "opencode-go: request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
-		model := requestModel(body)
+		src := &trackedReader{r: http.MaxBytesReader(w, r.Body, maxProxyBody)}
+		body, length, model, err := proxyRequestBody(src, r.ContentLength)
+		if err != nil {
+			applog.Warnf("opencode proxy: reading the request for %s: %v", r.URL.Path, err)
+			http.Error(w, "opencode-go: "+err.Error(), bodyErrorStatus(err))
+			return
+		}
 		started := time.Now()
 
-		req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
+		}
+		req.ContentLength = length
+		if length == 0 {
+			req.Body = http.NoBody
 		}
 		for k, vs := range r.Header {
 			if strings.EqualFold(k, "Host") || strings.EqualFold(k, "Connection") {
@@ -344,6 +356,13 @@ func openCodeProxyHandler() http.Handler {
 		noteProxyRequest()
 		resp, err := proxyTransport.RoundTrip(req)
 		if err != nil {
+			// A streamed body that failed on the CLIENT side is the
+			// client's fault, and says so the way the whole-body read used to.
+			if berr := src.Err(); berr != nil {
+				applog.Warnf("opencode proxy: reading the request for %s: %v", r.URL.Path, berr)
+				http.Error(w, "opencode-go: "+berr.Error(), bodyErrorStatus(berr))
+				return
+			}
 			applog.Errorf("opencode proxy: %s %s %s model=%s → upstream unreachable after %s: %v",
 				plan.Backend, r.Method, rest, model, time.Since(started).Round(time.Millisecond), err)
 			http.Error(w, "opencode-go: "+err.Error(), http.StatusBadGateway)
@@ -409,6 +428,132 @@ func openCodeProxyHandler() http.Handler {
 // chunk graphify sends is a few hundred kilobytes; this is far above it and
 // still keeps a runaway client from filling memory.
 const maxProxyBody = 64 << 20
+
+// modelSniffBytes is how much of a request body is read ahead to find its
+// "model" before the rest is streamed upstream.
+const modelSniffBytes = 4 << 10
+
+// proxyRequestBody decides how a request body travels upstream, and reads its
+// model on the way. It returns the reader to send, the length to declare, and
+// the model ("-" when there is none).
+//
+// The fast path reads at most modelSniffBytes. A body that ends inside that
+// prefix is parsed whole, exactly as before. A longer one whose top-level
+// "model" is complete within the prefix is streamed: prefix, then the rest of
+// src, never held in memory at once.
+//
+// Otherwise it falls back to reading the whole body (src is already capped at
+// maxProxyBody, so an oversized one fails with *http.MaxBytesError rather than
+// being truncated) and parsing that. The fallback is not rare: the OpenAI
+// Python client serializes "messages" BEFORE "model", so a chat request's
+// model typically sits after the whole prompt. A body of unknown length
+// (chunked) also takes it, so upstream is always sent a Content-Length, as it
+// always was.
+func proxyRequestBody(src io.Reader, declared int64) (io.Reader, int64, string, error) {
+	prefix := make([]byte, modelSniffBytes)
+	n, err := io.ReadFull(src, prefix)
+	prefix = prefix[:n]
+	switch {
+	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
+		return bytes.NewReader(prefix), int64(n), requestModel(prefix), nil
+	case err != nil:
+		return nil, 0, "-", err
+	}
+	if declared >= 0 {
+		if model, ok := sniffModel(prefix); ok {
+			return io.MultiReader(bytes.NewReader(prefix), src), declared, model, nil
+		}
+	}
+	rest, err := io.ReadAll(src)
+	if err != nil {
+		return nil, 0, "-", err
+	}
+	body := append(prefix, rest...)
+	return bytes.NewReader(body), int64(len(body)), requestModel(body), nil
+}
+
+// sniffModel reads the top-level "model" string out of the first bytes of a
+// JSON object. ok is false when the prefix ends before that is decided; a
+// prefix that is decidedly not a JSON object, or an object whose top level
+// closes without a model, is "-" and ok. Key matching is case-insensitive, as
+// json.Unmarshal's is, so the answer agrees with requestModel's.
+func sniffModel(prefix []byte) (model string, ok bool) {
+	dec := json.NewDecoder(bytes.NewReader(prefix))
+	undecided := func(err error) bool {
+		return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+	}
+	tok, err := dec.Token()
+	if err != nil {
+		return "-", !undecided(err)
+	}
+	if d, isDelim := tok.(json.Delim); !isDelim || d != '{' {
+		return "-", true
+	}
+	for {
+		tok, err = dec.Token()
+		if err != nil {
+			return "-", !undecided(err)
+		}
+		key, isKey := tok.(string)
+		if !isKey {
+			return "-", true // the closing '}': no model at the top level
+		}
+		if strings.EqualFold(key, "model") {
+			var v json.RawMessage
+			if err := dec.Decode(&v); err != nil {
+				return "-", !undecided(err)
+			}
+			var m string
+			if json.Unmarshal(v, &m) != nil || m == "" {
+				return "-", true
+			}
+			return m, true
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return "-", !undecided(err)
+		}
+	}
+}
+
+// bodyErrorStatus is the status a failed client-body read answers with: 413
+// for one over maxProxyBody, 400 for anything else.
+func bodyErrorStatus(err error) int {
+	var tooBig *http.MaxBytesError
+	if errors.As(err, &tooBig) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
+}
+
+// trackedReader remembers the first error its reader returned other than EOF,
+// so a RoundTrip that failed while streaming the body can be told apart from
+// an upstream that failed by itself. The transport reads it on its own
+// goroutine, hence the lock.
+type trackedReader struct {
+	r   io.Reader
+	mu  sync.Mutex
+	err error
+}
+
+func (t *trackedReader) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.mu.Lock()
+		if t.err == nil {
+			t.err = err
+		}
+		t.mu.Unlock()
+	}
+	return n, err
+}
+
+// Err is the first non-EOF error Read returned, or nil.
+func (t *trackedReader) Err() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err
+}
 
 // requestModel is the "model" field of an OpenAI-shaped request body, or "-"
 // when there is none (GET /models, or a body that is not JSON).

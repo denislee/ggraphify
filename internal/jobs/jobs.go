@@ -141,6 +141,22 @@ type Job struct {
 	// subscribing to the event channel, which has a single consumer (the UI)
 	// and drops events under load — neither is a sound completion signal.
 	done chan struct{}
+	// errStr is Err.Error(), computed once. Snapshot runs many times a second
+	// across every retained job, and a failure's error text does not change
+	// after the job has finished.
+	errStr string
+}
+
+// errString is Err's text, rendered at most once. Called with the runner's
+// lock held, which is what makes the cache write safe.
+func (j *Job) errString() string {
+	if j.Err == nil {
+		return ""
+	}
+	if j.errStr == "" {
+		j.errStr = j.Err.Error()
+	}
+	return j.errStr
 }
 
 // Done returns a channel closed when the job has finished, whether it
@@ -435,7 +451,15 @@ type Runner struct {
 	nextID  uint64
 	queue   []*Job
 	running map[uint64]*Job
-	history []*Job
+	// history is a ring of at most opts.History finished jobs. Once full,
+	// histNext is the slot holding the oldest, which the next retire
+	// overwrites; order within the ring means nothing to any reader (Snapshot
+	// sorts by id, Get scans for one), so nothing pays to keep it sorted.
+	history  []*Job
+	histNext int
+	// fullLogs is the last few failures, oldest first, whose logs retire left
+	// at full size. Everything else is compacted on retirement.
+	fullLogs []*Job
 	// busyRepo is the set of resources with a mutating job in flight. Two
 	// mutating jobs against one output directory would race each other's
 	// graph.json; read-only jobs are unaffected and run freely. The global
@@ -695,8 +719,8 @@ func (r *Runner) Restore(js []*Job) int {
 		n++
 		if j.Status.Done() {
 			j.finish()
-			// retire prepends, so feeding the history oldest-first leaves it
-			// newest-first, which is the order every reader assumes.
+			// Fed oldest-first, so a full history drops the oldest restored
+			// jobs first, as it always has.
 			r.retire(j)
 			continue
 		}
@@ -1094,6 +1118,25 @@ func (r *Runner) Snapshot() []Snapshot {
 	return out
 }
 
+// Live returns the queued and running jobs only, newest first — Snapshot
+// without the history. It is for the per-tick callers (the dock, the activity
+// strip) that never render a finished job: copying and sorting up to
+// DefaultHistory retired jobs under the runner's lock, several times a second,
+// to throw them away again was most of what those ticks cost.
+func (r *Runner) Live() []Snapshot {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]Snapshot, 0, len(r.queue)+len(r.running))
+	for _, j := range r.queue {
+		out = append(out, snapshot(j))
+	}
+	for _, j := range r.running {
+		out = append(out, snapshot(j))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
+	return out
+}
+
 // Active is the count of queued and running jobs, for the status bar.
 func (r *Runner) Active() (queued, running int) {
 	r.mu.Lock()
@@ -1391,6 +1434,7 @@ func (r *Runner) run(j *Job, ctx context.Context, cancel context.CancelFunc) {
 	default:
 		j.Status = Failed
 		j.Err = err
+		j.errStr = err.Error()
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			j.Exit = ee.ExitCode()
@@ -1458,9 +1502,57 @@ func (r *Runner) reap(ctx context.Context, exited <-chan struct{}, j *Job, cmd *
 
 // retire moves a finished job into the bounded history. Called with the lock.
 func (r *Runner) retire(j *Job) {
-	r.history = append([]*Job{j}, r.history...)
-	if len(r.history) > r.opts.History {
-		r.history = r.history[:r.opts.History]
+	r.compactRetired(j)
+	if len(r.history) < r.opts.History {
+		r.history = append(r.history, j)
+		return
+	}
+	// Full: overwrite the oldest in place. The previous version prepended,
+	// which reallocated and copied all opts.History slots on every completion.
+	old := r.history[r.histNext]
+	r.history[r.histNext] = j
+	r.histNext = (r.histNext + 1) % len(r.history)
+	r.dropFullLog(old)
+}
+
+// RetiredLogBytes is how much of a finished job's log retire keeps — enough
+// for the command header's neighbourhood and the end of the run, which is
+// what a finished row and the persisted session read.
+const RetiredLogBytes = 32 << 10
+
+// KeepFullFailures is how many of the most recent failures keep their whole
+// log, because a failure is the one finished job somebody reads all of.
+const KeepFullFailures = 10
+
+// compactRetired shrinks a finishing job's log, except for the most recent
+// KeepFullFailures failures; a failure pushed out of that window is compacted
+// then. Called with the lock held.
+func (r *Runner) compactRetired(j *Job) {
+	if j.Log == nil {
+		return
+	}
+	if j.Status != Failed {
+		j.Log.Compact(RetiredLogBytes)
+		return
+	}
+	r.fullLogs = append(r.fullLogs, j)
+	if len(r.fullLogs) > KeepFullFailures {
+		oldest := r.fullLogs[0]
+		if oldest.Log != nil {
+			oldest.Log.Compact(RetiredLogBytes)
+		}
+		r.fullLogs = append(r.fullLogs[:0], r.fullLogs[1:]...)
+	}
+}
+
+// dropFullLog forgets a job that has left the history, so fullLogs does not
+// keep its log alive after nothing else can reach it.
+func (r *Runner) dropFullLog(j *Job) {
+	for i, f := range r.fullLogs {
+		if f == j {
+			r.fullLogs = append(r.fullLogs[:i], r.fullLogs[i+1:]...)
+			return
+		}
 	}
 }
 
@@ -1473,9 +1565,7 @@ func snapshot(j *Job) Snapshot {
 		Queued: j.Queued, Started: j.Started, Ended: j.Ended, Log: j.Log,
 		Paused: j.paused, PausedAt: j.pausedAt, PausedFor: j.pausedFor,
 	}
-	if j.Err != nil {
-		s.Err = j.Err.Error()
-	}
+	s.Err = j.errString()
 	return s
 }
 

@@ -562,8 +562,13 @@ func fetchOpenCodeModelIDs(ctx context.Context, plan OpenCodePlan) ([]string, er
 }
 
 // fetchModelsDev reads the published prices and context windows.
+//
+// models.dev publishes every provider it knows in one document, and this needs
+// one of them. The document is walked token by token at the top level and only
+// plan.ModelsDevProvider's value is decoded; every other provider is skipped
+// without being materialized.
 func fetchModelsDev(ctx context.Context, plan OpenCodePlan) (map[string]OpenCodeModel, error) {
-	var doc map[string]struct {
+	var provider struct {
 		Models map[string]struct {
 			Name string `json:"name"`
 			Cost struct {
@@ -576,11 +581,16 @@ func fetchModelsDev(ctx context.Context, plan OpenCodePlan) (map[string]OpenCode
 			} `json:"limit"`
 		} `json:"models"`
 	}
-	if err := getJSON(ctx, ModelsDevURL, &doc); err != nil {
+	var found bool
+	err := getBody(ctx, ModelsDevURL, func(r io.Reader) error {
+		var err error
+		found, err = decodeMember(json.NewDecoder(r), plan.ModelsDevProvider, &provider)
+		return err
+	})
+	if err != nil {
 		return nil, err
 	}
-	provider, ok := doc[plan.ModelsDevProvider]
-	if !ok {
+	if !found {
 		return nil, errors.New(ModelsDevURL + ": no " + plan.ModelsDevProvider + " provider")
 	}
 	out := make(map[string]OpenCodeModel, len(provider.Models))
@@ -595,7 +605,62 @@ func fetchModelsDev(ctx context.Context, plan OpenCodePlan) (map[string]OpenCode
 	return out, nil
 }
 
+// decodeMember decodes the value of one top-level key of a JSON object into
+// into, skipping every other member token by token, and stops as soon as it
+// has it. found is false when the object has no such key.
+func decodeMember(dec *json.Decoder, key string, into any) (found bool, err error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return false, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return false, errors.New("want a JSON object at the top level")
+	}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return false, err
+		}
+		if k, _ := tok.(string); k == key {
+			return true, dec.Decode(into)
+		}
+		if err := skipValue(dec); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// skipValue consumes one JSON value without building it.
+func skipValue(dec *json.Decoder) error {
+	depth := 0
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				depth++
+			default:
+				depth--
+			}
+		}
+		if depth == 0 {
+			return nil
+		}
+	}
+}
+
 func getJSON(ctx context.Context, url string, into any) error {
+	return getBody(ctx, url, func(r io.Reader) error {
+		return json.NewDecoder(r).Decode(into)
+	})
+}
+
+// getBody GETs url and hands its body, capped at 32 MiB, to read.
+func getBody(ctx context.Context, url string, read func(io.Reader) error) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -611,7 +676,7 @@ func getJSON(ctx context.Context, url string, into any) error {
 	if resp.StatusCode != http.StatusOK {
 		return &httpStatusError{url: url, code: resp.StatusCode}
 	}
-	return json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(into)
+	return read(io.LimitReader(resp.Body, 32<<20))
 }
 
 type httpStatusError struct {

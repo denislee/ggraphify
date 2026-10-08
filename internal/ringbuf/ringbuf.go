@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"strings"
 	"sync"
+	"unsafe"
 )
 
 // DefaultCap is the per-job budget: enough that a failing run's traceback is
@@ -82,7 +83,7 @@ func (b *Buf) Write(p []byte) (int, error) {
 	// So the return is honoured here the way a terminal honours it: it erases
 	// the unterminated line it returns to. A progress stream then occupies
 	// one line rather than the whole budget, the header and every real line
-	// of output stay put, and Tail/LastLine/FirstErrorLine downstream see
+	// of output stay put, and Tail/TailBytes/FirstErrorLine downstream see
 	// something a human can read instead of one megabyte-long "line".
 	if b.pendingCR {
 		b.pendingCR = false
@@ -94,17 +95,17 @@ func (b *Buf) Write(p []byte) (int, error) {
 	for len(p) > 0 {
 		i := bytes.IndexByte(p, '\r')
 		if i < 0 {
-			b.buf = append(b.buf, p...)
+			b.put(p)
 			break
 		}
-		b.buf = append(b.buf, p[:i]...)
+		b.put(p[:i])
 		p = p[i+1:]
 		switch {
 		case len(p) == 0:
 			// Decided on the next write, which knows whether an '\n' follows.
 			b.pendingCR = true
 		case p[0] == '\n':
-			b.buf = append(b.buf, '\n')
+			b.put(newline)
 			p = p[1:]
 			continue
 		default:
@@ -113,30 +114,108 @@ func (b *Buf) Write(p []byte) (int, error) {
 		}
 		break
 	}
-
-	if len(b.buf) <= b.cap {
-		return n, nil
-	}
-	// Trim to the first newline at or after the low-water mark, so the buffer
-	// always starts at a line boundary and the UI never renders half a line.
-	over := len(b.buf) - b.lowWater()
-	if over < 0 {
-		over = 0
-	}
-	if i := bytes.IndexByte(b.buf[over:], '\n'); i >= 0 {
-		over += i + 1
-	}
-	// No newline at or after the mark: what is retained is one enormous line,
-	// and it is cut at the mark rather than dropped whole. The newest bytes
-	// are the ones worth keeping — a traceback's last frame, the line that
-	// says why the run failed — and discarding them left the reader with an
-	// empty log, which is strictly less than half a line.
-	b.dropped += bytes.Count(b.buf[:over], []byte{'\n'})
-	// Copy down rather than reslice: reslicing keeps the original backing
-	// array alive forever, which defeats the point of a bounded buffer.
-	m := copy(b.buf, b.buf[over:])
-	b.buf = b.buf[:m]
 	return n, nil
+}
+
+// newline is put's argument for a CRLF folded to LF, as a package-level slice
+// so that path does not allocate.
+var newline = []byte{'\n'}
+
+// put appends q, evicting whole lines off the front FIRST so that neither the
+// retained text nor the backing array ever exceeds cap. Caller holds mu.
+//
+// Appending first and trimming afterwards — what Write used to do — kept the
+// bytes within cap but not the array: append grows by doubling, so a buffer
+// that ran past cap once held an array of up to twice cap for the rest of its
+// life, and copy-down never gives it back. Two hundred retired jobs is two
+// hundred such arrays.
+//
+// The trim itself is unchanged: the concatenation of buf and q is cut to the
+// first newline at or after the low-water mark, or at the mark itself when
+// what is retained is one enormous line.
+func (b *Buf) put(q []byte) {
+	if len(q) == 0 {
+		return
+	}
+	need := len(b.buf) + len(q)
+	if need > b.cap {
+		// over indexes the virtual concatenation buf+q.
+		over := need - b.lowWater()
+		if over < len(b.buf) {
+			if i := bytes.IndexByte(b.buf[over:], '\n'); i >= 0 {
+				over += i + 1
+			} else if i := bytes.IndexByte(q, '\n'); i >= 0 {
+				over = len(b.buf) + i + 1
+			}
+		} else if i := bytes.IndexByte(q[over-len(b.buf):], '\n'); i >= 0 {
+			over += i + 1
+		}
+		if over <= len(b.buf) {
+			b.dropped += bytes.Count(b.buf[:over], newline)
+			// Copy down rather than reslice: reslicing keeps the original
+			// backing array alive forever, which defeats the point.
+			m := copy(b.buf, b.buf[over:])
+			b.buf = b.buf[:m]
+		} else {
+			k := over - len(b.buf)
+			b.dropped += bytes.Count(b.buf, newline) + bytes.Count(q[:k], newline)
+			b.buf = b.buf[:0]
+			q = q[k:]
+		}
+		need = len(b.buf) + len(q)
+	}
+	// Grow by hand so the array is capped at cap rather than at whatever
+	// append's doubling lands on.
+	if need > cap(b.buf) {
+		c := 2 * cap(b.buf)
+		if c < need {
+			c = need
+		}
+		if c > b.cap {
+			c = b.cap
+		}
+		nb := make([]byte, len(b.buf), c)
+		copy(nb, b.buf)
+		b.buf = nb
+	}
+	b.buf = append(b.buf, q...)
+}
+
+// Compact keeps at most the newest n bytes, cut at a line boundary the way
+// TailBytes cuts, in a slice of exactly that size — releasing whatever larger
+// array the buffer grew while its job was running. The runner calls it when a
+// job retires: a finished job's log is read, not written, and two hundred of
+// them at full size is the board's largest idle allocation. Lines it drops
+// count towards the elision note like any other eviction. A non-positive n is
+// a no-op. Writing after Compact is allowed; cap is unchanged.
+func (b *Buf) Compact(n int) {
+	if n <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	cut := 0
+	if len(b.buf) > n {
+		cut = len(b.buf) - n
+		if b.buf[cut-1] != '\n' {
+			if i := bytes.IndexByte(b.buf[cut:], '\n'); i >= 0 {
+				cut += i + 1
+			}
+		}
+	}
+	if cut == 0 && cap(b.buf) == len(b.buf) {
+		return
+	}
+	var nb []byte
+	if rest := len(b.buf) - cut; rest > 0 {
+		nb = make([]byte, rest)
+		copy(nb, b.buf[cut:])
+	}
+	if cut > 0 {
+		b.dropped += bytes.Count(b.buf[:cut], newline)
+		b.gen++
+	}
+	b.buf = nb
 }
 
 // eraseLine drops the unterminated line at the end of the buffer — what a
@@ -171,7 +250,13 @@ func (b *Buf) lowWater() int {
 }
 
 // WriteString is Write for a string, without the conversion.
-func (b *Buf) WriteString(s string) (int, error) { return b.Write([]byte(s)) }
+//
+// The bytes are viewed in place rather than copied by []byte(s): Write only
+// reads p and copies what it keeps, so the view is never written through and
+// never outlives the call.
+func (b *Buf) WriteString(s string) (int, error) {
+	return b.Write(unsafe.Slice(unsafe.StringData(s), len(s)))
+}
 
 // String returns the retained text, prefixed with an elision note when lines
 // have been dropped.
@@ -239,30 +324,6 @@ func (b *Buf) Tail(n int) string {
 		}
 	}
 	return string(b.buf)
-}
-
-// LastLine returns the final non-empty line, which is what a row badge shows
-// for a failed job.
-func (b *Buf) LastLine() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	// Walk back over blank and whitespace-only lines rather than stopping at
-	// the last one. A subprocess that signs off with a trailing blank line —
-	// and graphify does, on several paths — would otherwise reduce the badge
-	// to an empty string and hide the very line that says why it failed.
-	s := strings.TrimRight(string(b.buf), "\n")
-	for s != "" {
-		line := s
-		if i := strings.LastIndexByte(s, '\n'); i >= 0 {
-			line, s = s[i+1:], s[:i]
-		} else {
-			s = ""
-		}
-		if t := strings.TrimSpace(line); t != "" {
-			return t
-		}
-	}
-	return ""
 }
 
 // Gen is a counter bumped on every write. The UI's render tick compares it
