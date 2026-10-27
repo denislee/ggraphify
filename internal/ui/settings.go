@@ -210,6 +210,18 @@ func (a *App) settingsGeneral() *adw.PreferencesPage {
 	}
 	look.Add(scheme)
 
+	anim := adw.NewSwitchRow()
+	anim.SetTitle("Animations")
+	anim.SetSubtitle("Crossfades, spinning spinners and pulsing progress bars. Off keeps the interface still")
+	anim.SetActive(a.opts.Store.Settings().Animations)
+	anim.NotifyProperty("active", func() {
+		s := a.opts.Store.Settings()
+		s.Animations = anim.Active()
+		a.opts.Store.SetSettings(s)
+		a.applyAnimations()
+	})
+	look.Add(anim)
+
 	cols := adw.NewExpanderRow()
 	cols.SetTitle("Columns")
 	cols.SetSubtitle("Which columns the board shows")

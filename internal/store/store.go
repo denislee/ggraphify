@@ -120,6 +120,12 @@ type Settings struct {
 	// written before this setting existed reads back as.
 	ClaudeAccount string `json:"claude_account,omitempty"`
 
+	// Animations turns the interface's motion back on: stack crossfades,
+	// spinning spinners, pulsing progress bars, libadwaita's own transitions.
+	// Off by default — the zero value, so a state file written before this
+	// existed reads back as a still interface.
+	Animations bool `json:"animations,omitempty"`
+
 	// The ollama lifecycle: the board starts the local model server when a
 	// job needs it and stops it again once nothing does, so a machine that
 	// uses a local model occasionally does not keep several gigabytes of

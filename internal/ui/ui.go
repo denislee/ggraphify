@@ -442,6 +442,7 @@ func (a *App) Run(args []string) int {
 
 func (a *App) activate() {
 	a.applyColorScheme()
+	a.applyAnimations()
 	a.loadCSS()
 
 	set := a.opts.Store.Settings()

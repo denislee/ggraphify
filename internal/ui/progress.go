@@ -136,7 +136,12 @@ func setJobProgress(p *gtk.ProgressBar, s *jobs.Snapshot) {
 		p.SetTooltipText(text + " complete, by the job's own account")
 		return
 	}
-	// Nothing to read: move the bar without claiming a number.
-	p.Pulse()
+	// Nothing to read: move the bar without claiming a number — or, with
+	// animations off, leave it as a still, empty track.
+	if animationsOn.Load() {
+		p.Pulse()
+	} else {
+		p.SetFraction(0)
+	}
 	p.SetTooltipText("running — this job does not report a percentage")
 }
