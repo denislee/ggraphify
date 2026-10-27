@@ -309,3 +309,57 @@ func TestDriftHonoursLeadingDoubleStar(t *testing.T) {
 		t.Fatalf("DriftAdded = %d %v, want [real.go]", g.DriftAdded, g.DriftFiles.Added)
 	}
 }
+
+// W11: discover boards a symlinked checkout and keeps the link as the repo
+// path. WalkDir Lstats its root, so the walk used to visit the link as one
+// non-directory entry and report no drift at all, forever.
+func TestDriftWalksASymlinkedCheckout(t *testing.T) {
+	f := newFixture(t)
+	f.write("a.go", "package a")
+	f.write("b.go", "package a")
+	f.manifest(map[string]float64{"a.go": 1})
+	link := filepath.Join(t.TempDir(), "foo")
+	if err := os.Symlink(f.repo, link); err != nil {
+		t.Fatal(err)
+	}
+	d := DriftOf(link, filepath.Join(link, "graphify-out"), nil, Baseline{})
+	if len(d.Added) != 1 || d.Added[0] != "b.go" || len(d.Changed) != 1 || d.Changed[0] != "a.go" {
+		t.Fatalf("drift through link = %+v, want Added [b.go] Changed [a.go]", d)
+	}
+}
+
+// W12: only the configured out directory is skipped, not every directory that
+// happens to share its basename at any depth.
+func TestDriftSkipsOnlyTheExactOutDir(t *testing.T) {
+	repo := t.TempDir()
+	out := filepath.Join(repo, ".kb", "graph")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f := &fixture{t: t, repo: repo, out: out}
+	f.write("a.go", "package a")
+	f.write("internal/graph/new.go", "package graph")
+	f.write(".kb/graph/cache/x.go", "package x")
+	f.manifest(map[string]float64{"a.go": future()})
+	d := DriftOf(repo, out, nil, Baseline{})
+	if len(d.Added) != 1 || d.Added[0] != "internal/graph/new.go" {
+		t.Fatalf("Added = %v, want exactly [internal/graph/new.go]", d.Added)
+	}
+
+	// An absolute out elsewhere must not hide cmd/<its basename>/ either.
+	ext := filepath.Join(t.TempDir(), "acquiring")
+	if err := os.MkdirAll(ext, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(repo, ".kb")); err != nil {
+		t.Fatal(err)
+	}
+	f.out = ext
+	f.manifest(map[string]float64{"a.go": future()})
+	f.write("cmd/acquiring/main.go", "package main")
+	d = DriftOf(repo, ext, nil, Baseline{})
+	want := []string{"cmd/acquiring/main.go", "internal/graph/new.go"}
+	if len(d.Added) != 2 || d.Added[0] != want[0] || d.Added[1] != want[1] {
+		t.Fatalf("Added = %v, want %v", d.Added, want)
+	}
+}

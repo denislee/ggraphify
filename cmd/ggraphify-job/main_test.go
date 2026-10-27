@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -20,7 +22,7 @@ import (
 // trap here, a signal that lands a moment late would take the default action
 // and kill the test run instead of failing it.
 func TestMain(m *testing.M) {
-	signal.Notify(make(chan os.Signal, 1), os.Interrupt)
+	signal.Notify(make(chan os.Signal, 1), os.Interrupt, syscall.SIGTERM)
 	os.Exit(m.Run())
 }
 
@@ -135,5 +137,105 @@ func TestEarlyExitsReturnTheirCode(t *testing.T) {
 	}
 	if code, _ := runWith(t, "exit 0", "-kind", "no-such-kind", "-repo", repo); code != 2 {
 		t.Errorf("unknown kind exit code = %d, want 2", code)
+	}
+}
+
+// capture runs f with os.Stdout and os.Stderr pointed at files, and returns
+// what each received.
+func capture(t *testing.T, f func()) (stdout, stderr string) {
+	t.Helper()
+	dir := t.TempDir()
+	o, err := os.Create(filepath.Join(dir, "stdout"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := os.Create(filepath.Join(dir, "stderr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	savedOut, savedErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = o, e
+	func() {
+		defer func() { os.Stdout, os.Stderr = savedOut, savedErr }()
+		f()
+		// Anything run() left running on its way out — the interrupt watcher
+		// is the one that matters — gets a moment to write before the files
+		// are swapped back.
+		time.Sleep(100 * time.Millisecond)
+	}()
+	o.Close()
+	e.Close()
+	ob, _ := os.ReadFile(o.Name())
+	eb, _ := os.ReadFile(e.Name())
+	return string(ob), string(eb)
+}
+
+// W5: a log well past the ring buffer's cap reaches stdout whole — every
+// line, in order, through to the last one — rather than going silent once the
+// buffer starts evicting, or losing its tail when the job retires.
+func TestStdoutCarriesALogPastTheBufferCap(t *testing.T) {
+	repo := t.TempDir()
+	const n = 40000 // ~470 KiB of output, well past ringbuf.DefaultCap
+	var code int
+	out, _ := capture(t, func() {
+		code, _ = runWith(t, `i=1; while [ $i -le `+strconv.Itoa(n)+` ]; do echo "output line $i"; i=$((i+1)); done`,
+			"-kind", "update", "-repo", repo, "-y")
+	})
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.HasPrefix(out, "$ ") {
+		t.Errorf("stdout does not open with the command header: %.80q", out)
+	}
+	if strings.Contains(out, "elided") {
+		t.Error("stdout carries the ring buffer's elision note; it should carry the stream")
+	}
+	next := 1
+	for _, line := range strings.Split(out, "\n") {
+		if rest, ok := strings.CutPrefix(line, "output line "); ok {
+			if rest != strconv.Itoa(next) {
+				t.Fatalf("stdout skipped from line %d to %q", next, rest)
+			}
+			next++
+		}
+	}
+	if next != n+1 {
+		t.Fatalf("stdout ended at line %d of %d", next-1, n)
+	}
+}
+
+// W28: a job that simply finishes must not be reported as interrupted.
+func TestNormalExitIsNotReportedAsAnInterrupt(t *testing.T) {
+	repo := t.TempDir()
+	var code int
+	_, errOut := capture(t, func() {
+		code, _ = runWith(t, "echo done; exit 0", "-kind", "update", "-repo", repo, "-y")
+	})
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	// The false report came from the watcher waking on the deferred stop(),
+	// asynchronously; capture waits for it before handing stderr back.
+	if strings.Contains(errOut, "cancelling") {
+		t.Errorf("a normal exit printed an interrupt:\n%s", errOut)
+	}
+}
+
+// W28: SIGTERM is reported as 143 (128+15), not as SIGINT's 130.
+func TestSIGTERMExitsWith143(t *testing.T) {
+	repo := t.TempDir()
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+	}()
+	var code int
+	_, errOut := capture(t, func() {
+		code, _ = runWith(t, "sleep 30", "-kind", "update", "-repo", repo, "-y")
+	})
+	if code != 143 {
+		t.Errorf("exit code = %d, want 143 (terminated)", code)
+	}
+	if !strings.Contains(errOut, "terminated — cancelling the job") {
+		t.Errorf("stderr does not name the signal:\n%s", errOut)
 	}
 }

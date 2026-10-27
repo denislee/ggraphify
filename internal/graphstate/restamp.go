@@ -71,9 +71,15 @@ func Restamp(out, head string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	renamed := false
 	defer func() {
-		tmp.Close()
-		os.Remove(tmp.Name()) // no-op once the rename has taken it
+		if renamed {
+			return
+		}
+		// Cleanup of a write that already failed: the error that matters is
+		// the one being returned, and these can only add noise to it.
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
 	}()
 
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
@@ -103,6 +109,7 @@ func Restamp(out, head string) (bool, error) {
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return false, err
 	}
+	renamed = true
 
 	// Best effort, and deliberately not fatal: the report is a rendering of
 	// the graph, and a stale line in it is worth fixing but not worth failing
@@ -178,7 +185,39 @@ func restampReport(out, head string) {
 	if !changed {
 		return
 	}
-	_ = os.WriteFile(path, []byte(strings.Join(lines, "\n")), fi.Mode().Perm())
+	// Through a temp file and a rename, like graph.json: an in-place write
+	// that dies half way — a crash, a full disk — truncates the report agents
+	// are pointed at, which is worse than the stale line it was fixing.
+	_ = writeFileAtomic(path, ".GRAPH_REPORT.stamp-*", []byte(strings.Join(lines, "\n")), fi.Mode().Perm())
+}
+
+// writeFileAtomic replaces path with data via a synced temp file in the same
+// directory and a rename, so a reader sees the old file or the new one and
+// never a partial one.
+func writeFileAtomic(path, pattern string, data []byte, perm os.FileMode) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), pattern)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // MaxReportBytes is the ceiling on a GRAPH_REPORT.md this package will read

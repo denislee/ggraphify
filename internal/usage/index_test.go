@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -464,5 +466,165 @@ func TestPendingSurvivesASaveAndReload(t *testing.T) {
 	got := Load(path)
 	if c, ok := got.Pending["toolu_x"]; !ok || c.Event.Verb != "query" {
 		t.Fatalf("pending after reload = %+v, want the call preserved", got.Pending)
+	}
+}
+
+// rewriteTranscript replaces a transcript's contents wholesale, the way a
+// rotation or a rewrite does, rather than appending to it.
+func rewriteTranscript(t *testing.T, path string, recs ...map[string]any) {
+	t.Helper()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	acct := filepath.Dir(filepath.Dir(filepath.Dir(path)))
+	writeTranscript(t, acct, strings.TrimSuffix(filepath.Base(path), ".jsonl"), recs...)
+}
+
+// W19: a transcript that shrinks — rotated, or rewritten without some of its
+// lines — is re-read from the start, and every event it still carries used to
+// be counted a second time.
+func TestUpdateDoesNotDoubleCountAShrunkTranscript(t *testing.T) {
+	dir := t.TempDir()
+	acct := filepath.Join(dir, ".claude")
+	repo := filepath.Join(dir, "repo")
+	now := time.Now()
+	a := bashRec(repo, "sess-1", now.Add(-3*time.Hour), `graphify query "a"`)
+	b := bashRec(repo, "sess-1", now.Add(-2*time.Hour), `graphify query "b"`)
+	c := bashRec(repo, "sess-1", now.Add(-1*time.Hour), `graphify query "c"`)
+	path := writeTranscript(t, acct, "sess-1", a, b, c)
+
+	x := New()
+	opts := Options{Accounts: []Account{{Name: "default", Dir: acct}}, Now: now}
+	if err := x.Update(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if got := x.Summarize(Window{Days: 7, Now: now}).Events; got != 3 {
+		t.Fatalf("setup: events = %d, want 3", got)
+	}
+
+	rewriteTranscript(t, path, b, c) // shorter: the old offset is past the end
+	if err := x.Update(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if got := x.Summarize(Window{Days: 7, Now: now}).Events; got != 3 {
+		t.Fatalf("events after shrink = %d, want 3 — b and c were counted again", got)
+	}
+
+	// What is genuinely new after the rewrite still counts.
+	writeTranscript(t, acct, "sess-1", bashRec(repo, "sess-1", now, `graphify update .`))
+	if err := x.Update(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if got := x.Summarize(Window{Days: 7, Now: now}).Events; got != 4 {
+		t.Fatalf("events after append = %d, want 4", got)
+	}
+}
+
+// W19: a transcript rewritten and grown past the old offset no longer carries
+// what was read up to it; resuming there starts mid-line in different content.
+// It must be read as a replacement: old events not recounted, new ones counted.
+func TestUpdateReadsAGrownRewriteAsAReplacement(t *testing.T) {
+	dir := t.TempDir()
+	acct := filepath.Join(dir, ".claude")
+	repo := filepath.Join(dir, "repo")
+	now := time.Now()
+	a := bashRec(repo, "sess-1", now.Add(-3*time.Hour), `graphify query "a"`)
+	b := bashRec(repo, "sess-1", now.Add(-2*time.Hour), `graphify query "b"`)
+	path := writeTranscript(t, acct, "sess-1", a, b)
+
+	x := New()
+	opts := Options{Accounts: []Account{{Name: "default", Dir: acct}}, Now: now}
+	if err := x.Update(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The same two calls behind a long new first line, then two new calls:
+	// bigger than before, and nothing at the old offset lines up.
+	pad := map[string]any{"type": "user", "timestamp": now.Add(-4 * time.Hour).Format(time.RFC3339Nano),
+		"cwd": repo, "sessionId": "sess-1", "message": map[string]any{"content": strings.Repeat("x", 300)}}
+	rewriteTranscript(t, path, pad, a, b,
+		bashRec(repo, "sess-1", now.Add(-time.Hour), `graphify query "c"`),
+		bashRec(repo, "sess-1", now.Add(-time.Minute), `graft ask "d" --source`))
+	if nfi, err := os.Stat(path); err != nil || nfi.Size() <= fi.Size() {
+		t.Fatalf("setup: rewrite did not grow the file (%v)", err)
+	}
+	if err := x.Update(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	s := x.Summarize(Window{Days: 7, Now: now})
+	if s.Events != 4 || s.ByTool[Graphify] != 3 || s.ByTool[Graft] != 1 {
+		t.Fatalf("events = %d %v, want 4: a and b once, c and d new", s.Events, s.ByTool)
+	}
+}
+
+// W34: Save goes through a unique temp file and a rename. Concurrent savers —
+// the board's background save, the window-close save, ggraphify-scan — each
+// get their own temp file, the published file is always one whole encode, no
+// temp file is left behind, and the result is still private (0600).
+func TestSaveIsAtomicUnderConcurrentSavers(t *testing.T) {
+	dir := t.TempDir()
+	acct := filepath.Join(dir, ".claude")
+	repo := filepath.Join(dir, "repo")
+	now := time.Now()
+	var recs []map[string]any
+	for i := 0; i < 200; i++ {
+		recs = append(recs, bashRec(repo, "sess-1", now.Add(-time.Duration(i)*time.Minute), `graphify query "x"`))
+	}
+	writeTranscript(t, acct, "sess-1", recs...)
+	path := DefaultPath(dir)
+
+	// A stale fixed-name temp from an older build must not be touched or reused.
+	legacy := path + ".tmp"
+	if err := os.WriteFile(legacy, []byte("half"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		x := New()
+		if err := x.Update(context.Background(), Options{Accounts: []Account{{Name: "default", Dir: acct}}, Now: now}); err != nil {
+			t.Fatal(err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				x.mu.Lock()
+				x.gen++ // force a write every time
+				x.mu.Unlock()
+				if err := x.Save(path); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := Load(path).Summarize(Window{Days: 7, Now: now}).Events; got != 200 {
+		t.Fatalf("reloaded events = %d, want 200 — the published file was torn", got)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v, want 0600", fi.Mode().Perm())
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "usage.json.tmp-") {
+			t.Errorf("temp file left behind: %s", e.Name())
+		}
+	}
+	if b, err := os.ReadFile(legacy); err != nil || string(b) != "half" {
+		t.Errorf("the fixed-name temp was written through: %q, %v", b, err)
 	}
 }

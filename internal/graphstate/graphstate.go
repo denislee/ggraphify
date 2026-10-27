@@ -297,6 +297,7 @@ func readStatic(opts Options) (g Graph, final bool, err error) {
 			// about whether a huge graph is behind.
 			g.State = StateRaw
 			g.Err = "graph.json is larger than the parse ceiling; counters not read"
+			g.BuiltCommit = oversizedBuiltCommit(out)
 		} else if c, err := ReadBuiltCommit(out); err != nil {
 			g.State = StateBroken
 			g.Err = "graph.json: " + err.Error()
@@ -312,6 +313,7 @@ func readStatic(opts Options) (g Graph, final bool, err error) {
 		// which is enough to decide what to do about it.
 		g.State = StateRaw
 		g.Err = "graph.json is larger than the parse ceiling; counters not read"
+		g.BuiltCommit = oversizedBuiltCommit(out)
 	} else if err := readGraph(gj, &g); err != nil {
 		g.State = StateBroken
 		g.Err = "graph.json: " + err.Error()
@@ -332,6 +334,16 @@ func readStatic(opts Options) (g Graph, final bool, err error) {
 		g.Communities = readAnalysisCommunities(out)
 	}
 	return g, false, nil
+}
+
+// oversizedBuiltCommit is the built_at_commit of a graph.json too large to
+// parse. The stamp sits at the end of the file, so a tail read still answers
+// whether the graph is behind HEAD — without it the biggest repositories were
+// never Behind and the sweep never rebuilt them. A stamp that is not where the
+// tail read looks leaves it empty, which is "cannot judge", not an error.
+func oversizedBuiltCommit(out string) string {
+	c, _ := ReadBuiltCommit(out)
+	return c
 }
 
 // finishRead is the other half: the drift walk, which no stamp on the output

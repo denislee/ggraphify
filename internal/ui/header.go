@@ -110,6 +110,14 @@ func (a *App) buildHeader() gtk.Widgetter {
 	graftDeep.ConnectClicked(func() { a.actSyncGraftDeep() })
 	header.PackStart(graftDeep)
 
+	// Queue every repository on the board that still needs graft's deep tier,
+	// regardless of the folder filter, minus the ones already in the queue.
+	graftDeepAll := gtk.NewButtonFromIconName("list-add-symbolic")
+	graftDeepAll.AddCSSClass("flat")
+	graftDeepAll.SetTooltipText("Queue the deep graft index on every repository on the board that needs it and is not already queued or running — every folder, not just the selected one.")
+	graftDeepAll.ConnectClicked(func() { a.actQueueGraftDeepAll() })
+	header.PackStart(graftDeepAll)
+
 	// The local-model sweep, third in the same row of board-wide buttons. It
 	// is the one of the three that runs an LLM, so it does NOT get the "free"
 	// wording the other two carry — a local run costs no money but it costs

@@ -12,10 +12,11 @@ import (
 	"github.com/dns/ggraphify/internal/gfy"
 )
 
-// The OpenCode group is the settings for the two backends graphify does not
-// ship — the Go subscription and the pay-as-you-go Zen gateway. It shows one
-// at a time: whichever the Backend picker has selected, because that picker is
-// the control that decides which bill a run lands on.
+// The OpenCode group is the settings for the three backends graphify does not
+// ship — the Go subscription, the pay-as-you-go Zen gateway, and Ollama
+// Cloud's hosted models. It shows one at a time: whichever the Backend picker
+// has selected, because that picker is the control that decides which bill a
+// run lands on.
 //
 // Everything else in "LLM defaults" is a value passed to a backend graphify
 // already knows; this one is the backend. The name only means something
@@ -66,6 +67,11 @@ func (a *App) settingsOpenCode() *adw.PreferencesGroup {
 	}
 	verdicts := map[string]verdict{}
 	sweeping := false
+	// sweepStop cancels the sweep in flight and sweepGen names it, so a plan
+	// change can stop the old plan's probes — each one a paid request — and
+	// the old sweep's late callbacks can tell they no longer own the row.
+	var sweepStop context.CancelFunc
+	sweepGen := 0
 	var lastPaint time.Time
 
 	// Adw's default list item is a single ellipsized line, and every entry
@@ -107,7 +113,7 @@ func (a *App) settingsOpenCode() *adw.PreferencesGroup {
 	// chosen puts the answer in front of the person choosing, rather than in
 	// a failed run twenty minutes later.
 	verify := func(id string) {
-		if !gfy.HasOpenCodeKey() || id == "" {
+		if !gfy.HasPlanKey(plan.Backend) || id == "" {
 			return
 		}
 		backend := plan.Backend
@@ -147,8 +153,8 @@ func (a *App) settingsOpenCode() *adw.PreferencesGroup {
 			}
 		}
 		switch {
-		case !gfy.HasOpenCodeKey():
-			return "Export " + gfy.OpenCodeKeyVar + " and the board can ask the gateway which " +
+		case !gfy.HasPlanKey(plan.Backend):
+			return "Export " + plan.KeyVar + " and the board can ask the gateway which " +
 				"of these models actually answer for this account. Until then every model is " +
 				"shown as listed, which is all " + plan.Name + "'s /models can say."
 		case total == 0:
@@ -252,9 +258,9 @@ func (a *App) settingsOpenCode() *adw.PreferencesGroup {
 	// somebody's money to populate a dropdown they were not looking at. For
 	// the plan in use it is worth it: the alternative is finding out mid-run.
 	sweep := func(announce bool) {
-		if sweeping || !gfy.HasOpenCodeKey() {
-			if announce && !gfy.HasOpenCodeKey() {
-				a.toastf("%s is not set, so the gateway cannot be asked", gfy.OpenCodeKeyVar)
+		if sweeping || !gfy.HasPlanKey(plan.Backend) {
+			if announce && !gfy.HasPlanKey(plan.Backend) {
+				a.toastf("%s is not set, so the gateway cannot be asked", plan.KeyVar)
 			}
 			return
 		}
@@ -264,13 +270,16 @@ func (a *App) settingsOpenCode() *adw.PreferencesGroup {
 			return
 		}
 		sweeping = true
+		sweepGen++
+		gen := sweepGen
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		sweepStop = cancel
 		avail.SetSubtitle(escapeMarkup(availSummary()))
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 			gfy.VerifyOpenCodeCatalog(ctx, backend, models, func(id string, ok bool, detail string) {
 				idle(func() {
-					if plan.Backend != backend {
+					if gen != sweepGen || plan.Backend != backend {
 						return
 					}
 					verdicts[id] = verdict{known: true, ok: ok, detail: detail}
@@ -286,10 +295,16 @@ func (a *App) settingsOpenCode() *adw.PreferencesGroup {
 				})
 			})
 			idle(func() {
-				if plan.Backend != backend {
+				// A plan change already reset sweeping when it cancelled this
+				// sweep; a stale end must not clear a newer sweep's flag.
+				if gen != sweepGen {
 					return
 				}
 				sweeping = false
+				sweepStop = nil
+				if plan.Backend != backend {
+					return
+				}
 				fill(gfy.OpenCodeCatalog(backend))
 				if announce {
 					a.toastf("%s", availSummary())
@@ -387,6 +402,16 @@ func (a *App) settingsOpenCode() *adw.PreferencesGroup {
 			// list and a different set of verdicts. Nothing from the old one
 			// survives the switch.
 			verdicts = map[string]verdict{}
+			// The old plan's sweep is stopped rather than left to run out
+			// its five minutes: every probe it still sends is a paid request
+			// to a gateway nobody is looking at, and its flag would keep the
+			// new plan's sweep from ever starting.
+			if sweepStop != nil {
+				sweepStop()
+				sweepStop = nil
+			}
+			sweepGen++
+			sweeping = false
 			fill(gfy.OpenCodeCatalog(plan.Backend))
 			reload(false)
 			return
@@ -411,10 +436,16 @@ func (a *App) settingsOpenCode() *adw.PreferencesGroup {
 func planBlurb(plan gfy.OpenCodePlan) string {
 	what := "A $10/month subscription to a curated set of open coding models, " +
 		"reached through one OpenAI-compatible endpoint."
-	if plan.Backend == gfy.OpenCodeZenBackend {
+	switch plan.Backend {
+	case gfy.OpenCodeZenBackend:
 		what = "Pay-as-you-go over the same key and a wider estate — the open models, the " +
 			"frontier ones, and whichever models the gateway is currently serving at no " +
 			"charge, which are labelled free below and sort first."
+	case gfy.OllamaCloudBackend:
+		what = "Ollama's hosted models — the same open models ollama runs locally and larger ones, " +
+			"served from ollama.com over an OpenAI-compatible endpoint and billed to that Ollama " +
+			"account through " + plan.KeyVar + ". Not the local ollama backend: nothing here runs " +
+			"on this machine."
 	}
 	return what + " graphify has no backend by this name — the board registers it as a " +
 		"custom provider, which is what makes `--backend " + plan.Backend + "` work at all."

@@ -350,6 +350,8 @@ func weightLabels(choices []string, follows string) []string {
 			names[i] = c + " (OpenCode Go — a $10/month subscription)"
 		case gfy.OpenCodeZenBackend:
 			names[i] = c + " (OpenCode Zen — pay-as-you-go, including its free models)"
+		case gfy.OllamaCloudBackend:
+			names[i] = c + " (Ollama Cloud — hosted models, metered)"
 		default:
 			names[i] = c
 			if gfy.IsLocalBackend(c) {

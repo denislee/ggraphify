@@ -148,10 +148,12 @@ var KnownVars = []string{
 	"GRAPHIFY_ALLOW_LOCAL_PROVIDERS", "GRAPHIFY_HOOK_STRICT", "GRAPHIFY_HOOK_STRICT_TTL",
 	"GRAPHIFY_GEMINI_MODEL", OpenAIModelVar, "GRAPHIFY_DEEPSEEK_MODEL",
 	ClaudeCLIModelVar, "GRAPHIFY_CLAUDE_CLI_PARALLEL",
-	// OpenCode Zen. The model variable is the registered provider's
-	// model_env_key; the base-URL one is read by this board when it writes
-	// that provider, not by graphify.
-	OpenCodeModelVar, OpenCodeBaseURLVar,
+	// The OpenCode plans and Ollama Cloud: each is the registered provider's
+	// model_env_key. Their base-URL variables (OpenCodeBaseURLVar and
+	// friends) are deliberately absent: they move the board's loopback
+	// proxy, which serves every job in the process, and are read from the
+	// board's own environment — an overlay entry would do nothing.
+	OpenCodeModelVar, OpenCodeZenModelVar, OllamaCloudModelVar,
 	// Local models. The first three are ollama's OWN variables, not graphify's:
 	// graphify reads them unprefixed so a machine already set up for ollama
 	// needs no second configuration. GRAPHIFY_OLLAMA_MODEL and
@@ -185,12 +187,13 @@ func ValidVar(name string) bool {
 // extraction that is going to fail on every repository for want of a key is
 // worth catching before it starts, not after.
 func HasAPIKey() bool {
-	// OpenCode's key is asked about separately, not added to the list below:
+	// OpenCode's and Ollama Cloud's keys are asked about separately, not
+	// added to the list below:
 	// graphify's own detection reaches a custom provider only after every
 	// built-in and only once the provider file exists, so "a key is set,
 	// therefore auto-detect works" is exactly the claim it cannot support.
 	// EffectiveBackend names the backend outright instead.
-	if HasOpenCodeKey() {
+	if HasOpenCodeKey() || HasPlanKey(OllamaCloudBackend) {
 		return true
 	}
 	return hasVendorAPIKey()

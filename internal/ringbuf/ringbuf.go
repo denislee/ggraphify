@@ -13,6 +13,7 @@ package ringbuf
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"sync"
 	"unsafe"
@@ -34,6 +35,9 @@ type Buf struct {
 	// split across two writes is still read as one line terminator rather
 	// than as a redraw of the line it terminates.
 	pendingCR bool
+	// tee, when set, receives every write verbatim before the buffer folds
+	// carriage returns and evicts lines. See SetTee.
+	tee io.Writer
 }
 
 // New returns a buffer holding at most capBytes. A non-positive cap uses
@@ -62,10 +66,21 @@ func New(capBytes int) *Buf {
 // Len stays within cap throughout, as documented: the mark is below cap, never
 // above it.
 func (b *Buf) Write(p []byte) (int, error) {
+	n := len(p)
+	// An empty write is not a write. Going on would clear pendingCR without
+	// erasing the line it was holding open, so the next progress update would
+	// append to that line instead of replacing it.
+	if n == 0 {
+		return 0, nil
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	n := len(p)
 	b.gen++
+	if b.tee != nil {
+		// Errors are the tee's business: a closed terminal must not cost the
+		// buffer its copy, and Write promises never to fail.
+		_, _ = b.tee.Write(p)
+	}
 
 	// A carriage return is a redraw, not text.
 	//
@@ -115,6 +130,25 @@ func (b *Buf) Write(p []byte) (int, error) {
 		break
 	}
 	return n, nil
+}
+
+// SetTee copies every subsequent write to w, verbatim and in order, before the
+// buffer folds carriage returns or evicts anything. A nil w stops the copy.
+//
+// It is how a headless caller streams a log to a terminal. Reading the buffer
+// back and printing the part not yet printed cannot work: the buffer evicts
+// lines off the front, prefixes an elision note, erases a line on a carriage
+// return and is compacted when its job retires, so no offset into String() is
+// stable across two reads — a log past cap went silent or printed from the
+// wrong place, and its tail was lost at retirement. The tee sees the stream
+// itself, so none of that applies to it.
+//
+// w is called with the buffer's lock held, which is what keeps the copy in
+// the same order as the buffer; a w that blocks stalls the writer with it.
+func (b *Buf) SetTee(w io.Writer) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tee = w
 }
 
 // newline is put's argument for a CRLF folded to LF, as a package-level slice

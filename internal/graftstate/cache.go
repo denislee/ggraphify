@@ -31,12 +31,24 @@ type Cache struct {
 	clears uint64
 	// TTL bounds how stale a cached derivation may be. Zero means DefaultTTL.
 	TTL time.Duration
+	// SizeTTL bounds how stale the Size column may be. Zero means
+	// DefaultSizeTTL. See entry.sizeAt.
+	SizeTTL time.Duration
 }
 
 // DefaultTTL matches graphstate's, for the same reason: short enough that an
 // edit shows up as drift within a tick or two, long enough that most ticks
 // skip the stat pass entirely.
 const DefaultTTL = 45 * time.Second
+
+// DefaultSizeTTL is how often the graft directory is re-walked for its size
+// while its stamp holds still. The stamp cannot see growth inside .cache/ or
+// the card subdirectories, so a size kept for as long as the stamp would never
+// move again; a walk per drift tick would cost more than the column is worth.
+const DefaultSizeTTL = 5 * time.Minute
+
+// derived is called between a derivation and its store, by tests only.
+var derived func(repo string)
 
 type entry struct {
 	key string
@@ -45,6 +57,9 @@ type entry struct {
 	st static
 	at time.Time // when the drift layer was last derived
 	i  Index
+	// sizeAt is when st.i.SizeBytes was last walked. Size is the one field
+	// of the static layer the stamp does not cover, so it has its own TTL.
+	sizeAt time.Time
 }
 
 type stamp struct {
@@ -78,10 +93,22 @@ func (c *Cache) Read(opts Options) (Index, error) {
 		return e.i, nil
 	}
 
+	sizeTTL := c.SizeTTL
+	if sizeTTL <= 0 {
+		sizeTTL = DefaultSizeTTL
+	}
+
 	var st static
+	sizeAt := time.Now()
 	if ok && e.key == key {
-		// Only the drift layer has expired.
-		st = e.st
+		// Only the drift layer has expired — and possibly the size, which
+		// files added under .cache/ change without moving the stamp.
+		st, sizeAt = e.st, e.sizeAt
+		hasDir := !st.final || st.i.State != StateNone
+		if hasDir && time.Since(sizeAt) >= sizeTTL {
+			st.i.SizeBytes = dirSize(dir)
+			sizeAt = time.Now()
+		}
 		if !st.final && !opts.SkipDrift {
 			st.fp, st.fpOK = readFingerprint(st.fpPath)
 		}
@@ -97,12 +124,15 @@ func (c *Cache) Read(opts Options) (Index, error) {
 		i = finishRead(st.i, st.fp, st.fpOK, opts)
 	}
 	st.fp, st.fpOK = nil, false
+	if derived != nil {
+		derived(opts.Repo) // test seam, as in graphstate.Cache.Read
+	}
 	c.mu.Lock()
 	if (stamp{clears: c.clears, repo: c.gen[opts.Repo]}) == at {
 		if c.m == nil {
 			c.m = map[string]entry{}
 		}
-		c.m[opts.Repo] = entry{key: key, st: st, at: time.Now(), i: i}
+		c.m[opts.Repo] = entry{key: key, st: st, at: time.Now(), i: i, sizeAt: sizeAt}
 	}
 	c.mu.Unlock()
 	return i, nil
@@ -124,20 +154,30 @@ func (c *Cache) Invalidate(repo string) {
 // invalidation counter, and returns how many entries it dropped. Checkouts
 // come and go — agent worktrees above all — and a cache that only adds keys
 // holds every one it has ever seen.
+//
+// Dropping a counter resets it to zero, which would let a read stamped before
+// the prune match a later Invalidate's count and store a superseded answer —
+// or simply put the pruned key straight back. So a prune that drops anything
+// also moves the board-wide epoch, exactly as Clear does.
 func (c *Cache) Prune(keep map[string]bool) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	n := 0
+	n, dropped := 0, false
 	for repo := range c.m {
 		if !keep[repo] {
 			delete(c.m, repo)
 			n++
+			dropped = true
 		}
 	}
 	for repo := range c.gen {
 		if !keep[repo] {
 			delete(c.gen, repo)
+			dropped = true
 		}
+	}
+	if dropped {
+		c.clears++
 	}
 	return n
 }

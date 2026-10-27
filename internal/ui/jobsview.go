@@ -6,8 +6,8 @@ import (
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 
+	"github.com/dns/ggraphify/internal/board"
 	"github.com/dns/ggraphify/internal/gfy"
-	"github.com/dns/ggraphify/internal/globalgraph"
 	"github.com/dns/ggraphify/internal/jobs"
 )
 
@@ -404,27 +404,126 @@ func (v *jobsView) retry() { v.retryJob(v.selected()) }
 
 // retryJob re-runs a finished job with the identical argv, which is what makes
 // a transient failure — a rate limit, a flaky network — a one-click recovery.
+//
+// It is held to the same rules as the first click: the prechecks and the
+// OpenCode preflight run again, and a job that bills — metered and not on this
+// machine — goes through a confirm naming the backend and model, because the
+// toolbar Retry reaches succeeded and cancelled jobs too and one click must
+// never re-run a paid extraction.
 func (v *jobsView) retryJob(s *jobs.Snapshot) {
 	if s == nil || !s.Status.Done() {
 		return
 	}
-	v.a.runner.Submit(&jobs.Job{
+	a := v.a
+	if s.Kind == gfy.GraftDeepKind {
+		// graft's deep argv names an endpoint, not a backend — the loopback
+		// proxy's URL among them — so it cannot be replayed or read back. It
+		// is rebuilt from the row through run(), which owns the cost gate.
+		r := a.row(s.Repo)
+		if r == nil {
+			a.toastf("%s: the repository is no longer on the board", s.Label)
+			return
+		}
+		a.run(s.Kind, []board.Row{*r}, a.graftDeepParams())
+		return
+	}
+	j := retryJobFrom(*s, a.opts.Store.Overlay(s.Repo), a.opts.Store.Settings().ClaudeAccount)
+	backend, model := gfy.ArgvBackend(s.Argv), gfy.ArgvModel(s.Argv)
+	if j.Cost == gfy.Metered && !j.Local {
+		a.confirmRetry(j, gfy.Params{
+			Repo: s.Repo, Out: s.Out, Backend: backend, Model: model,
+			ClaudeDir: a.opts.Store.Settings().ClaudeAccount,
+		})
+		return
+	}
+	a.submitRetry(j)
+}
+
+// retryJobFrom rebuilds a finished job for a retry with every field SubmitCmd
+// would have composed for it — the lane (Local), the output directory, the log
+// preamble and the full environment overlay chain, graft's credential included
+// — from the snapshot's argv alone. Pure, so the composition can be tested
+// without a runner.
+//
+// The identical argv still carries the --max-concurrency the original run was
+// sized with, so the overlay that makes graphify honour it has to be rebuilt
+// here too. A retry that dropped it would quietly run serially and look like
+// the first attempt having been slow. Local is carried over rather than
+// re-derived: it is what puts the job in the local lane and gives it the lease
+// that keeps the model server up while it runs.
+func retryJobFrom(s jobs.Snapshot, overlay gfy.Env, account string) *jobs.Job {
+	backend, model := gfy.ArgvBackend(s.Argv), gfy.ArgvModel(s.Argv)
+	dir := s.Dir
+	if dir == "" {
+		dir = s.Repo
+	}
+	j := &jobs.Job{
 		Kind: s.Kind, Repo: s.Repo, Label: s.Label, Cost: s.Cost,
-		Argv: s.Argv,
-		// The identical argv still carries the --max-concurrency the original
-		// run was sized with, so the overlay that makes graphify honour it has
-		// to be rebuilt here too. A retry that dropped it would quietly run
-		// serially and look like the first attempt having been slow.
-		Env: gfy.ClaudeAccountEnv(
-			gfy.ClaudeCLIModelEnv(
-				gfy.ClaudeCLIEnv(
-					gfy.LocalEnv(gfy.JobEnv(v.a.opts.Store.Overlay(s.Repo)), gfy.ArgvBackend(s.Argv)),
-					gfy.ArgvBackend(s.Argv)),
-				gfy.ArgvBackend(s.Argv), gfy.ArgvModel(s.Argv)),
-			v.a.opts.Store.Settings().ClaudeAccount),
-		Dir: s.Repo,
+		Local: s.Local,
+		Argv:  append([]string(nil), s.Argv...),
+		Env: gfy.GraftDeepEnv(
+			gfy.ClaudeAccountEnv(
+				gfy.ClaudeCLIModelEnv(
+					gfy.ClaudeCLIEnv(gfy.LocalEnv(gfy.JobEnv(overlay), backend), backend),
+					backend, model),
+				account),
+			s.Kind, backend),
+		Dir: dir,
+		Out: s.Out,
+	}
+	if note := gfy.AccountNote(s.Kind, backend, account); note != "" {
+		j.Notes = []string{note}
+	}
+	return j
+}
+
+// submitRetry runs the checks SubmitCmd runs and queues the job.
+func (a *App) submitRetry(j *jobs.Job) {
+	backend, model := gfy.ArgvBackend(j.Argv), gfy.ArgvModel(j.Argv)
+	overlay := a.opts.Store.Overlay(j.Repo)
+	if err := gfy.PreflightOpenCode(backend, overlay, model); err != nil {
+		a.toastf("%s: %v", j.Label, err)
+		return
+	}
+	if _, _, err := gfy.EnsureOpenCodeProvider(backend, overlay, model); err != nil {
+		a.toastf("%s: cannot register the %s provider: %v", j.Label, backend, err)
+		return
+	}
+	if a.precheck != nil {
+		if err := a.precheck(j); err != nil {
+			a.submitRefused(j.Label, err)
+			return
+		}
+	}
+	a.runner.Submit(j)
+	a.toastf("re-queued %s", j.Label)
+}
+
+// confirmRetry is the cost gate for a retry: the same notice confirm() shows,
+// over the literal argv that will run again.
+func (a *App) confirmRetry(j *jobs.Job, sample gfy.Params) {
+	body := j.Label + "\n" + j.Repo + "\n\n" + a.meteredNotice(sample)
+	dlg := adw.NewAlertDialog("Retry "+gfy.Title(j.Kind), body)
+	dlg.SetPreferWideLayout(true)
+	cmdLabel := monoLabel("$ " + gfy.Quote(j.Argv))
+	cmdLabel.SetMarginTop(8)
+	cmdLabel.SetMarginBottom(8)
+	cmdLabel.SetMarginStart(8)
+	cmdLabel.SetMarginEnd(8)
+	frame := gtk.NewFrame("")
+	frame.SetChild(cmdLabel)
+	dlg.SetExtraChild(frame)
+	dlg.AddResponse("cancel", "Cancel")
+	dlg.AddResponse("run", "Run again")
+	dlg.SetResponseAppearance("run", adw.ResponseDestructive)
+	dlg.SetDefaultResponse("cancel")
+	dlg.SetCloseResponse("cancel")
+	dlg.ConnectResponse(func(resp string) {
+		if resp == "run" {
+			a.submitRetry(j)
+		}
 	})
-	v.a.toastf("re-queued %s", s.Label)
+	dlg.Present(a.win)
 }
 
 // --- the global graph -------------------------------------------------------
@@ -441,18 +540,6 @@ func (a *App) showGlobal() {
 		return
 	}
 	a.setMainPage(pageGlobalName)
-}
-
-// mergeSelected merges every selected repository's graph.json into one file.
-func (a *App) mergeSelected(out *gtk.TextView) {
-	var graphs []string
-	for _, r := range a.batch() {
-		if r.Graph.Nodes == 0 {
-			continue
-		}
-		graphs = append(graphs, globalgraph.GraphFor(r.Graph.Out))
-	}
-	a.mergeGraphs(graphs, out)
 }
 
 // mergeGraphs is `graphify merge-graphs`: one file out of several graphs,

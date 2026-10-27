@@ -272,15 +272,20 @@ func TestRetryAndResetClearTheGiveUp(t *testing.T) {
 	}
 
 	e.Retry("/a")
-	if a3, _ := e.Plan(c, pol); len(a3) != 1 {
+	a3, _ := e.Plan(c, pol)
+	if len(a3) != 1 {
 		t.Fatal("Retry did not clear the give-up")
 	}
-	e.Reset()
-	if e.Running() != 0 {
-		t.Fatalf("Running = %d after Reset", e.Running())
+	// Reset forgives the give-up but not a chain still running: that slot is
+	// still taken until Done says otherwise (W36).
+	e.Done(a3[0], "")
+	*now = now.Add(time.Hour)
+	if a4, _ := e.Plan(c, pol); len(a4) != 0 {
+		t.Fatal("should have given up again")
 	}
-	if a4, _ := e.Plan(c, pol); len(a4) != 1 {
-		t.Fatal("Reset did not clear the in-flight marker")
+	e.Reset()
+	if a5, _ := e.Plan(c, pol); len(a5) != 1 {
+		t.Fatal("Reset did not clear the give-up")
 	}
 }
 

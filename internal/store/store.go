@@ -15,6 +15,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -51,6 +52,10 @@ type Settings struct {
 	// zero-value reason as ShowHidden; see discover.Options.ShowWorktrees.
 	ShowWorktrees bool   `json:"show_worktrees"`
 	Scheme        string `json:"scheme"` // system | light | dark
+	// Scale multiplies the interface's text size (and with it most widget
+	// sizes, which libadwaita derives from the font). Zero means 1.0, so a
+	// state file written before this existed reads back unscaled.
+	Scale float64 `json:"scale,omitempty"`
 
 	Backend string `json:"backend"`
 	Model   string `json:"model"`
@@ -113,6 +118,10 @@ type Settings struct {
 	// for Zen, the cheapest model it is currently serving, which is usually a
 	// free one.
 	OpenCodeZenModel string `json:"opencode_zen_model,omitempty"`
+
+	// OllamaCloudModel is the same field for the Ollama Cloud plan: its own
+	// catalogue, its own ids. Blank means gfy.DefaultOllamaCloudModel.
+	OllamaCloudModel string `json:"ollama_cloud_model,omitempty"`
 
 	// ClaudeAccount is the Claude Code configuration directory jobs run
 	// against — one of this machine's ~/.claude* logins. Blank means the
@@ -364,23 +373,30 @@ func withKey(m map[string]string, k, v string) map[string]string {
 }
 
 // OpenCodeModelFor is the model setting that belongs to an OpenCode plan, and
-// SetOpenCodeModelFor writes it. Two fields, one per plan, reached through the
+// SetOpenCodeModelFor writes it. One field per plan, reached through the
 // backend name so that no caller has to remember which field goes with which
 // gateway — forgetting that is how a Go id ends up being sent to Zen.
 func (s Settings) OpenCodeModelFor(backend string) string {
-	if gfy.OpenCodePlanFor(backend).Backend == gfy.OpenCodeZenBackend {
+	switch gfy.OpenCodePlanFor(backend).Backend {
+	case gfy.OpenCodeZenBackend:
 		return s.OpenCodeZenModel
+	case gfy.OllamaCloudBackend:
+		return s.OllamaCloudModel
+	default:
+		return s.OpenCodeModel
 	}
-	return s.OpenCodeModel
 }
 
 // SetOpenCodeModelFor is the writer half.
 func (s *Settings) SetOpenCodeModelFor(backend, model string) {
-	if gfy.OpenCodePlanFor(backend).Backend == gfy.OpenCodeZenBackend {
+	switch gfy.OpenCodePlanFor(backend).Backend {
+	case gfy.OpenCodeZenBackend:
 		s.OpenCodeZenModel = model
-		return
+	case gfy.OllamaCloudBackend:
+		s.OllamaCloudModel = model
+	default:
+		s.OpenCodeModel = model
 	}
-	s.OpenCodeModel = model
 }
 
 // AutoFix reports whether the auto-fix loop runs at all, and AutoFixLocal
@@ -633,6 +649,25 @@ type Store struct {
 
 	timer   *time.Timer
 	saveErr error
+
+	// saveMu serializes whole saves — snapshot, write, rename — so a debounce
+	// callback already running when Flush is called cannot rename an older
+	// snapshot over the one Flush just wrote. A save that waits here takes its
+	// snapshot after the previous one finished, so the last rename is always
+	// the newest state.
+	saveMu sync.Mutex
+
+	// corrupt is where Open moved a state file it could not parse, and
+	// corruptErr why; both empty when the file loaded (or did not exist).
+	corrupt    string
+	corruptErr error
+	// noSave, when set, is returned by every Save: the corrupt file could
+	// not be moved aside, and overwriting it would lose it.
+	noSave error
+
+	// beforeRename is a test hook: it holds a save between its snapshot and
+	// its rename, the window in which an unserialized save could land late.
+	beforeRename func()
 }
 
 // SetOutOverride records what the command line said about where graphify
@@ -713,6 +748,12 @@ func Defaults() Settings {
 // Open loads the state file, returning a usable Store even when the file is
 // missing or corrupt — a board that refuses to start because its preferences
 // file has a stray brace in it would be worse than one that starts fresh.
+//
+// Starting fresh must not mean losing the file, though: the first debounced
+// save would overwrite every override, baseline, queued job and setting it
+// held. A file that does not parse is renamed aside to
+// state.json.corrupt-<timestamp> first, and Corrupt reports where, so the
+// board can say so instead of resetting silently.
 func Open(path string) *Store {
 	st := &Store{path: path, s: state{Version: Version, Settings: Defaults(), Repos: map[string]RepoOverride{}, Columns: map[string]int{}}}
 	b, err := os.ReadFile(path)
@@ -721,6 +762,18 @@ func Open(path string) *Store {
 	}
 	var loaded state
 	if err := json.Unmarshal(b, &loaded); err != nil {
+		st.corruptErr = err
+		aside := path + ".corrupt-" + time.Now().Format("20060102-150405")
+		if rerr := os.Rename(path, aside); rerr != nil {
+			// Could not move it aside. Do not let a save overwrite what
+			// may be the only copy of the user's state: every Save fails
+			// for this session instead (and SaveError says so).
+			st.corruptErr = errors.Join(err, rerr)
+			st.saveErr = fmt.Errorf("store: %s is unreadable and could not be moved aside; not saving over it: %w", path, st.corruptErr)
+			st.noSave = st.saveErr
+			return st
+		}
+		st.corrupt = aside
 		return st
 	}
 	// Forward-compatible merge: whatever the file did not say keeps the
@@ -1035,6 +1088,28 @@ func (s *Store) SetScheme(v string) {
 	s.SetSettings(st)
 }
 
+// Scale is the interface scale preference, clamped to [0.5, 3]; unset is 1.
+func (s *Store) Scale() float64 {
+	v := s.Settings().Scale
+	if v <= 0 {
+		return 1
+	}
+	if v < 0.5 {
+		return 0.5
+	}
+	if v > 3 {
+		return 3
+	}
+	return v
+}
+
+// SetScale persists it.
+func (s *Store) SetScale(v float64) {
+	st := s.Settings()
+	st.Scale = v
+	s.SetSettings(st)
+}
+
 // OutSpec is where this store says a repository's graphify knowledge lives:
 // the board-wide name and central base, plus that repository's own override.
 // The board resolves rows through it and every job is launched pointing at the
@@ -1079,13 +1154,8 @@ func (s *Store) schedule() {
 		s.timer.Reset(SaveDebounce)
 		return
 	}
-	s.timer = time.AfterFunc(SaveDebounce, func() {
-		if err := s.Save(); err != nil {
-			s.mu.Lock()
-			s.saveErr = err
-			s.mu.Unlock()
-		}
-	})
+	// Save records its own outcome in saveErr, success included.
+	s.timer = time.AfterFunc(SaveDebounce, func() { _ = s.Save() })
 }
 
 // Save writes the file now. Flush on the way out calls it; the debounce timer
@@ -1093,12 +1163,38 @@ func (s *Store) schedule() {
 //
 // The write is atomic — a temp file in the same directory, then os.Rename — so
 // a crash mid-write leaves the previous state rather than a truncated file.
+//
+// The outcome lands in SaveError either way: a later successful save clears an
+// earlier failure, so the board stops reporting an error that is gone.
 func (s *Store) Save() error {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	err := s.save()
+	s.mu.Lock()
+	s.saveErr = err
+	s.mu.Unlock()
+	return err
+}
+
+// save is Save without the serialization and the bookkeeping; saveMu is held.
+func (s *Store) save() error {
+	if s.noSave != nil {
+		return s.noSave
+	}
+	// Marshal under the read lock. state is full of maps (Repos, Columns,
+	// Baselines, Settings.Overlay and the kind pins) that the setters mutate
+	// in place; a shallow copy taken under the lock and marshalled after it
+	// walks those maps unlocked, and a concurrent write is a fatal
+	// "concurrent map read and map write" — not a panic anything can recover.
 	s.mu.RLock()
 	snap := s.s
 	snap.Version = Version
 	path := s.path
+	b, err := json.MarshalIndent(snap, "", "  ")
 	s.mu.RUnlock()
+	if err != nil {
+		return err
+	}
 
 	if path == "" {
 		return errors.New("store: no path")
@@ -1110,10 +1206,6 @@ func (s *Store) Save() error {
 	// the user's own data directory; nothing else on the machine has a reason
 	// to read it.
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
@@ -1141,11 +1233,16 @@ func (s *Store) Save() error {
 	if err := os.Chmod(name, 0o600); err != nil {
 		return err
 	}
+	if s.beforeRename != nil {
+		s.beforeRename()
+	}
 	return os.Rename(name, path)
 }
 
 // Flush cancels any pending debounce and writes immediately. The window's
-// close handler calls it.
+// close handler calls it. A timer callback already past Stop is not lost and
+// cannot win: Save serializes on saveMu, so whichever of the two runs second
+// snapshots the newer state and its rename is the one that sticks.
 func (s *Store) Flush() error {
 	s.mu.Lock()
 	if s.timer != nil {
@@ -1154,6 +1251,15 @@ func (s *Store) Flush() error {
 	}
 	s.mu.Unlock()
 	return s.Save()
+}
+
+// Corrupt reports a state file Open could not parse: where the unreadable
+// file was moved (empty if it could not be moved, in which case saving is
+// disabled for this session) and the parse error. err is nil when the file
+// loaded or did not exist. The board shows it once at startup — the store
+// fell back to defaults, and the user's old state is in that file.
+func (s *Store) Corrupt() (aside string, err error) {
+	return s.corrupt, s.corruptErr
 }
 
 // SaveError is the last background save failure, so the UI can toast it rather

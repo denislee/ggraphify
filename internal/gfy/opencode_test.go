@@ -26,7 +26,8 @@ func isolateHome(t *testing.T) string {
 	t.Setenv(OpenCodePortVar, "0")
 	resetProxy(t)
 	for _, k := range []string{
-		OpenCodeKeyVar, OpenCodeBaseURLVar,
+		OpenCodeKeyVar, OpenCodeBaseURLVar, OpenCodeZenBaseURLVar,
+		OllamaCloudKeyVar, OllamaCloudBaseURLVar, OllamaKeyVar,
 		"GRAPHIFY_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
 		"GOOGLE_API_KEY", "DEEPSEEK_API_KEY", "MOONSHOT_API_KEY",
 		OllamaBaseURLVar, OllamaHostVar,
@@ -52,7 +53,7 @@ func readProviders(t *testing.T) map[string]map[string]any {
 func TestEnsureOpenCodeProviderWritesAnEntryGraphifyCanRead(t *testing.T) {
 	isolateHome(t)
 
-	path, wrote, err := EnsureOpenCodeProvider(OpenCodeBackend, "")
+	path, wrote, err := EnsureOpenCodeProvider(OpenCodeBackend, nil, "")
 	if err != nil || !wrote {
 		t.Fatalf("EnsureOpenCodeProvider = %q, %v, %v; want written, no error", path, wrote, err)
 	}
@@ -100,7 +101,7 @@ func TestTheBaseURLOverrideMovesTheGatewayNotTheEntry(t *testing.T) {
 	if got := OpenCodeUpstream(OpenCodeBackend); got != "https://gateway.example.test/v1" {
 		t.Errorf("OpenCodeUpstream(OpenCodeBackend) = %q, want the override", got)
 	}
-	if _, _, err := EnsureOpenCodeProvider(OpenCodeBackend, ""); err != nil {
+	if _, _, err := EnsureOpenCodeProvider(OpenCodeBackend, nil, ""); err != nil {
 		t.Fatalf("EnsureOpenCodeProvider: %v", err)
 	}
 	// Still the proxy: the override moves where the proxy forwards to, which
@@ -124,7 +125,7 @@ func TestEnsureOpenCodeProviderKeepsOtherProvidersAndTheUsersOwnEdits(t *testing
 		t.Fatal(err)
 	}
 
-	if _, wrote, err := EnsureOpenCodeProvider(OpenCodeBackend, ""); err != nil || !wrote {
+	if _, wrote, err := EnsureOpenCodeProvider(OpenCodeBackend, nil, ""); err != nil || !wrote {
 		t.Fatalf("first call: wrote=%v err=%v", wrote, err)
 	}
 	all := readProviders(t)
@@ -152,7 +153,7 @@ func TestEnsureOpenCodeProviderKeepsOtherProvidersAndTheUsersOwnEdits(t *testing
 	if err := os.WriteFile(ProvidersPath(), edited, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, wrote, err := EnsureOpenCodeProvider(OpenCodeBackend, ""); err != nil || wrote {
+	if _, wrote, err := EnsureOpenCodeProvider(OpenCodeBackend, nil, ""); err != nil || wrote {
 		t.Fatalf("second call: wrote=%v err=%v; want no rewrite", wrote, err)
 	}
 	if got, _ := readProviders(t)[OpenCodeBackend]["default_model"].(string); got != "kimi-k2.7-code" {
@@ -162,7 +163,7 @@ func TestEnsureOpenCodeProviderKeepsOtherProvidersAndTheUsersOwnEdits(t *testing
 	// Choosing a model moves the price pair with it — the whole reason this
 	// entry is rewritten rather than written once — and leaves a field the
 	// board has never heard of alone.
-	if _, wrote, err := EnsureOpenCodeProvider(OpenCodeBackend, "mimo-v2.5"); err != nil || !wrote {
+	if _, wrote, err := EnsureOpenCodeProvider(OpenCodeBackend, nil, "mimo-v2.5"); err != nil || !wrote {
 		t.Fatalf("third call: wrote=%v err=%v; want a rewrite", wrote, err)
 	}
 	cfg := readProviders(t)[OpenCodeBackend]
@@ -198,7 +199,7 @@ func TestEnsureOpenCodeProviderRefusesRatherThanOverwriteUnparseableJSON(t *test
 	if err := os.WriteFile(filepath.Join(dir, "providers.json"), half, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, wrote, err := EnsureOpenCodeProvider(OpenCodeBackend, ""); err == nil || wrote {
+	if _, wrote, err := EnsureOpenCodeProvider(OpenCodeBackend, nil, ""); err == nil || wrote {
 		t.Fatalf("wrote=%v err=%v; want a refusal", wrote, err)
 	}
 	b, _ := os.ReadFile(ProvidersPath())
@@ -210,7 +211,7 @@ func TestEnsureOpenCodeProviderRefusesRatherThanOverwriteUnparseableJSON(t *test
 func TestEnsureOpenCodeProviderIsANoOpForEveryOtherBackend(t *testing.T) {
 	isolateHome(t)
 	for _, b := range []string{"", "openai", ClaudeCLIBackend, OllamaBackend} {
-		if path, wrote, err := EnsureOpenCodeProvider(b, ""); path != "" || wrote || err != nil {
+		if path, wrote, err := EnsureOpenCodeProvider(b, nil, ""); path != "" || wrote || err != nil {
 			t.Errorf("EnsureOpenCodeProvider(%q) = %q, %v, %v; want silent no-op", b, path, wrote, err)
 		}
 	}
@@ -259,7 +260,7 @@ func TestBackendReadyOnOpenCodeAnswersAboutTheKeyAndTheProvider(t *testing.T) {
 	if !strings.Contains(why, "will be registered") {
 		t.Errorf("an unregistered provider should say so: %s", why)
 	}
-	if _, _, err := EnsureOpenCodeProvider(OpenCodeBackend, ""); err != nil {
+	if _, _, err := EnsureOpenCodeProvider(OpenCodeBackend, nil, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, why = BackendReady(OpenCodeBackend); !strings.Contains(why, "is registered") {
@@ -283,10 +284,15 @@ func resetProxy(t *testing.T) {
 	reset := func() {
 		proxyState.Lock()
 		proxyState.root, proxyState.base, proxyState.session = "", "", ""
+		proxyState.owned, proxyState.plans = false, ""
 		proxyState.Unlock()
 	}
 	reset()
-	t.Cleanup(reset)
+	allowEphemeralProxyPort = true
+	t.Cleanup(func() {
+		reset()
+		allowEphemeralProxyPort = false
+	})
 }
 
 func resetCatalog(t *testing.T) {
@@ -549,7 +555,7 @@ func TestPreflightRefusesAModelTheGatewayWillNotAnswer(t *testing.T) {
 	defer gw.Close()
 	t.Setenv(OpenCodeBaseURLVar, gw.URL+"/v1")
 
-	err := PreflightOpenCode(OpenCodeBackend, "sulky-model")
+	err := PreflightOpenCode(OpenCodeBackend, nil, "sulky-model")
 	if err == nil {
 		t.Fatal("a model answering 500 was allowed to start a run")
 	}
@@ -557,14 +563,14 @@ func TestPreflightRefusesAModelTheGatewayWillNotAnswer(t *testing.T) {
 	if !strings.Contains(err.Error(), "Internal server error") || !strings.Contains(err.Error(), "sulky-model") {
 		t.Errorf("the refusal does not carry the cause: %v", err)
 	}
-	if err := PreflightOpenCode(OpenCodeBackend, "willing-model"); err != nil {
+	if err := PreflightOpenCode(OpenCodeBackend, nil, "willing-model"); err != nil {
 		t.Errorf("a working model was refused: %v", err)
 	}
 
 	// Cached: a sweep of many repositories pays for one probe per model.
 	before := asked
-	_ = PreflightOpenCode(OpenCodeBackend, "sulky-model")
-	_ = PreflightOpenCode(OpenCodeBackend, "willing-model")
+	_ = PreflightOpenCode(OpenCodeBackend, nil, "sulky-model")
+	_ = PreflightOpenCode(OpenCodeBackend, nil, "willing-model")
 	if asked != before {
 		t.Errorf("the gateway was asked again: %d probes, want %d", asked, before)
 	}
@@ -575,7 +581,7 @@ func TestPreflightRefusesAModelTheGatewayWillNotAnswer(t *testing.T) {
 	}
 
 	// Every other backend goes nowhere near this.
-	if err := PreflightOpenCode(OllamaBackend, "sulky-model"); err != nil {
+	if err := PreflightOpenCode(OllamaBackend, nil, "sulky-model"); err != nil {
 		t.Errorf("preflight touched another backend: %v", err)
 	}
 }
@@ -588,7 +594,7 @@ func TestAnUnreachableGatewayIsNotAVerdictAboutTheModel(t *testing.T) {
 	// something about this machine and nothing about the model.
 	t.Setenv(OpenCodeBaseURLVar, "http://127.0.0.1:1/v1")
 
-	if err := PreflightOpenCode(OpenCodeBackend, "some-model"); err != nil {
+	if err := PreflightOpenCode(OpenCodeBackend, nil, "some-model"); err != nil {
 		t.Errorf("an unreachable gateway refused the run: %v", err)
 	}
 	if known, _, _ := OpenCodeVerdict(OpenCodeBackend, "some-model"); known {
@@ -667,10 +673,10 @@ func TestEachPlanRegistersItsOwnProviderEntry(t *testing.T) {
 	t.Setenv(OpenCodePortVar, "0")
 	resetProxy(t)
 
-	if _, _, err := EnsureOpenCodeProvider(OpenCodeBackend, "glm-5.3-flash"); err != nil {
+	if _, _, err := EnsureOpenCodeProvider(OpenCodeBackend, nil, "glm-5.3-flash"); err != nil {
 		t.Fatalf("EnsureOpenCodeProvider(go): %v", err)
 	}
-	if _, _, err := EnsureOpenCodeProvider(OpenCodeZenBackend, "some-zen-model"); err != nil {
+	if _, _, err := EnsureOpenCodeProvider(OpenCodeZenBackend, nil, "some-zen-model"); err != nil {
 		t.Fatalf("EnsureOpenCodeProvider(zen): %v", err)
 	}
 

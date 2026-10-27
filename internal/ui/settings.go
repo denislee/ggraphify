@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -209,6 +211,17 @@ func (a *App) settingsGeneral() *adw.PreferencesPage {
 		scheme.SetSubtitle("pinned by the -dark/-light flag for this run")
 	}
 	look.Add(scheme)
+
+	scale := adw.NewComboRow()
+	scale.SetTitle("Interface scale")
+	scale.SetSubtitle("Text and controls, on top of the desktop's own scaling")
+	scale.SetModel(gtk.NewStringList(scaleLabels()))
+	scale.SetSelected(uint(scaleIndex(a.opts.Store.Scale())))
+	scale.NotifyProperty("selected", func() {
+		a.opts.Store.SetScale(scaleSteps[int(scale.Selected())])
+		a.applyScale()
+	})
+	look.Add(scale)
 
 	anim := adw.NewSwitchRow()
 	anim.SetTitle("Animations")
@@ -429,6 +442,8 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 			// of the two that serves models at no charge at all.
 			names[i] = b + " (OpenCode Zen — pay-as-you-go on the same " + gfy.OpenCodeKeyVar +
 				", including its free models)"
+		case gfy.OllamaCloudBackend:
+			names[i] = b + " (Ollama Cloud — hosted models, metered on " + gfy.OllamaCloudKeyVar + ")"
 		default:
 			names[i] = b
 			// openai is the OpenAI API until OPENAI_BASE_URL says otherwise,
@@ -502,6 +517,13 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 	key := adw.NewActionRow()
 	key.SetTitle("API key")
 	key.SetSubtitleLines(0)
+	// Said on its own rather than as a rider on the OpenCode sentence: it is a
+	// key of its own, and it is the whole answer on a machine that has no
+	// other.
+	cloudKey := ""
+	if gfy.HasPlanKey(gfy.OllamaCloudBackend) {
+		cloudKey = " " + gfy.OllamaCloudKeyVar + " is visible, which is what " + gfy.OllamaCloudBackend + " runs on."
+	}
 	if gfy.HasAPIKey() {
 		sub := "An API key is visible in this environment. It is passed through to " +
 			"graphify and is never written to ggraphify's state file."
@@ -509,7 +531,7 @@ func (a *App) settingsJobs() *adw.PreferencesPage {
 			sub += " That includes " + gfy.OpenCodeKeyVar + ", which reaches both OpenCode " +
 				"plans — see the group below for whichever one is selected."
 		}
-		key.SetSubtitle(sub)
+		key.SetSubtitle(sub + cloudKey)
 	} else if gfy.HasClaudeCLI() {
 		key.SetSubtitle("No API key is visible in this environment — the claude-cli backend " +
 			"will be used instead, and needs none.")
@@ -1305,4 +1327,25 @@ func (a *App) autoFixLocalSubtitle() string {
 			"itself runs. Nothing you start by hand changes."
 	}
 	return s
+}
+
+// scaleSteps are the interface scales the settings dialog offers.
+var scaleSteps = []float64{0.75, 0.85, 1, 1.1, 1.25, 1.5, 1.75, 2}
+
+func scaleLabels() []string {
+	out := make([]string, len(scaleSteps))
+	for i, s := range scaleSteps {
+		out[i] = fmt.Sprintf("%d%%", int(math.Round(s*100)))
+	}
+	return out
+}
+
+func scaleIndex(v float64) int {
+	best := 0
+	for i, s := range scaleSteps {
+		if math.Abs(s-v) < math.Abs(scaleSteps[best]-v) {
+			best = i
+		}
+	}
+	return best
 }

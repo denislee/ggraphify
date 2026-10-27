@@ -581,3 +581,39 @@ func TestBehindComparesByPrefix(t *testing.T) {
 		}
 	}
 }
+
+// W13: a graph.json above the parse ceiling still carries its built_at_commit
+// in the tail, and a read of it must say whether the graph is behind HEAD.
+// It never did, so the largest repositories were never rebuilt after HEAD moved.
+func TestOversizedGraphStillKnowsItsBuiltCommit(t *testing.T) {
+	f := newFixture(t)
+	gj := filepath.Join(f.out, "graph.json")
+	fh, err := os.Create(gj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail := []byte(`, "built_at_commit": "aaaaaaaa1111"}` + "\n")
+	size := int64(MaxGraphBytes) + 1
+	if err := fh.Truncate(size); err != nil { // sparse: no 128 MB written
+		t.Fatal(err)
+	}
+	if _, err := fh.WriteAt(tail, size-int64(len(tail))); err != nil {
+		t.Fatal(err)
+	}
+	if err := fh.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, commitOnly := range []bool{false, true} {
+		g, err := Read(Options{Repo: f.repo, Head: "bbbbbbbb2222", SkipDrift: true, CommitOnly: commitOnly})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g.BuiltCommit != "aaaaaaaa1111" || !g.Behind() {
+			t.Fatalf("CommitOnly=%v: BuiltCommit=%q Behind=%v, want aaaaaaaa1111 and behind",
+				commitOnly, g.BuiltCommit, g.Behind())
+		}
+		if g.State != StateRaw {
+			t.Fatalf("CommitOnly=%v: State = %v, want raw (counters still unread)", commitOnly, g.State)
+		}
+	}
+}

@@ -148,7 +148,7 @@ func (e *Engine) PlanFleet(roots []Root, stranded []Stranded, pol Policy) (actio
 			sig := r.Workspace.Issue()
 			key := fleetKey("workspace", r.Path, "")
 			if sig == "" {
-				delete(e.seen, key)
+				e.forgetHealthy(key, now, pol)
 				continue
 			}
 			if r.Busy {
@@ -213,13 +213,19 @@ func (e *Engine) PlanFleet(roots []Root, stranded []Stranded, pol Policy) (actio
 // reported under; its Why is filled in here.
 func (e *Engine) reserve(key, sig string, now time.Time, pol Policy, skips *[]Skip, tmpl Skip) (*record, bool) {
 	rec := e.seen[key]
-	switch {
-	case rec == nil:
+	if rec == nil {
 		rec = &record{}
 		e.seen[key] = rec
-	case rec.running:
+	}
+	if rec.running {
 		return nil, false
+	}
+	switch {
 	case rec.sig != sig:
+		// A fresh budget, not a fresh clock — the same rule as Plan. A
+		// workspace signature carries the drift's Summary, so every change
+		// in child counts is a new signature, and without the cooldown below
+		// a root whose children keep moving got a whole-root rebuild per tick.
 		rec.attempts, rec.err, rec.declared = 0, "", false
 	case rec.attempts >= attemptCap(pol, sig):
 		if rec.declared {
@@ -233,7 +239,8 @@ func (e *Engine) reserve(key, sig string, now time.Time, pol Policy, skips *[]Sk
 		tmpl.Why = gaveUp(sig, rec.attempts)
 		*skips = append(*skips, tmpl)
 		return nil, false
-	case now.Sub(rec.last) < backoff(pol.Cooldown, rec.attempts):
+	}
+	if coolingDown(rec, now, pol) {
 		tmpl.Why = "cooling down"
 		*skips = append(*skips, tmpl)
 		return nil, false
@@ -265,8 +272,9 @@ func (e *Engine) FleetDone(a FleetAction, err string) {
 	// identically — and forgetting the record here reset both the attempt
 	// count and the cooldown, so the next tick re-queued the whole-root
 	// rebuild at once, forever. PlanFleet drops the record itself on the
-	// first tick that reads the subject healthy; one that comes back with the
-	// same signature starts from the attempt it left off at.
+	// first tick after the cooldown that reads the subject healthy; one that
+	// comes back with the same signature starts from the attempt it left off
+	// at.
 	rec.running = false
 	rec.err = err
 }

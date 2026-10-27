@@ -237,3 +237,65 @@ func ellipsis(s string) string {
 	}
 	return s
 }
+
+// W29: an empty write between a chunk ending in "\r" and what follows must
+// not settle the pending carriage return — only the next real byte can say
+// whether it was a redraw or half of a CRLF.
+func TestEmptyWriteKeepsPendingCR(t *testing.T) {
+	b := New(1024)
+	b.WriteString("head\n")
+	b.WriteString("progress 1/3\r")
+	if _, err := b.Write(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write([]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	b.WriteString("progress 2/3")
+	if got, want := b.String(), "head\nprogress 2/3"; got != want {
+		t.Fatalf("String() = %q, want %q", got, want)
+	}
+
+	// The CRLF case is where it shows: an empty write between the "\r" and
+	// the "\n" used to settle the pending return as a redraw and erase the
+	// line the "\n" was about to terminate.
+	b = New(1024)
+	b.WriteString("done 3/3\r")
+	b.Write(nil)
+	b.WriteString("\nnext\n")
+	if got, want := b.String(), "done 3/3\nnext\n"; got != want {
+		t.Fatalf("String() = %q, want %q", got, want)
+	}
+}
+
+// W5: the tee sees the stream exactly as written, however much the buffer
+// evicts, folds or compacts behind it.
+func TestTeeSeesEveryByteDespiteEviction(t *testing.T) {
+	b := New(256)
+	var tee strings.Builder
+	b.SetTee(&tee)
+	var want strings.Builder
+	for i := 0; i < 500; i++ {
+		line := "line " + itoa(i) + " with padding\n"
+		if i%7 == 0 {
+			line = "progress " + itoa(i) + "\r"
+		}
+		want.WriteString(line)
+		b.WriteString(line)
+		if i%50 == 0 {
+			b.Compact(64)
+		}
+	}
+	b.Write(nil)
+	if tee.String() != want.String() {
+		t.Fatalf("tee got %d bytes, want %d", tee.Len(), want.Len())
+	}
+	if !strings.Contains(b.String(), "elided") {
+		t.Fatal("test did not exercise eviction")
+	}
+	b.SetTee(nil)
+	b.WriteString("after\n")
+	if strings.HasSuffix(tee.String(), "after\n") {
+		t.Fatal("SetTee(nil) did not stop the copy")
+	}
+}

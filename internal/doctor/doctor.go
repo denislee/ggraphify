@@ -102,6 +102,8 @@ type Options struct {
 	OpenCodeModel string
 	// OpenCodeZenModel is the same for the Zen plan, which keeps its own.
 	OpenCodeZenModel string
+	// OllamaCloudModel is the same for the Ollama Cloud plan.
+	OllamaCloudModel string
 	ClaudeAccount    string
 	// Version is graphify's own probe result.
 	Version gfy.Version
@@ -149,6 +151,8 @@ func backendCheck(opts Options) Check {
 		model = opts.OpenCodeZenModel
 	case gfy.OpenCodeBackend:
 		model = opts.OpenCodeModel
+	case gfy.OllamaCloudBackend:
+		model = opts.OllamaCloudModel
 	}
 	eff, ready, why := gfy.BackendVerdict(opts.Backend, model)
 	name := eff
@@ -162,7 +166,7 @@ func backendCheck(opts Options) Check {
 		return Check{Name: "backend", Value: name, Detail: why, Level: OK}
 	}
 	do := "no backend on this machine is ready; export an API key, log into the Claude Code CLI, " +
-		"set " + gfy.OpenCodeKeyVar + ", or start a local model server"
+		"set " + gfy.OpenCodeKeyVar + " or " + gfy.OllamaCloudKeyVar + ", or start a local model server"
 	if alts := gfy.ReadyBackends(eff, model); len(alts) > 0 {
 		names := make([]string, 0, len(alts))
 		for _, a := range alts {

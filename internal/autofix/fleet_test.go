@@ -255,6 +255,9 @@ func TestPartialProgressIsNotTheSameDefect(t *testing.T) {
 	}
 	e.FleetDone(first[0], "still short")
 
+	// A fresh budget is not a fresh clock: the changed drift waits out the
+	// plain cooldown like anything else (see TestAFlippingWorkspaceIsNotRebuiltEveryTick).
+	*now = now.Add(DefaultCooldown)
 	second, _ := e.PlanFleet([]Root{federated("/git", []string{"b"}, nil)}, nil, pol)
 	if len(second) != 1 {
 		t.Fatalf("a root that went from 2 unfederated to 1 was not re-planned")
@@ -262,7 +265,6 @@ func TestPartialProgressIsNotTheSameDefect(t *testing.T) {
 	if second[0].Attempt != 1 {
 		t.Fatalf("Attempt = %d, want a fresh budget on the changed drift", second[0].Attempt)
 	}
-	_ = now
 }
 
 // The cap is on what this loop is doing at once, across both passes: a
@@ -326,6 +328,9 @@ func TestADriftThatClearsForgetsItsAttempts(t *testing.T) {
 
 	first, _ := e.PlanFleet(drift, nil, pol)
 	e.FleetDone(first[0], "")
+	// The record outlives a healthy read until its cooldown has run out —
+	// see TestAHealthyReadInsideTheCooldownIsNotAFreshStart.
+	*now = now.Add(DefaultCooldown)
 	if acts, _ := e.PlanFleet([]Root{federated("/git", nil, nil)}, nil, pol); len(acts) != 0 {
 		t.Fatalf("a healthy root planned %v", fleetKinds(acts))
 	}

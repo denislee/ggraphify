@@ -41,6 +41,9 @@ type Cache struct {
 	clears uint64
 	// TTL bounds how stale a cached derivation may be. Zero means DefaultTTL.
 	TTL time.Duration
+	// SizeTTL bounds how stale the Size column may be. Zero means
+	// DefaultSizeTTL. See entry.sizeAt.
+	SizeTTL time.Duration
 }
 
 // stamp is the invalidation state one derivation was started under. Read only
@@ -58,6 +61,12 @@ var derived func(repo string)
 // most of them.
 const DefaultTTL = 45 * time.Second
 
+// DefaultSizeTTL is how often the output directory is re-walked for its size
+// while its stamp holds still. The stamp cannot see growth inside cache/ or
+// any other subdirectory, so a size kept for as long as the stamp would never
+// move again; a walk per drift tick would cost more than the column is worth.
+const DefaultSizeTTL = 5 * time.Minute
+
 type entry struct {
 	key string
 	// static is readStatic's result for key; final says it is already the
@@ -68,6 +77,9 @@ type entry struct {
 	// drift plus the verdict.
 	at time.Time
 	g  Graph
+	// sizeAt is when static.SizeBytes was last walked. Size is the one field
+	// of the static layer the stamp does not cover, so it has its own TTL.
+	sizeAt time.Time
 }
 
 // Read returns the cached derivation when the output directory is unchanged
@@ -98,14 +110,27 @@ func (c *Cache) Read(opts Options) (Graph, error) {
 		return e.g, nil
 	}
 
+	sizeTTL := c.SizeTTL
+	if sizeTTL <= 0 {
+		sizeTTL = DefaultSizeTTL
+	}
+
 	var (
 		static Graph
 		final  bool
+		sizeAt = time.Now()
 	)
 	if ok && e.key == key {
 		// Only the drift layer has expired: the directory has not moved, so
-		// nothing readStatic would read has either.
-		static, final = e.static, e.final
+		// nothing readStatic would read has either — except its size, which
+		// a graphify cache growing in a subdirectory changes without moving
+		// any stamped file.
+		static, final, sizeAt = e.static, e.final, e.sizeAt
+		hasDir := !final || static.State != StateNone
+		if !opts.CommitOnly && hasDir && time.Since(sizeAt) >= sizeTTL {
+			static.SizeBytes = dirSize(out)
+			sizeAt = time.Now()
+		}
 	} else {
 		var err error
 		static, final, err = readStatic(opts)
@@ -128,7 +153,7 @@ func (c *Cache) Read(opts Options) (Graph, error) {
 		if c.m == nil {
 			c.m = map[string]entry{}
 		}
-		c.m[opts.Repo] = entry{key: key, static: static, final: final, at: time.Now(), g: g}
+		c.m[opts.Repo] = entry{key: key, static: static, final: final, at: time.Now(), g: g, sizeAt: sizeAt}
 	}
 	c.mu.Unlock()
 	return g, nil
@@ -151,20 +176,31 @@ func (c *Cache) Invalidate(repo string) {
 // invalidation counter. Checkouts come and go — agent worktrees above all —
 // and a cache that only ever adds keys holds every one it has ever seen. It
 // returns how many entries it dropped.
+//
+// Dropping a counter resets it to zero, which would let a read stamped before
+// the prune match a later Invalidate's count and store a superseded answer —
+// or simply put the pruned key straight back. So a prune that drops anything
+// also moves the board-wide epoch, exactly as Clear does: every read in flight
+// across it is discarded rather than stored.
 func (c *Cache) Prune(keep map[string]bool) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	n := 0
+	n, dropped := 0, false
 	for repo := range c.m {
 		if !keep[repo] {
 			delete(c.m, repo)
 			n++
+			dropped = true
 		}
 	}
 	for repo := range c.gen {
 		if !keep[repo] {
 			delete(c.gen, repo)
+			dropped = true
 		}
+	}
+	if dropped {
+		c.clears++
 	}
 	return n
 }

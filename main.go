@@ -111,6 +111,13 @@ func main() {
 	applog.Infof("ggraphify %s starting — %s", version, store.DefaultPath())
 
 	st := store.Open(store.DefaultPath())
+	if aside, err := st.Corrupt(); err != nil {
+		if aside != "" {
+			applog.Errorf("state file was unreadable (%v); moved it to %s and started from defaults", err, aside)
+		} else {
+			applog.Errorf("state file is unreadable and could not be moved aside (%v); started from defaults and will not save over it", err)
+		}
+	}
 	// The command line's say in where knowledge lives, handed to the store
 	// before anything reads a row or launches a job. Both the board's scan and
 	// every job's GRAPHIFY_OUT resolve through it, so they cannot disagree.
@@ -161,12 +168,20 @@ func splitList(s string) []string {
 	return out
 }
 
+// instanceLock holds the single-instance lock file for the process's
+// lifetime. It has to stay reachable: an *os.File nothing refers to is closed
+// by its finalizer on the next GC — frequent under SetMemoryLimit — and
+// closing the fd releases the flock, letting a second board start.
+var instanceLock *os.File
+
 // singleInstance takes an exclusive flock on a file in the data directory. A
 // second launch exits rather than opening a duplicate window — two boards
 // would race on the same state.json and, worse, could each start a job
 // against the same repository.
-func singleInstance() bool {
-	dir := store.DefaultDir()
+func singleInstance() bool { return lockInstance(store.DefaultDir()) }
+
+// lockInstance is singleInstance against a given directory.
+func lockInstance(dir string) bool {
 	// 0700/0600: this is the same directory state.json lives in, and the lock
 	// is a single-user guard — a second instance of this user's board, not
 	// anybody else's.
@@ -181,7 +196,8 @@ func singleInstance() bool {
 		f.Close()
 		return false
 	}
-	// Deliberately leaked: the lock is held for the process's lifetime.
+	// Held, never closed: the lock lasts as long as the process does.
+	instanceLock = f
 	return true
 }
 

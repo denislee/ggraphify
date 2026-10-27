@@ -1,6 +1,8 @@
 package globalgraph
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -191,5 +193,72 @@ func TestCacheRereadsWhenTheFileMoves(t *testing.T) {
 	c.Invalidate()
 	if got := c.LoadFrom(path); got.Exists || got.Len() != 0 {
 		t.Fatalf("after removal: Exists=%v Len=%d", got.Exists, got.Len())
+	}
+}
+
+// W18: graphify rewrites graph.json on every run, and `global add` skips a
+// graph whose hash still matches without moving added_at. A byte-identical
+// rebuild must therefore not read as stale — the mtime alone said it was,
+// forever, and re-adding could never clear it.
+func TestMemberOfSettlesAnMtimeStaleVerdictByHash(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "graph.json")
+	body := []byte(`{"nodes":[{"id":"a"}],"links":[],"built_at_commit":"abc"}`)
+	if err := os.WriteFile(src, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	manifest := func(hash string) *Manifest {
+		return Load(writeManifest(t, `{"version":1,"repos":{"x":{
+		  "added_at":"2026-01-01T00:00:00.123456+00:00","source_path":"`+src+`",
+		  "node_count":1,"edge_count":0,"source_hash":"`+hash+`"}}}`))
+	}
+	calls := 0
+	hashFile = func(p string) (string, error) { calls++; return fileHash(p) }
+	t.Cleanup(func() { hashFile = fileHash })
+
+	built := time.Now()
+	m := manifest(hex.EncodeToString(sum[:])[:16])
+	if mem := m.MemberOf(src, built); !mem.In || mem.Stale || mem.Issue() != "" {
+		t.Fatalf("identical rebuild: %+v, want a current member", mem)
+	}
+	_ = m.MemberOf(src, built)
+	if calls != 1 {
+		t.Errorf("hashed %d times for one mtime, want 1 (memoised)", calls)
+	}
+
+	// A hash that does not match is a real rebuild, and stays stale.
+	if mem := manifest("0123456789abcdef").MemberOf(src, built); !mem.Stale {
+		t.Fatalf("changed graph: %+v, want stale", mem)
+	}
+	// So is new content under the old hash, once the mtime moves.
+	if err := os.WriteFile(src, append(body, ' '), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(src, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if mem := m.MemberOf(src, later); !mem.Stale {
+		t.Fatalf("rewritten graph: %+v, want stale", mem)
+	}
+}
+
+// W30: two tags sharing one source_path (a re-add with --as) must resolve to
+// the same entry on every load — the newest add — not whichever one map
+// iteration reached last.
+func TestByGraphPicksTheNewestAddDeterministically(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "graph.json")
+	if err := os.WriteFile(src, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := writeManifest(t, `{"version":1,"repos":{
+	  "old":{"added_at":"2026-01-01T00:00:00+00:00","source_path":"`+src+`","node_count":1},
+	  "new":{"added_at":"2026-02-01T00:00:00+00:00","source_path":"`+src+`","node_count":2},
+	  "mid":{"added_at":"2026-01-15T00:00:00+00:00","source_path":"`+src+`","node_count":3}}}`)
+	for i := 0; i < 50; i++ {
+		e, ok := Load(path).ByGraph(src)
+		if !ok || e.Tag != "new" {
+			t.Fatalf("load %d: ByGraph = %q, %v, want the newest add, \"new\"", i, e.Tag, ok)
+		}
 	}
 }

@@ -700,3 +700,41 @@ func TestWorktreesReadsTheRegistry(t *testing.T) {
 		t.Fatal("a git dir with no worktrees/ returned entries")
 	}
 }
+
+// W14: symlinked directories are followed, so one checkout reachable by its
+// own name, by a sibling link and through a link back to an ancestor must
+// still be one row — each row gets its own jobs, and four rows meant four
+// concurrent graphify runs writing one output directory.
+func TestSymlinkedDirsAreDedupedOnTheirTarget(t *testing.T) {
+	root := t.TempDir()
+	mkrepo(t, mkdir(t, root, "api"), "main", "1111111111111111111111111111111111111111")
+	mkrepo(t, mkdir(t, root, "real/svc"), "main", "2222222222222222222222222222222222222222")
+	if err := os.Symlink(filepath.Join(root, "api"), filepath.Join(root, "api-link")); err != nil {
+		t.Fatal(err)
+	}
+	mkdir(t, root, "grp")
+	if err := os.Symlink(root, filepath.Join(root, "grp", "loop")); err != nil {
+		t.Fatal(err)
+	}
+	// A symlinked checkout reachable only through its link still boards.
+	ext := t.TempDir()
+	mkrepo(t, mkdir(t, ext, "far"), "main", "3333333333333333333333333333333333333333")
+	if err := os.Symlink(filepath.Join(ext, "far"), filepath.Join(root, "far")); err != nil {
+		t.Fatal(err)
+	}
+
+	repos, err := Walk(Options{Roots: []string{root}, Depth: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := names(repos)
+	if len(repos) != 3 || has(repos, "api") == nil || has(repos, "svc") == nil || has(repos, "far") == nil {
+		t.Fatalf("found %v, want exactly api, far, svc", got)
+	}
+	if p := has(repos, "api").Path; p != filepath.Join(root, "api") {
+		t.Errorf("api.Path = %q, want the first path in walk order, %q", p, filepath.Join(root, "api"))
+	}
+	if p := has(repos, "far").Path; p != filepath.Join(root, "far") {
+		t.Errorf("far.Path = %q, want the link path the board knows it by", p)
+	}
+}

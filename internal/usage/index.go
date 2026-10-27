@@ -233,11 +233,7 @@ func (x *Index) Save(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, buf.Bytes(), 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := writeAtomic(path, buf.Bytes()); err != nil {
 		return err
 	}
 	x.mu.Lock()
@@ -246,6 +242,38 @@ func (x *Index) Save(path string) error {
 	}
 	x.mu.Unlock()
 	return nil
+}
+
+// writeAtomic replaces path with data through a uniquely named, synced temp
+// file and a rename, as store.Save does. Three writers can save this rollup at
+// once — the board's background save, the window-close save and
+// ggraphify-scan — and with one fixed ".tmp" name they wrote into the same
+// file, so a rename could publish a torn mix of two encodes that Load then
+// discards for a cold rescan. Without the sync a crash could publish an empty
+// file the same way.
+func writeAtomic(path string, data []byte) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+	// CreateTemp already makes the file 0600, which is the mode this
+	// per-user state wants; nothing to chmod.
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // indexJSON is the on-disk shape of the rollup.
@@ -382,16 +410,30 @@ func (x *Index) Update(ctx context.Context, opts Options) error {
 				continue
 			}
 			off := st.Offset
-			if fi.Size() < off {
-				// The file shrank: it was rotated or rewritten, and the old
-				// offset points into the middle of a different file. Start
-				// over rather than parse garbage.
+			fileSince := since
+			if fi.Size() < off || (st.Tail != 0 && tailPrint(p, off) != st.Tail) {
+				// The file shrank, or grew but no longer carries what was read
+				// up to the old offset: it was rotated or rewritten, and that
+				// offset points into the middle of a different file. Start over
+				// rather than parse garbage — but only what is newer than this
+				// file already contributed: a rewrite that kept its earlier
+				// lines would otherwise count every one of them again.
 				off = 0
+				if !st.Through.IsZero() && !fileSince.After(st.Through) {
+					fileSince = st.Through.Add(time.Nanosecond)
+				}
 			}
 			scanned++
-			end, ss, err := scanTranscript(ctx, p, acct.Name, off, since, pend, emitE, emitR)
+			first := len(events)
+			end, ss, err := scanTranscript(ctx, p, acct.Name, off, fileSince, pend, emitE, emitR)
 			if err != nil && ctx.Err() != nil {
 				return err
+			}
+			through := st.Through
+			for _, e := range events[first:] {
+				if e.At.After(through) {
+					through = e.At
+				}
 			}
 			if off == 0 && st.Tools > 0 {
 				// Re-read from the start: this pass counted the whole file, so
@@ -402,7 +444,7 @@ func (x *Index) Update(ctx context.Context, opts Options) error {
 			scans = append(scans, ss)
 			nextF[p] = FileState{
 				Size: fi.Size(), ModNS: fi.ModTime().UnixNano(), Offset: end,
-				Tools: st.Tools + ss.Tools,
+				Tools: st.Tools + ss.Tools, Tail: tailPrint(p, end), Through: through,
 			}
 		}
 	}

@@ -50,6 +50,18 @@ func (a *App) graftTargetName() string {
 	return board.Tilde(a.groupID)
 }
 
+// liveGraftDeep is every repository that already has a deep graft job
+// queued or running, so a sweep never queues the same repository twice.
+func (a *App) liveGraftDeep() map[string]bool {
+	out := map[string]bool{}
+	for _, s := range a.runner.Live() {
+		if s.Kind == gfy.GraftDeepKind {
+			out[s.Repo] = true
+		}
+	}
+	return out
+}
+
 // actSyncGraft is the button. It splits the target into what needs a build and
 // what is already in step, then asks.
 func (a *App) actSyncGraft() {
@@ -163,9 +175,28 @@ func (a *App) confirmSyncGraft(rows []board.Row, inStep int) {
 // build` has genuinely nothing to do there. That is precisely the repository
 // this action exists for: current wiring, no prose tier at all.
 func (a *App) actSyncGraftDeep() {
-	rows := a.graftTargets()
+	a.sweepGraftDeep(a.graftTargets(), a.graftTargetName(), "no repositories in this folder")
+}
+
+// actQueueGraftDeepAll queues the deep graft index on every repository on
+// the board that needs it — every folder, regardless of the folder filter —
+// skipping the ones that already have a deep job queued or running.
+func (a *App) actQueueGraftDeepAll() {
+	var rows []board.Row
+	for _, r := range a.allRows() {
+		if !r.Excluded {
+			rows = append(rows, r)
+		}
+	}
+	a.sweepGraftDeep(rows, "every folder on the board", "no repositories on the board")
+}
+
+// sweepGraftDeep is what both deep buttons share: keep the rows whose deep
+// tier is missing or stale, drop the ones a deep job is already queued or
+// running on, and ask.
+func (a *App) sweepGraftDeep(rows []board.Row, target, empty string) {
 	if len(rows) == 0 {
-		a.toast("no repositories in this folder")
+		a.toast(empty)
 		return
 	}
 
@@ -179,20 +210,29 @@ func (a *App) actSyncGraftDeep() {
 	}
 
 	var todo []board.Row
-	inStep := 0
+	inStep, queued := 0, 0
+	live := a.liveGraftDeep()
 	for _, r := range rows {
-		if r.Graft.NeedsDeep() {
+		switch {
+		case !r.Graft.NeedsDeep():
+			inStep++
+		case live[r.Path]:
+			queued++
+		default:
 			todo = append(todo, r)
-			continue
 		}
-		inStep++
 	}
 	if len(todo) == 0 {
-		a.toastf("graft's deep tier is already current on all %s in %s",
-			plural(inStep, "repo", "repos"), a.graftTargetName())
+		if queued > 0 {
+			a.toastf("nothing to queue in %s: %s already current, %s already queued or running",
+				target, gfy.Itoa(inStep), gfy.Itoa(queued))
+		} else {
+			a.toastf("graft's deep tier is already current on all %s in %s",
+				plural(inStep, "repo", "repos"), target)
+		}
 		return
 	}
-	a.confirmSyncGraftDeep(todo, inStep, backend, model)
+	a.confirmSyncGraftDeep(todo, inStep, queued, target, backend, model)
 }
 
 // confirmSyncGraftDeep is the gate. It differs from the free sweep's in the
@@ -201,14 +241,21 @@ func (a *App) actSyncGraftDeep() {
 // not about this command, a reader is entitled to check it, and since the deep
 // pass started following the Heavy work pin the claim is sometimes the
 // opposite one.
-func (a *App) confirmSyncGraftDeep(rows []board.Row, inStep int, backend, model string) {
+func (a *App) confirmSyncGraftDeep(rows []board.Row, inStep, queued int, target, backend, model string) {
 	set := a.opts.Store.Settings()
 
 	var body strings.Builder
-	body.WriteString("Target: " + a.graftTargetName() + "\n")
+	body.WriteString("Target: " + target + "\n")
 	body.WriteString(plural(len(rows), "repository", "repositories") + " to index deeply")
+	var parts []string
 	if inStep > 0 {
-		body.WriteString(" (" + gfy.Itoa(inStep) + " already current, skipped)")
+		parts = append(parts, gfy.Itoa(inStep)+" already current")
+	}
+	if queued > 0 {
+		parts = append(parts, gfy.Itoa(queued)+" already queued or running")
+	}
+	if len(parts) > 0 {
+		body.WriteString(" (" + strings.Join(parts, ", ") + ", skipped)")
 	}
 	body.WriteString("\n\n")
 	body.WriteString(graftDeepPlanSummary(rows))
@@ -262,6 +309,22 @@ func (a *App) confirmSyncGraftDeep(rows []board.Row, inStep int, backend, model 
 	frame.SetChild(lbl)
 	extra.Append(frame)
 
+	names := make([]string, 0, len(rows))
+	for _, r := range rows {
+		names = append(names, board.Tilde(r.Path))
+	}
+	sw := gtk.NewScrolledWindow()
+	sw.SetPolicy(gtk.PolicyNever, gtk.PolicyAutomatic)
+	sw.SetPropagateNaturalHeight(true)
+	sw.SetMaxContentHeight(200)
+	lbl2 := monoLabel(strings.Join(names, "\n"))
+	lbl2.SetMarginTop(8)
+	lbl2.SetMarginBottom(8)
+	lbl2.SetMarginStart(8)
+	lbl2.SetMarginEnd(8)
+	sw.SetChild(lbl2)
+	extra.Append(sw)
+
 	var entry *gtk.Entry
 	typed := len(rows) > 1 && len(rows) >= set.ConfirmBatchAt
 	if typed {
@@ -294,11 +357,34 @@ func (a *App) confirmSyncGraftDeep(rows []board.Row, inStep int, backend, model 
 	queue := append([]board.Row(nil), rows...)
 	mutate := a.graftDeepParams()
 	dlg.ConnectResponse(func(resp string) {
-		if resp == "sync" {
-			a.submit(gfy.GraftDeepKind, queue, mutate)
+		if resp != "sync" {
+			return
+		}
+		// The dedupe above ran when the dialog opened; a typed-count confirm
+		// can sit open for a while, and another path may have queued a deep
+		// job on some of these since. On a metered pin each duplicate is a
+		// full per-file bill, so the queue is filtered again at the click.
+		q := withoutLive(queue, a.liveGraftDeep())
+		if skipped := len(queue) - len(q); skipped > 0 {
+			a.toastf("skipped %s queued since the dialog opened",
+				plural(skipped, "repo", "repos"))
+		}
+		if len(q) > 0 {
+			a.submit(gfy.GraftDeepKind, q, mutate)
 		}
 	})
 	dlg.Present(a.win)
+}
+
+// withoutLive drops the rows a job is already queued or running on.
+func withoutLive(rows []board.Row, live map[string]bool) []board.Row {
+	out := make([]board.Row, 0, len(rows))
+	for _, r := range rows {
+		if !live[r.Path] {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // graftDeepPlanSummary is graftPlanSummary plus the state the free sweep has

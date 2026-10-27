@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/dns/ggraphify/internal/applog"
@@ -76,11 +77,10 @@ const (
 	OpenCodeBaseURLVar = "OPENCODE_BASE_URL"
 
 	// OpenCodeZenBaseURLVar is the same override for the Zen plan. Two
-	// variables rather than one, because the two plans now exist side by side
+	// variables rather than one, because the three plans now exist side by side
 	// in one process: a single variable could only move whichever endpoint was
-	// selected at the moment it was read, and a board that had moved BOTH
-	// gateways to one URL would be quietly billing one plan's runs to the
-	// other.
+	// selected at the moment it was read, and a board that had moved ALL of
+	// them to one URL would be quietly billing one plan's runs to another.
 	OpenCodeZenBaseURLVar = "OPENCODE_ZEN_BASE_URL"
 
 	// OpenCodeModelVar is the registered entry's `model_env_key`, so it
@@ -112,6 +112,34 @@ const (
 	// OpenCodeCatalog is one dropdown away.
 	DefaultOpenCodeModel = "glm-5.3-flash"
 
+	// OllamaCloudBackend is Ollama Cloud's hosted models, the same provider id
+	// opencode and models.dev use. It is metered against OllamaCloudKeyVar,
+	// and it is NOT graphify's built-in "ollama", which is the local server.
+	OllamaCloudBackend = "ollama-cloud"
+
+	// OllamaCloudKeyVar is that account's credential. It is deliberately NOT
+	// OllamaKeyVar: the local graft-deep target (ollama, or openai pointed at
+	// a LAN server) reads OLLAMA_API_KEY and exports it as GRAFT_API_KEY, so a
+	// paid cloud key under that name would be sent to whatever OLLAMA_HOST or
+	// OPENAI_BASE_URL points at.
+	OllamaCloudKeyVar = "OLLAMA_CLOUD_API_KEY"
+
+	// OllamaCloudBaseURLVar moves the endpoint written into the provider
+	// entry — a proxy in front of Ollama Cloud.
+	OllamaCloudBaseURLVar = "OLLAMA_CLOUD_BASE_URL"
+
+	// OllamaCloudModelVar is the entry's model_env_key for this plan, kept
+	// apart from the two OpenCode ones for the same reason they are apart.
+	OllamaCloudModelVar = "GRAPHIFY_OLLAMA_CLOUD_MODEL"
+
+	// DefaultOllamaCloudBaseURL is Ollama Cloud's OpenAI-compatible endpoint:
+	// the hosted service, not a server on this machine.
+	DefaultOllamaCloudBaseURL = "https://ollama.com/v1"
+
+	// DefaultOllamaCloudModel is what a run with no model chosen asks for: a
+	// wide-context flash model at the cheap end of the plan.
+	DefaultOllamaCloudModel = "deepseek-v4.1-flash"
+
 	// openCodeMaxTokens matches what every OpenAI-compatible backend in
 	// llm.py's own table asks for. Every model on this plan allows far more,
 	// so it is the floor and the fallback rather than the answer —
@@ -137,11 +165,11 @@ const (
 // test can answer it locally; nothing in the application writes it.
 var ModelsDevURL = "https://models.dev/api.json"
 
-// An OpenCodePlan is one of the two OpenCode subscriptions, and everything
-// that differs between them. They differ in more than a URL: the endpoint
-// decides the bill, the models.dev provider decides the prices, the model
-// env key and the provider entry are per plan, and the proxy needs a path of
-// its own per plan so one loopback port can serve both.
+// An OpenCodePlan is one of the three OpenCode plans, and everything that
+// differs between them. They differ in more than a URL: the endpoint decides
+// the bill, the models.dev provider decides the prices, the model env key and
+// the provider entry are per plan, and the proxy needs a path of its own per
+// plan so one loopback port can serve all of them.
 //
 // It is a value rather than a mode switch on purpose. A package-level
 // "current plan" would be read by the proxy handler, the catalogue fetch and
@@ -157,8 +185,8 @@ type OpenCodePlan struct {
 	DefaultURL string
 	URLVar     string
 	// ModelsDevProvider is the provider id to read prices and context windows
-	// from. The two plans are published separately there, and joining one
-	// plan's models to the other's prices would put a number on screen that
+	// from. The plans are published separately there, and joining one
+	// plan's models to another's prices would put a number on screen that
 	// nobody will be charged.
 	ModelsDevProvider string
 	// ModelVar is the entry's model_env_key.
@@ -171,12 +199,24 @@ type OpenCodePlan struct {
 	// plan has no fixed answer and the catalogue decides; see
 	// DefaultModelFor.
 	DefaultModel string
+	// KeyVar is the credential variable graphify reads for this plan — the
+	// `env_key` of the registered entry, so the value stays in the inherited
+	// environment.
+	KeyVar string
+	// KeyURL is where to get that key, named in the refusal.
+	KeyURL string
+	// Tag is the short name the proxy advertises in its probe body: "go",
+	// "zen" or "ollama".
+	Tag string
+	// SessionHeader says whether the gateway requires x-opencode-session.
+	// Ollama Cloud does not, so the header is left off its requests.
+	SessionHeader bool
 	// Billing is the sentence the confirm dialog says about where the money
 	// comes from.
 	Billing string
 }
 
-// openCodePlans is the pair, Go first.
+// openCodePlans is the three plans, Go first.
 var openCodePlans = []OpenCodePlan{{
 	Backend:           OpenCodeBackend,
 	Name:              "OpenCode Go",
@@ -186,6 +226,10 @@ var openCodePlans = []OpenCodePlan{{
 	ModelVar:          OpenCodeModelVar,
 	ProxyPath:         "/v1",
 	DefaultModel:      DefaultOpenCodeModel,
+	KeyVar:            OpenCodeKeyVar,
+	KeyURL:            "https://opencode.ai/docs/go",
+	Tag:               "go",
+	SessionHeader:     true,
 	Billing: "drawn from that $10/month subscription's monthly allowance for this " +
 		"model rather than from an API balance",
 }, {
@@ -200,30 +244,52 @@ var openCodePlans = []OpenCodePlan{{
 	// than Go's, it moves faster, and the models worth defaulting to are the
 	// ones it serves at no charge, which is a fact only the live catalogue
 	// carries. DefaultModelFor picks from what the gateway actually said.
-	DefaultModel: "",
+	DefaultModel:  "",
+	KeyVar:        OpenCodeKeyVar,
+	KeyURL:        "https://opencode.ai/docs/zen",
+	Tag:           "zen",
+	SessionHeader: true,
 	Billing: "billed per token to that OpenCode account, at the price shown against the " +
 		"model — except the models the gateway serves free, which are labelled as such",
+}, {
+	Backend:           OllamaCloudBackend,
+	Name:              "Ollama Cloud",
+	DefaultURL:        DefaultOllamaCloudBaseURL,
+	URLVar:            OllamaCloudBaseURLVar,
+	ModelsDevProvider: "ollama-cloud",
+	ModelVar:          OllamaCloudModelVar,
+	ProxyPath:         "/ollama/v1",
+	DefaultModel:      DefaultOllamaCloudModel,
+	KeyVar:            OllamaCloudKeyVar,
+	KeyURL:            "https://ollama.com/settings/keys",
+	Tag:               "ollama",
+	SessionHeader:     false,
+	Billing: "billed to that Ollama account — drawn from its Ollama Cloud plan's " +
+		"usage, or per token at the price shown against the model",
 }}
 
-// OpenCodePlans is both plans, for a caller building a picker.
+// OpenCodePlans is all three plans, for a caller building a picker.
 func OpenCodePlans() []OpenCodePlan {
 	return append([]OpenCodePlan(nil), openCodePlans...)
 }
 
-// IsOpenCodeBackend reports whether a backend name is one of the two OpenCode
-// plans. Every `== OpenCodeBackend` that meant "is this OpenCode" rather than
-// "is this specifically the Go plan" is this instead.
+// IsOpenCodeBackend reports whether a backend name is one of the three plans.
+// Every `== OpenCodeBackend` that meant "is this OpenCode" rather than "is
+// this specifically the Go plan" is this instead.
 func IsOpenCodeBackend(backend string) bool {
 	b := strings.TrimSpace(backend)
-	return b == OpenCodeBackend || b == OpenCodeZenBackend
+	return b == OpenCodeBackend || b == OpenCodeZenBackend || b == OllamaCloudBackend
 }
 
 // OpenCodePlanFor resolves a backend name to its plan. Anything that is not
-// Zen resolves to Go, so a caller that has not been taught about plans at all
-// behaves exactly as it did before this existed.
+// one of the three resolves to Go, so a caller that has not been taught about
+// plans at all behaves exactly as it did before this existed.
 func OpenCodePlanFor(backend string) OpenCodePlan {
-	if strings.TrimSpace(backend) == OpenCodeZenBackend {
-		return openCodePlans[1]
+	b := strings.TrimSpace(backend)
+	for _, p := range openCodePlans {
+		if p.Backend == b {
+			return p
+		}
 	}
 	return openCodePlans[0]
 }
@@ -432,9 +498,27 @@ var openCodeCatalog = []OpenCodeModel{
 	{ID: "hy3-preview", Name: "hy3-preview", Input: 0, Output: 0, Context: 0, MaxOutput: 0, Priced: false},
 }
 
-// The catalogue is cached per plan: the two gateways serve different model
-// lists at different prices, and one cache for both would answer the Zen
-// dropdown with Go's models the moment Go was refreshed first.
+// ollamaCloudCatalog is Ollama Cloud's model list as of the date below, baked
+// in for the same reasons openCodeCatalog is: the dropdown is populated before
+// any network call, and on a machine that cannot reach the network at all.
+//
+// Sorted by input price, cheapest first, so an extraction sweep starts at the
+// cheap end of the plan. Generated on 2026-10-20 from
+// https://ollama.com/v1/models joined with models.dev's ollama-cloud provider.
+var ollamaCloudCatalog = []OpenCodeModel{
+	{ID: "nemotron-3-nano:30b", Name: "Nemotron 3 Nano 30B", Input: 0.06, Output: 0.24, Context: 1048576, MaxOutput: 131072, Priced: true},
+	{ID: "gpt-oss:20b", Name: "gpt-oss 20B", Input: 0.07, Output: 0.3, Context: 131072, MaxOutput: 32768, Priced: true},
+	{ID: "gpt-oss:120b", Name: "gpt-oss 120B", Input: 0.15, Output: 0.6, Context: 131072, MaxOutput: 32768, Priced: true},
+	{ID: "deepseek-v4.1-flash", Name: "DeepSeek V4.1 Flash", Input: 0.15, Output: 0.6, Context: 1048576, MaxOutput: 384000, Priced: true},
+	{ID: "glm-5.3-flash", Name: "GLM-5.3-Flash", Input: 0.15, Output: 0.5, Context: 1000000, MaxOutput: 131072, Priced: true},
+	{ID: "minimax-m3.1-flash", Name: "MiniMax-M3.1 Flash", Input: 0.15, Output: 0.6, Context: 1000000, MaxOutput: 512000, Priced: true},
+	{ID: "glm-5.3", Name: "GLM-5.3", Input: 1.4, Output: 4.4, Context: 1048576, MaxOutput: 131072, Priced: true},
+}
+
+// The catalogue is cached per plan: the three gateways serve different model
+// lists at different prices, and one cache for all of them would answer one
+// plan's dropdown with another's models the moment that one was refreshed
+// first.
 type catalogEntry struct {
 	models  []OpenCodeModel
 	fetched time.Time
@@ -458,14 +542,17 @@ func OpenCodeCatalog(backend string) []OpenCodeModel {
 	return models
 }
 
-// bakedCatalog is what a plan offers before the gateway has answered. Go has
-// a table; Zen deliberately has none — its catalogue is wider, moves faster,
-// and inventing ids for it would put models in a dropdown that no gateway
-// ever served. An empty list is the honest starting point, and the settings
-// page says the list arrives with the first refresh.
+// bakedCatalog is what a plan offers before the gateway has answered. Go and
+// Ollama Cloud have tables; Zen deliberately has none — its catalogue is
+// wider, moves faster, and inventing ids for it would put models in a dropdown
+// that no gateway ever served. An empty list is the honest starting point, and
+// the settings page says the list arrives with the first refresh.
 func bakedCatalog(backend string) []OpenCodeModel {
-	if OpenCodePlanFor(backend).Backend == OpenCodeZenBackend {
+	switch OpenCodePlanFor(backend).Backend {
+	case OpenCodeZenBackend:
 		return nil
+	case OllamaCloudBackend:
+		return ollamaCloudCatalog
 	}
 	return openCodeCatalog
 }
@@ -757,6 +844,17 @@ func OpenCodeUpstream(backend string) string {
 // environment. Like every other credential here it is asked about, never read.
 func HasOpenCodeKey() bool { return strings.TrimSpace(os.Getenv(OpenCodeKeyVar)) != "" }
 
+// HasPlanKey reports whether the credential a plan reads is visible in this
+// environment. Ollama Cloud reads OllamaCloudKeyVar rather than
+// OPENCODE_API_KEY, so this is the question its readiness check has to ask.
+func HasPlanKey(backend string) bool {
+	return strings.TrimSpace(os.Getenv(OpenCodePlanFor(backend).KeyVar)) != ""
+}
+
+// PlanKeyVar is the credential variable this plan reads, for a caller that has
+// to name it without resolving the plan itself.
+func PlanKeyVar(backend string) string { return OpenCodePlanFor(backend).KeyVar }
+
 // ProvidersPath is graphify's global custom-provider file. The project-local
 // .graphify/providers.json is deliberately not touched: llm.py ignores that
 // one unless GRAPHIFY_ALLOW_LOCAL_PROVIDERS is set, precisely because a file
@@ -807,7 +905,17 @@ func OpenCodeProvider(backend string) (baseURL, model string, registered bool) {
 // same reason and joined the set for it; see OpenCodeOutputBudget. Any other
 // field a user adds by hand survives, as does every other provider in the
 // file: it is decoded as raw JSON per name and re-encoded.
-func EnsureOpenCodeProvider(backend, model string) (path string, wrote bool, err error) {
+//
+// overlay is the job's env overlay: with no model chosen, its model_env_key
+// is the model graphify will run, so it is also the one whose price the entry
+// must carry.
+//
+// The read-modify-write runs under an flock on a sibling .lock file, and the
+// new contents replace the old by rename: two submits for different plans —
+// or this board and a ggraphify-job — would otherwise drop each other's
+// entries or interleave into a file nothing can parse, and a graphify child
+// starting mid-write would read it truncated.
+func EnsureOpenCodeProvider(backend string, overlay Env, model string) (path string, wrote bool, err error) {
 	if !IsOpenCodeBackend(backend) {
 		return "", false, nil
 	}
@@ -824,6 +932,15 @@ func EnsureOpenCodeProvider(backend, model string) (path string, wrote bool, err
 	if err != nil {
 		return path, false, err
 	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return path, false, err
+	}
+	unlock, err := lockProviders(path)
+	if err != nil {
+		return path, false, err
+	}
+	defer unlock()
 
 	all := map[string]json.RawMessage{}
 	switch b, rerr := os.ReadFile(path); { // #nosec G304 -- a fixed path under the user's own home
@@ -851,17 +968,19 @@ func EnsureOpenCodeProvider(backend, model string) (path string, wrote bool, err
 	}
 	// A blank model means "whatever is registered" rather than "reset to the
 	// board's default": ggraphify-job takes its model from a flag and a run
-	// without one must not undo the model chosen in settings.
-	if strings.TrimSpace(model) == "" {
+	// without one must not undo the model chosen in settings. An overlay that
+	// names the plan's model_env_key is the exception — graphify runs that
+	// model, so its price is the one the entry has to carry.
+	if strings.TrimSpace(model) == "" && strings.TrimSpace(overlay[plan.ModelVar]) == "" {
 		if prev, _ := entry["default_model"].(string); strings.TrimSpace(prev) != "" {
 			model = prev
 		}
 	}
-	m, _ := OpenCodeModelFor(plan.Backend, nil, model)
+	m, _ := OpenCodeModelFor(plan.Backend, overlay, model)
 	managed := map[string]any{
 		"base_url":      proxy,
 		"default_model": m.ID,
-		"env_key":       OpenCodeKeyVar,
+		"env_key":       plan.KeyVar,
 		"model_env_key": plan.ModelVar,
 		"pricing":       map[string]float64{"input": m.Input, "output": m.Output},
 		// Managed for the same reason pricing is, and it took the same kind of
@@ -915,15 +1034,63 @@ func EnsureOpenCodeProvider(backend, model string) (path string, wrote bool, err
 	}
 	buf.WriteString("}\n")
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return path, false, err
-	}
 	// 0600: the file names an endpoint the corpus and the key are sent to, so
 	// it is only writable by the account whose key that is.
-	if err := os.WriteFile(path, []byte(buf.String()), 0o600); err != nil {
+	if err := writeFileAtomic(path, []byte(buf.String()), 0o600); err != nil {
 		return path, false, err
 	}
 	return path, true, nil
+}
+
+// lockProviders takes an exclusive flock on path+".lock", blocking until any
+// other writer — in this process or another — is done.
+func lockProviders(path string) (unlock func(), err error) {
+	f, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600) // #nosec G304 -- a fixed path under the user's own home
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+// writeFileAtomic writes a temporary file beside path, syncs it, and renames
+// it over path, so a reader sees the old contents or the new and never half.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = tmp.Close()
+			_ = os.Remove(name)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 // sameJSON compares a value decoded from the file with one about to be
@@ -1006,10 +1173,10 @@ func VerifyOpenCodeModel(ctx context.Context, backend, model string) (bool, stri
 		applog.Debugf("opencode verify: %s %s — cached verdict ok=%t %s", plan.Backend, model, ok, detail)
 		return ok, detail
 	}
-	key := strings.TrimSpace(os.Getenv(OpenCodeKeyVar))
+	key := strings.TrimSpace(os.Getenv(plan.KeyVar))
 	if key == "" {
-		applog.Warnf("opencode verify: %s %s — %s is not set in ggraphify's environment", plan.Backend, model, OpenCodeKeyVar)
-		return false, OpenCodeKeyVar + " is not set, so the gateway cannot be asked about " + model + "."
+		applog.Warnf("opencode verify: %s %s — %s is not set in ggraphify's environment", plan.Backend, model, plan.KeyVar)
+		return false, plan.KeyVar + " is not set, so the gateway cannot be asked about " + model + "."
 	}
 
 	body := `{"model":` + jsonString(model) +
@@ -1023,7 +1190,10 @@ func VerifyOpenCodeModel(ctx context.Context, backend, model string) (bool, stri
 	req.Header.Set("Content-Type", "application/json")
 	// The same two headers the proxy adds to a job's requests, because a probe
 	// that skipped them would fail for a reason the real traffic does not have.
-	req.Header.Set("x-opencode-session", OpenCodeSession())
+	// Ollama Cloud asks for neither, and is asked with neither.
+	if plan.SessionHeader {
+		req.Header.Set("x-opencode-session", OpenCodeSession())
+	}
 	req.Header.Set("User-Agent", "ggraphify/"+AppVersion)
 
 	started := time.Now()
@@ -1078,7 +1248,7 @@ const openCodeSweepConcurrency = 4
 // asked again next time.
 func VerifyOpenCodeCatalog(ctx context.Context, backend string, models []OpenCodeModel, onResult func(id string, ok bool, detail string)) {
 	plan := OpenCodePlanFor(backend)
-	if !HasOpenCodeKey() || len(models) == 0 {
+	if !HasPlanKey(plan.Backend) || len(models) == 0 {
 		return
 	}
 	ids := make(chan string)
@@ -1146,12 +1316,12 @@ func jsonString(s string) string {
 // PreflightOpenCode is the check a job runs before it is queued: is this model
 // one the gateway will actually answer with. It is a no-op for every other
 // backend, and for a model already verified in this process.
-func PreflightOpenCode(backend, model string) error {
+func PreflightOpenCode(backend string, overlay Env, model string) error {
 	if !IsOpenCodeBackend(backend) {
 		return nil
 	}
 	plan := OpenCodePlanFor(backend)
-	m, _ := OpenCodeModelFor(plan.Backend, nil, model)
+	m, _ := OpenCodeModelFor(plan.Backend, overlay, model)
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
 	if ok, detail := VerifyOpenCodeModel(ctx, plan.Backend, m.ID); !ok {
@@ -1168,11 +1338,18 @@ func PreflightOpenCode(backend, model string) error {
 // way to launching the job — so it is reported as what will happen rather than
 // as something wrong.
 func OpenCodeReady(backend, model string) (bool, string) {
+	return OpenCodeReadyWith(backend, nil, model)
+}
+
+// OpenCodeReadyWith is OpenCodeReady for a job whose env overlay is known: a
+// blank model resolves through the overlay's model_env_key the way graphify
+// will resolve it, so the model checked and named is the one that runs.
+func OpenCodeReadyWith(backend string, overlay Env, model string) (bool, string) {
 	plan := OpenCodePlanFor(backend)
-	if !HasOpenCodeKey() {
-		return false, "The " + plan.Backend + " backend needs " + OpenCodeKeyVar +
-			" exported in this environment, and none is visible. Subscribe at " +
-			"https://opencode.ai/docs/go, copy the key, export it and relaunch the board — " +
+	if !HasPlanKey(plan.Backend) {
+		return false, "The " + plan.Backend + " backend needs " + plan.KeyVar +
+			" exported in this environment, and none is visible. Get a key at " +
+			plan.KeyURL + ", export it and relaunch the board — " +
 			"ggraphify never stores a key itself."
 	}
 	_, _, registered := OpenCodeProvider(plan.Backend)
@@ -1181,7 +1358,7 @@ func OpenCodeReady(backend, model string) (bool, string) {
 	// session header on, and saying "127.0.0.1" here would only puzzle
 	// somebody checking where their corpus goes.
 	where := OpenCodeUpstream(plan.Backend)
-	m, origin := OpenCodeModelFor(plan.Backend, nil, model)
+	m, origin := OpenCodeModelFor(plan.Backend, overlay, model)
 	if m.ID == "" {
 		// Zen, before the first catalogue. Nothing is wrong and nothing is
 		// ready: there is no model to name yet.
@@ -1213,7 +1390,7 @@ func OpenCodeReady(backend, model string) (bool, string) {
 		return false, detail + ". Pick another model below — a model can be listed by the " +
 			"gateway and still refuse this account or region."
 	}
-	s := OpenCodeKeyVar + " is visible in this environment; requests go to " + where +
+	s := plan.KeyVar + " is visible in this environment; requests go to " + where +
 		", " + plan.Billing + ".\nModel: " + m.Label() + " (from " + origin + ")."
 	if registered {
 		return true, s + " The provider is registered in " + Tilde(ProvidersPath()) + "."

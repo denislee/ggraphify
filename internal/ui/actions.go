@@ -337,10 +337,19 @@ func (a *App) confirm(kind string, rows []board.Row, mutate func(*gfy.Params)) {
 	dlg.SetCloseResponse("cancel")
 
 	if typed {
-		dlg.SetResponseEnabled("run", false)
+		// Every response that submits is gated, not just "run": the free
+		// --code-only run is still the fan-out over every row the typed count
+		// exists to stop.
+		gated := typedGateResponses(dlg.HasResponse("free"))
+		for _, id := range gated {
+			dlg.SetResponseEnabled(id, false)
+		}
 		want := gfy.Itoa(len(rows))
 		entry.ConnectChanged(func() {
-			dlg.SetResponseEnabled("run", strings.TrimSpace(entry.Text()) == want)
+			ok := strings.TrimSpace(entry.Text()) == want
+			for _, id := range gated {
+				dlg.SetResponseEnabled(id, ok)
+			}
 		})
 	}
 
@@ -358,6 +367,15 @@ func (a *App) confirm(kind string, rows []board.Row, mutate func(*gfy.Params)) {
 		}
 	})
 	dlg.Present(a.win)
+}
+
+// typedGateResponses lists the confirm responses the typed-count gate holds
+// disabled until the count is typed: every one that submits anything.
+func typedGateResponses(freeOffered bool) []string {
+	if freeOffered {
+		return []string{"run", "free"}
+	}
+	return []string{"run"}
 }
 
 // meteredNotice is the block that stands between a click and a bill: which
@@ -417,12 +435,16 @@ func (a *App) meteredNotice(sample gfy.Params) string {
 			"Claude Code CLI on this machine, billed to the " + acc.Name +
 			" login's plan rather than to an API key.\n")
 		b.WriteString("Claude Code account: " + acc.Name + " (" + acc.Dir + ")\n")
-	case gfy.OpenCodeBackend, gfy.OpenCodeZenBackend:
+	case gfy.OpenCodeBackend, gfy.OpenCodeZenBackend, gfy.OllamaCloudBackend:
 		plan := gfy.OpenCodePlanFor(backend)
 		b.WriteString("This is METERED. It dispatches LLM requests to " + plan.Name +
-			" against " + gfy.OpenCodeKeyVar + ", " + plan.Billing + ".\n")
-		b.WriteString("Endpoint: " + gfy.OpenCodeUpstream(backend) + " (through this board's loopback " +
-			"proxy, which adds the session header the gateway requires)\n")
+			" against " + plan.KeyVar + ", " + plan.Billing + ".\n")
+		if plan.SessionHeader {
+			b.WriteString("Endpoint: " + gfy.OpenCodeUpstream(backend) + " (through this board's loopback " +
+				"proxy, which adds the session header the gateway requires)\n")
+		} else {
+			b.WriteString("Endpoint: " + gfy.OpenCodeUpstream(backend) + " (through this board's loopback proxy)\n")
+		}
 	default:
 		b.WriteString("This is METERED. It dispatches LLM requests against your " +
 			"own API key and will be billed.\n")
@@ -434,7 +456,7 @@ func (a *App) meteredNotice(sample gfy.Params) string {
 	if gfy.IsOpenCodeBackend(backend) {
 		// BackendReady answers for a job with nothing chosen; here the model
 		// is known, and it is half of what this backend's readiness means.
-		ready, why = gfy.OpenCodeReady(backend, sample.Model)
+		ready, why = gfy.OpenCodeReadyWith(backend, a.opts.Store.Overlay(sample.Repo), sample.Model)
 	}
 	if !ready {
 		b.WriteString("\n⚠ " + why + "\nEvery one of these runs is likely to fail.")
@@ -603,10 +625,6 @@ func (a *App) actWatch() {
 	}
 	a.run("watch", []board.Row{*r}, nil)
 }
-
-// actGlobalAdd merges the selected repositories' graphs into the global graph
-// under a tag, which is the cross-repo answer the CLI makes tedious.
-func (a *App) actGlobalAdd() { a.globalAdd(a.batch()) }
 
 // actGlobalToggle is the membership switch: one key that puts the selection
 // into the global graph or takes it out again.

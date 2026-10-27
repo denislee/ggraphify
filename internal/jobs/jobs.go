@@ -23,6 +23,7 @@ package jobs
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
@@ -124,6 +125,12 @@ type Job struct {
 	// still owns its output directory, and must not look finished to anything
 	// that keys off Status.Done.
 	paused bool
+	// exited is set, under the runner's lock, the moment the job's process has
+	// been waited for. Status stays Running until the terminal bookkeeping a
+	// little later, so it is this flag that tells setPaused the process it
+	// is about to stop is gone — and that whatever answers the signal is a
+	// straggler of its group, not the job.
+	exited bool
 	// pausedAt and pausedFor are the elapsed clock's accounting. A stopped
 	// process is not working, so the time it spends stopped is subtracted
 	// from Elapsed — which is not cosmetic: Elapsed is what the run history
@@ -337,7 +344,26 @@ type Options struct {
 	// nothing else, which is the correct thing to spend: the job cannot run
 	// before its server answers anyway.
 	LocalLease func(*Job) Lease
+
+	// Tee, when set, receives a verbatim copy of every job's log as it is
+	// written — the command header, the subprocess's output and the runner's
+	// own notes, in order. It is the headless runner's stdout: the ring buffer
+	// evicts, folds carriage returns and is compacted at retirement, so a
+	// reader that prints String() deltas loses text, where a tee cannot.
+	Tee io.Writer
+
+	// WaitDelay bounds how long a job waits, once its process has exited, for
+	// whatever else holds its output pipe — a grandchild that called setsid,
+	// or one left running in the background — before the pipe is closed and
+	// the job finishes anyway. Zero means DefaultWaitDelay.
+	WaitDelay time.Duration
 }
+
+// DefaultWaitDelay is how long run waits, after the job's own process has
+// exited, for its output pipe to reach EOF. Without a bound, exec.Cmd.Wait
+// waits for every process holding the pipe, so a lingering grandchild kept the
+// job Running — and its lane and its repository — for as long as it lived.
+const DefaultWaitDelay = 2 * time.Second
 
 // Lease is a job's claim on a resource that exists only while it runs — in
 // practice the local model server, though the runner is deliberately told
@@ -500,6 +526,9 @@ func New(opts Options) *Runner {
 	if opts.KillGrace <= 0 {
 		opts.KillGrace = DefaultKillGrace
 	}
+	if opts.WaitDelay <= 0 {
+		opts.WaitDelay = DefaultWaitDelay
+	}
 	r := &Runner{
 		opts:     opts,
 		running:  map[uint64]*Job{},
@@ -559,6 +588,11 @@ func (r *Runner) Submit(j *Job) *Job {
 	if j.Log == nil {
 		j.Log = ringbuf.New(r.opts.LogBytes)
 	}
+	if r.opts.Tee != nil {
+		// Before the job is queued, so not even the command header can be
+		// written ahead of the copy.
+		j.Log.SetTee(r.opts.Tee)
+	}
 	if j.done == nil {
 		j.done = make(chan struct{})
 	}
@@ -604,11 +638,11 @@ func (r *Runner) SubmitCmd(kind, repo, label string, p gfy.Params, env gfy.Env) 
 		// a say, and the argv alone does not say which of them won.
 		applog.Infof("submit %s (%s work) %s: backend=%q model=%q", kind, w, repo, p.Backend, p.Model)
 	}
-	if err := gfy.PreflightOpenCode(p.Backend, p.Model); err != nil {
+	if err := gfy.PreflightOpenCode(p.Backend, env, p.Model); err != nil {
 		applog.Warnf("submit %s %s refused by the preflight: %v", kind, repo, err)
 		return nil, errors.New("jobs: " + err.Error())
 	}
-	if path, wrote, err := gfy.EnsureOpenCodeProvider(p.Backend, p.Model); err != nil {
+	if path, wrote, err := gfy.EnsureOpenCodeProvider(p.Backend, env, p.Model); err != nil {
 		return nil, errors.New("jobs: cannot register the " + p.Backend +
 			" provider in " + path + ": " + err.Error())
 	} else if wrote {
@@ -900,13 +934,18 @@ func (r *Runner) Paused(id uint64) bool {
 	return j != nil && j.paused
 }
 
+// pauseSignalled is a test seam: when set, setPaused calls it after signalling
+// the group and before it records the change, which is exactly the window a
+// natural exit can land in.
+var pauseSignalled func(*Job)
+
 func (r *Runner) setPaused(id uint64, want bool) bool {
 	r.mu.Lock()
 	j := r.running[id]
 	// pgid is zero for the instant between dispatch and exec.Start; there is
 	// no group to signal yet, so the caller is told nothing happened rather
 	// than being given a pause that silently did not take.
-	if j == nil || j.Status != Running || j.pgid == 0 || j.paused == want {
+	if j == nil || j.Status != Running || j.exited || j.pgid == 0 || j.paused == want {
 		r.mu.Unlock()
 		return false
 	}
@@ -946,8 +985,29 @@ func (r *Runner) setPaused(id uint64, want bool) bool {
 		lease.Suspend()
 	}
 
+	if pauseSignalled != nil {
+		pauseSignalled(j)
+	}
+
 	now := time.Now()
 	r.mu.Lock()
+	// The lock was let go to signal, and the process can have exited in that
+	// window. A pause recorded now would mark a finished job Paused and hand
+	// its lane over a second time; worse, the SIGSTOP went to whatever of its
+	// group survived it, and nothing would ever continue them. Undo the
+	// signal instead and report that nothing happened.
+	if j.exited || j.Status != Running {
+		r.mu.Unlock()
+		if want {
+			_ = syscall.Kill(-pgid, syscall.SIGCONT)
+			if lease != nil {
+				// Release follows from run; Suspend after it is tolerated by
+				// contract, and Resume would wake a server for nobody.
+				lease.Suspend()
+			}
+		}
+		return false
+	}
 	if want {
 		j.pausedAt = now
 	} else {
@@ -1370,6 +1430,14 @@ func (r *Runner) run(j *Job, ctx context.Context, cancel context.CancelFunc) {
 	cmd.Stdin = nil
 	// Its own process group, so cancel reaches the AST worker subprocesses too.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Stdout is a pipe, not an *os.File, so Wait copies until EOF — which
+	// does not come while anything at all holds the write end. A grandchild
+	// that outlives the job (setsid, or a background helper) used to keep the
+	// job Running forever and Close blocked behind it. WaitDelay closes the
+	// pipe that long after the process itself has exited.
+	r.mu.Lock()
+	cmd.WaitDelay = r.opts.WaitDelay
+	r.mu.Unlock()
 
 	// exited is closed the instant Wait returns, so the reaper can tell a
 	// normal exit apart from a cancellation. Without it the deferred cancel
@@ -1392,6 +1460,21 @@ func (r *Runner) run(j *Job, ctx context.Context, cancel context.CancelFunc) {
 		r.mu.Unlock()
 		go r.reap(ctx, exited, j, cmd)
 		err = cmd.Wait()
+		r.mu.Lock()
+		j.exited = true
+		r.mu.Unlock()
+		// The pipe was closed on a straggler rather than at EOF. The job's own
+		// process exited cleanly — that is the only case Wait reports this
+		// way — so its outcome stands; what it left behind is said in the log
+		// and terminated below with the rest of its group.
+		if errors.Is(err, exec.ErrWaitDelay) {
+			j.Log.WriteString("ggraphify: the process exited but something it started still held its output — stopped waiting for it\n")
+			err = nil
+		}
+		// Whatever is left in the group is the job's and goes with it, before
+		// the job is reported finished: a straggler still writing into the
+		// output directory is exactly what busyRepo exists to exclude.
+		r.reapGroup(j, cmd.Process.Pid)
 	}
 	close(exited)
 
@@ -1498,6 +1581,31 @@ func (r *Runner) reap(ctx context.Context, exited <-chan struct{}, j *Job, cmd *
 		j.Log.WriteString("ggraphify: still alive after the grace period — SIGKILL\n")
 		_ = syscall.Kill(pgid, syscall.SIGKILL)
 	}
+}
+
+// reapGroup terminates whatever is left of a job's process group after its
+// leader has exited: SIGTERM (and SIGCONT, in case the group was paused), then
+// SIGKILL after the kill grace. A group that is already empty — the normal
+// case — costs one kill(2).
+func (r *Runner) reapGroup(j *Job, pgid int) {
+	if pgid <= 0 || syscall.Kill(-pgid, 0) != nil {
+		return
+	}
+	j.Log.WriteString("ggraphify: the process exited and left others in its group — sending SIGTERM\n")
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	_ = syscall.Kill(-pgid, syscall.SIGCONT)
+	r.mu.Lock()
+	grace := r.opts.KillGrace
+	r.mu.Unlock()
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if syscall.Kill(-pgid, 0) != nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	j.Log.WriteString("ggraphify: still alive after the grace period — SIGKILL\n")
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
 }
 
 // retire moves a finished job into the bounded history. Called with the lock.

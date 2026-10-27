@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -255,5 +256,114 @@ func TestRequestModel(t *testing.T) {
 		if got := requestModel([]byte(body)); got != want {
 			t.Errorf("requestModel(%q) = %q, want %q", body, got, want)
 		}
+	}
+}
+
+// fakeSiblingProxy stands in for another ggraphify's proxy on a port of its
+// own, advertising the given plan list, and points this process at that port.
+func fakeSiblingProxy(t *testing.T, plans string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == openCodeProbePath {
+			_, _ = io.WriteString(w, openCodeProbeBody+" old plans="+plans)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv(OpenCodePortVar, strings.TrimPrefix(srv.URL, "http://127.0.0.1:"))
+	return srv
+}
+
+// W4: once a shared proxy's root is cached, a later plan still has to be one
+// that proxy serves. An older sibling that only serves Go must not be handed
+// an ollama-cloud run because a Go run got there first.
+func TestASharedProxyIsCheckedForEveryPlan(t *testing.T) {
+	resetProxy(t)
+	fakeSiblingProxy(t, "go")
+
+	if _, err := StartOpenCodeProxy(OpenCodeBackend); err != nil {
+		t.Fatalf("StartOpenCodeProxy(go) on a Go-only sibling: %v", err)
+	}
+	if _, owned, _, _ := OpenCodeProxyActivity(); owned {
+		t.Fatal("owned = true, want the sibling's proxy shared")
+	}
+	if base, err := StartOpenCodeProxy(OllamaCloudBackend); err == nil {
+		t.Fatalf("StartOpenCodeProxy(ollama-cloud) = %q, nil; want a refusal — the sibling does not serve that path", base)
+	}
+	if base, err := StartOpenCodeProxy(OpenCodeZenBackend); err == nil {
+		t.Fatalf("StartOpenCodeProxy(zen) = %q, nil; want a refusal", base)
+	}
+}
+
+// W10: a shared proxy whose owner has quit is not cached forever — the next
+// Start finds the port free and binds it here.
+func TestASharedProxyIsReboundAfterItsOwnerQuits(t *testing.T) {
+	resetProxy(t)
+	sib := fakeSiblingProxy(t, "go,zen,ollama")
+
+	first, err := StartOpenCodeProxy(OpenCodeBackend)
+	if err != nil {
+		t.Fatalf("StartOpenCodeProxy: %v", err)
+	}
+	if _, owned, _, _ := OpenCodeProxyActivity(); owned {
+		t.Fatal("owned = true, want the sibling's proxy shared")
+	}
+	sib.Close()
+
+	again, err := StartOpenCodeProxy(OpenCodeBackend)
+	if err != nil {
+		t.Fatalf("StartOpenCodeProxy after the owner quit: %v", err)
+	}
+	if again != first {
+		t.Errorf("base = %q, want the same port %q bound here", again, first)
+	}
+	if _, owned, _, _ := OpenCodeProxyActivity(); !owned {
+		t.Fatal("owned = false after the owner quit, want this process to have bound the port")
+	}
+	probe, err := http.Get(strings.TrimSuffix(again, "/v1") + openCodeProbePath) // #nosec G107 -- loopback, composed here
+	if err != nil {
+		t.Fatalf("the port answers nothing after the rebind: %v", err)
+	}
+	_ = probe.Body.Close()
+}
+
+// W23: concurrent Starts in one process bind one proxy between them.
+func TestConcurrentStartsBindOneProxy(t *testing.T) {
+	t.Setenv(OpenCodePortVar, "0")
+	resetProxy(t)
+
+	const n = 8
+	bases := make(chan string, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b, err := StartOpenCodeProxy(OpenCodeBackend)
+			if err != nil {
+				t.Errorf("StartOpenCodeProxy: %v", err)
+			}
+			bases <- b
+		}()
+	}
+	wg.Wait()
+	close(bases)
+	first := ""
+	for b := range bases {
+		if first == "" {
+			first = b
+		} else if b != first {
+			t.Errorf("concurrent Starts bound different proxies: %q and %q", first, b)
+		}
+	}
+}
+
+// W23: port 0 is a test-only request; from the environment it falls back to
+// the fixed default, which another ggraphify can find and share.
+func TestPortZeroIsRefused(t *testing.T) {
+	t.Setenv(OpenCodePortVar, "0")
+	if got := OpenCodeProxyPort(); got != DefaultOpenCodePort {
+		t.Errorf("OpenCodeProxyPort() with %s=0 = %d, want the default %d", OpenCodePortVar, got, DefaultOpenCodePort)
 	}
 }

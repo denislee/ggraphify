@@ -46,8 +46,9 @@ import (
 // connections from this machine only.
 const (
 	// OpenCodePortVar moves the proxy's port, for a machine where something
-	// else owns the default. 0 asks the kernel for any free port, which is
-	// what the tests use.
+	// else owns the default. 0 is refused (the default is used instead): the
+	// port is written into a file other processes read, so it has to be one
+	// they can find again.
 	OpenCodePortVar = "GGRAPHIFY_OPENCODE_PORT"
 
 	// DefaultOpenCodePort is high, fixed and otherwise unclaimed. Fixed
@@ -64,12 +65,12 @@ const (
 
 	// openCodeProbePlans is appended to the probe body, and is the whole
 	// reason the body is parsed rather than only prefix-matched. A proxy
-	// bound by an OLDER ggraphify serves the Go path and 404s the Zen one, so
-	// a board that inherited it and wrote a Zen entry pointing at it would
-	// have produced a run that failed every chunk on a path that does not
-	// exist. Sharing is still right when the other end can serve the plan
+	// bound by an OLDER ggraphify serves fewer paths, so a board that
+	// inherited it and wrote an entry pointing at a path it does not serve
+	// would have produced a run that failed every chunk on a path that does
+	// not exist. Sharing is still right when the other end can serve the plan
 	// being asked for; it is refused, by name, when it cannot.
-	openCodeProbePlans = " plans=go,zen"
+	openCodeProbePlans = " plans=go,zen,ollama"
 )
 
 // AppVersion is ggraphify's own version, set by main from the value the
@@ -77,6 +78,16 @@ const (
 // sends, which OpenCode Go asks to be the client's own rather than a generic
 // SDK name.
 var AppVersion = "dev"
+
+// proxyStart serialises StartOpenCodeProxy's check-then-bind. Without it two
+// submits racing past an empty root would each bind (or share) a proxy of
+// their own, and providers.json would carry whichever wrote last.
+var proxyStart sync.Mutex
+
+// allowEphemeralProxyPort lets a test ask for port 0. Nothing else may: a
+// port that moves every launch leaves provider entries pointing at nothing,
+// and another ggraphify can never find it to share.
+var allowEphemeralProxyPort = false
 
 var proxyState struct {
 	sync.Mutex
@@ -88,6 +99,10 @@ var proxyState struct {
 	// quitting here takes nothing away from anybody; a proxy we bound goes
 	// down with us, which is the fact the quit dialog is about.
 	owned bool
+	// plans is the plan list a SHARED proxy advertised the last time it was
+	// probed — the "plans=…" part of its body. Empty for one we own, which
+	// serves every plan this build knows.
+	plans string
 	// requests and last are what that dialog needs: this gateway is useful to
 	// tools outside ggraphify — a fleet-wide `graft build --deep` runs against
 	// it — and an external consumer whose LLM vanishes mid-run sees only a
@@ -143,7 +158,7 @@ func OpenCodeSession() string {
 // OpenCodeProxyPort is the port the proxy listens on.
 func OpenCodeProxyPort() int {
 	if v := strings.TrimSpace(os.Getenv(OpenCodePortVar)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 65535 {
+		if n, err := strconv.Atoi(v); err == nil && n <= 65535 && (n > 0 || (n == 0 && allowEphemeralProxyPort)) {
 			return n
 		}
 	}
@@ -152,7 +167,7 @@ func OpenCodeProxyPort() int {
 
 // OpenCodeProxyBase is the URL a plan's provider entry should carry, given
 // the proxy's root. One port, one path per plan: the handler reads the path to
-// know which gateway to forward to, so the two plans cannot be confused by
+// know which gateway to forward to, so the plans cannot be confused by
 // anything the client does or does not send.
 func OpenCodeProxyBase(root, backend string) string {
 	return strings.TrimSuffix(root, "/") + OpenCodePlanFor(backend).ProxyPath
@@ -162,15 +177,37 @@ func OpenCodeProxyBase(root, backend string) string {
 // base URL a provider entry for this plan should carry. It is idempotent: the
 // second call in a process returns the first call's answer, and a port already
 // held by another ggraphify's proxy is shared rather than fought over.
+//
+// A shared proxy is asked again on every call: the board that owns it may
+// have quit (its port is then free and this process binds it), or it may be
+// an older build that does not serve this plan's path (refused, by name).
 func StartOpenCodeProxy(backend string) (string, error) {
 	plan := OpenCodePlanFor(backend)
+	proxyStart.Lock()
+	defer proxyStart.Unlock()
+
 	proxyState.Lock()
-	if proxyState.root != "" {
-		root := proxyState.root
-		proxyState.Unlock()
+	root, owned := proxyState.root, proxyState.owned
+	proxyState.Unlock()
+	if root != "" && owned {
 		return OpenCodeProxyBase(root, plan.Backend), nil
 	}
-	proxyState.Unlock()
+	if root != "" {
+		addr := strings.TrimPrefix(root, "http://")
+		if _, plans, ok := probeOpenCodeProxy(addr); ok {
+			proxyState.Lock()
+			proxyState.plans = plans
+			proxyState.Unlock()
+			if err := sharedProxyServes(addr, plans, plan); err != nil {
+				return "", err
+			}
+			return OpenCodeProxyBase(root, plan.Backend), nil
+		}
+		applog.Warnf("opencode proxy: the shared one at %s no longer answers — binding the port here", root)
+		proxyState.Lock()
+		proxyState.root, proxyState.base, proxyState.plans = "", "", ""
+		proxyState.Unlock()
+	}
 
 	port := OpenCodeProxyPort()
 	addr := "127.0.0.1:" + Itoa(port)
@@ -180,15 +217,14 @@ func StartOpenCodeProxy(backend string) (string, error) {
 		// conflict — its proxy adds the same headers to the same upstream, so
 		// sharing it is correct and costs nothing.
 		if root, plans, ok := probeOpenCodeProxy(addr); ok {
-			if !strings.Contains(plans, "zen") && plan.Backend == OpenCodeZenBackend {
-				return "", errors.New("the proxy on " + addr + " belongs to an older ggraphify " +
-					"that only serves the OpenCode Go path, so it cannot carry an " +
-					OpenCodeZenBackend + " run. Quit that board, or set " + OpenCodePortVar +
-					" to another port for this one")
+			if err := sharedProxyServes(addr, plans, plan); err != nil {
+				return "", err
 			}
 			proxyState.Lock()
 			proxyState.root = root
 			proxyState.base = OpenCodeProxyBase(root, OpenCodeBackend)
+			proxyState.owned = false
+			proxyState.plans = plans
 			proxyState.Unlock()
 			applog.Infof("opencode proxy: sharing the one another ggraphify serves at %s (plans=%s)", root, plans)
 			return OpenCodeProxyBase(root, plan.Backend), nil
@@ -200,7 +236,7 @@ func StartOpenCodeProxy(backend string) (string, error) {
 	}
 
 	actual := ln.Addr().(*net.TCPAddr).Port
-	root := "http://127.0.0.1:" + Itoa(actual)
+	root = "http://127.0.0.1:" + Itoa(actual)
 
 	srv := &http.Server{
 		Handler: openCodeProxyHandler(),
@@ -220,20 +256,21 @@ func StartOpenCodeProxy(backend string) (string, error) {
 	proxyState.root = root
 	proxyState.base = OpenCodeProxyBase(root, OpenCodeBackend)
 	proxyState.owned = true
+	proxyState.plans = ""
 	proxyState.Unlock()
-	applog.Infof("opencode proxy: listening on %s → %s (go), %s (zen)", root,
-		OpenCodeUpstream(OpenCodeBackend), OpenCodeUpstream(OpenCodeZenBackend))
+	applog.Infof("opencode proxy: listening on %s → %s (go), %s (zen), %s (ollama)", root,
+		OpenCodeUpstream(OpenCodeBackend), OpenCodeUpstream(OpenCodeZenBackend),
+		OpenCodeUpstream(OllamaCloudBackend))
 	return OpenCodeProxyBase(root, plan.Backend), nil
 }
 
 // openCodeRoute maps a request path to the plan it belongs to and the part of
 // the path the gateway should see after its own /v1.
 //
-// Zen is matched first and by its longer prefix, because "/v1" is a prefix of
-// nothing here but is the fallback: a path that is neither is refused rather
-// than guessed at.
+// Every plan is tried, and the match is exact-or-prefixed: a path no plan
+// claims is refused rather than guessed at.
 func openCodeRoute(path string) (plan OpenCodePlan, rest string, ok bool) {
-	for _, p := range []OpenCodePlan{OpenCodePlanFor(OpenCodeZenBackend), OpenCodePlanFor(OpenCodeBackend)} {
+	for _, p := range openCodePlans {
 		if path == p.ProxyPath {
 			return p, "", true
 		}
@@ -242,6 +279,30 @@ func openCodeRoute(path string) (plan OpenCodePlan, rest string, ok bool) {
 		}
 	}
 	return OpenCodePlan{}, "", false
+}
+
+// sharedProxyServes refuses a proxy another ggraphify serves when its probe
+// does not list this plan. Go is the one path every build has served, so an
+// older body without "plans=" still carries it.
+func sharedProxyServes(addr, plans string, plan OpenCodePlan) error {
+	if plan.Tag == "go" || planListed(plans, plan.Tag) {
+		return nil
+	}
+	return errors.New("the proxy on " + addr + " belongs to an older " +
+		"ggraphify that does not serve the " + plan.Name + " path, so it " +
+		"cannot carry an " + plan.Backend + " run. Quit that board, or set " +
+		OpenCodePortVar + " to another port for this one")
+}
+
+// planListed reports whether a proxy's advertised plan list — the "plans=…"
+// part of its probe body — names this tag exactly.
+func planListed(plans, tag string) bool {
+	for _, p := range strings.Split(plans, ",") {
+		if strings.TrimSpace(p) == tag {
+			return true
+		}
+	}
+	return false
 }
 
 // probeOpenCodeProxy asks whatever holds an address whether it is a ggraphify
@@ -282,7 +343,7 @@ func openCodeProxyHandler() http.Handler {
 		_, _ = io.WriteString(w, openCodeProbeBody+" "+AppVersion+openCodeProbePlans)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Two upstreams, one per plan, and only the paths they serve. Which
+		// One upstream per plan, and only the paths they serve. Which
 		// plan a request belongs to is read off the path rather than from any
 		// board-wide state: the path was written into that provider entry when
 		// the plan was chosen, so a request cannot arrive here meaning one
@@ -292,9 +353,11 @@ func openCodeProxyHandler() http.Handler {
 		plan, rest, ok := openCodeRoute(r.URL.Path)
 		if !ok {
 			applog.Warnf("opencode proxy: refused %s %s — not a plan path", r.Method, r.URL.Path)
-			http.Error(w, "this proxy forwards "+OpenCodeBackend+"'s /v1 to "+
-				OpenCodeUpstream(OpenCodeBackend)+" and "+OpenCodeZenBackend+"'s /zen/v1 to "+
-				OpenCodeUpstream(OpenCodeZenBackend)+", and nothing else", http.StatusNotFound)
+			routes := make([]string, 0, len(openCodePlans))
+			for _, p := range openCodePlans {
+				routes = append(routes, p.Backend+"'s "+p.ProxyPath+" to "+OpenCodeUpstream(p.Backend))
+			}
+			http.Error(w, "this proxy forwards "+strings.Join(routes, ", ")+", and nothing else", http.StatusNotFound)
 			return
 		}
 		upstream := OpenCodeUpstream(plan.Backend)
@@ -347,8 +410,9 @@ func openCodeProxyHandler() http.Handler {
 		}
 		// The two the plan asks for. Set rather than added, and only when the
 		// client did not already say: a future graphify that grows a header
-		// hook should win over this.
-		if req.Header.Get("x-opencode-session") == "" {
+		// hook should win over this. Ollama Cloud asks for neither, so neither
+		// is added on its path.
+		if plan.SessionHeader && req.Header.Get("x-opencode-session") == "" {
 			req.Header.Set("x-opencode-session", OpenCodeSession())
 		}
 		req.Header.Set("User-Agent", "ggraphify/"+AppVersion)

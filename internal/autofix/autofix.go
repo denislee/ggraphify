@@ -45,6 +45,18 @@ const (
 	// Two: once in case the failure was transient, and never again after
 	// that, because a third identical run is a third identical failure.
 	DefaultAttempts = 2
+	// DefaultMeteredPerDay is how many BILLED chains the loop may start
+	// against one repository in any rolling MeteredWindow. Attempts and the
+	// cooldown bound how often the loop repeats itself on one defect; this
+	// bounds what it spends on a repository whose defects keep changing —
+	// a graph flipping between no graph and a broken one, or an edit loop of
+	// drift → update → unnamed → label → healthy — each of which looks like
+	// fresh progress to the per-signature budget. Three covers an extraction
+	// plus a relabel or two on a working day, and nothing like a night of
+	// them.
+	DefaultMeteredPerDay = 3
+	// MeteredWindow is the rolling window DefaultMeteredPerDay counts over.
+	MeteredWindow = 24 * time.Hour
 )
 
 // Policy is what the settings say, resolved against what the machine can
@@ -123,6 +135,9 @@ type Policy struct {
 	Max      int
 	Cooldown time.Duration
 	Attempts int
+	// MeteredPerDay caps billed chains per repository per MeteredWindow. Zero
+	// means DefaultMeteredPerDay; there is no "unlimited".
+	MeteredPerDay int
 }
 
 // withDefaults fills the zeroes, so a Policy built from a settings file that
@@ -136,6 +151,9 @@ func (p Policy) withDefaults() Policy {
 	}
 	if p.Attempts <= 0 {
 		p.Attempts = DefaultAttempts
+	}
+	if p.MeteredPerDay <= 0 {
+		p.MeteredPerDay = DefaultMeteredPerDay
 	}
 	return p
 }
@@ -461,12 +479,20 @@ type record struct {
 type Engine struct {
 	mu   sync.Mutex
 	seen map[string]*record
+	// billed is when each repository's billed chains were started, newest
+	// last, trimmed to MeteredWindow. It is kept apart from seen on purpose:
+	// a record is forgotten when its repository reads healthy, and reset by
+	// Retry and by every settings change, and a spending cap that any of
+	// those wiped would cap nothing.
+	billed map[string][]time.Time
 	// now is time.Now, replaced in tests.
 	now func() time.Time
 }
 
 // New makes an engine with no memory of anything.
-func New() *Engine { return &Engine{seen: map[string]*record{}, now: time.Now} }
+func New() *Engine {
+	return &Engine{seen: map[string]*record{}, billed: map[string][]time.Time{}, now: time.Now}
+}
 
 // Plan chooses what to fix now, and marks those repositories as in flight —
 // so a caller that submits everything Plan returned, and calls Done for each,
@@ -510,25 +536,24 @@ func (e *Engine) Plan(cands []Candidate, pol Policy) (actions []Action, skips []
 		sig := candSig(c, pol)
 		if sig == "" {
 			// Healthy. Forget it, so a repository that goes bad again next
-			// month starts from a clean budget of attempts.
-			delete(e.seen, c.Path)
+			// month starts from a clean budget of attempts — but not before
+			// the cooldown has run out: see forgetHealthy.
+			e.forgetHealthy(c.Path, now, pol)
 			continue
 		}
-		var plan heal.Plan
-		if !c.GraftOnly {
-			plan = heal.For(c.Graph, allow)
-			// Order is the point, because a chain stops at its first failure.
-			// The re-merge comes after the steps that rewrite graph.json — it
-			// exists to pick up what they wrote — and before `graft build`,
-			// which is unrelated to both and must not be what stops either.
-			if step, ok := globalStep(c, pol, plan); ok {
-				plan.Steps = append(plan.Steps, step)
+		plan := planFor(c, pol, allow)
+		billed := plan.Metered() && !pol.Local
+		if billed && e.meteredSpent(c.Path, now) >= pol.MeteredPerDay {
+			// The day's billed budget for this repository is gone. Whatever
+			// is free in the plan still runs; the LLM steps wait for the
+			// window to roll rather than for a signature to change, because
+			// a changing signature is exactly what a repository that burns
+			// money in a loop looks like.
+			plan, billed = planFor(c, pol, false), false
+			if plan.Empty() {
+				skips = append(skips, Skip{c.Path, c.Name, meteredCapped(pol.MeteredPerDay)})
+				continue
 			}
-		}
-		if step, ok := graftStep(c, pol); ok {
-			// Appended LAST, for the same reason: a `graft build` that cannot
-			// run must not be what stops this checkout's graph being rebuilt.
-			plan.Steps = append(plan.Steps, step)
 		}
 		if plan.Empty() {
 			skips = append(skips, Skip{c.Path, c.Name,
@@ -536,16 +561,21 @@ func (e *Engine) Plan(cands []Candidate, pol Policy) (actions []Action, skips []
 			continue
 		}
 		rec := e.seen[c.Path]
-		switch {
-		case rec == nil:
+		if rec == nil {
 			rec = &record{}
 			e.seen[c.Path] = rec
-		case rec.running:
+		}
+		if rec.running {
 			continue
+		}
+		switch {
 		case rec.sig != sig:
 			// Different defect: a fresh budget. This is the ordinary path
 			// through a multi-stage repair — no-graph becomes unnamed becomes
-			// healthy — and each stage gets its own attempts.
+			// healthy — and each stage gets its own attempts. It does NOT get
+			// a fresh clock: last survives, and the cooldown below still
+			// applies, or a graph flipping between two defects is attacked
+			// on every tick.
 			rec.attempts, rec.err, rec.declared = 0, "", false
 		case restamped(rec, sig, c.Graph):
 			// Same defect, but the stamp moved: the last attempt worked and
@@ -562,7 +592,8 @@ func (e *Engine) Plan(cands []Candidate, pol Policy) (actions []Action, skips []
 				skips = append(skips, Skip{c.Path, c.Name, gaveUp(sig, rec.attempts)})
 			}
 			continue
-		case now.Sub(rec.last) < backoff(pol.Cooldown, rec.attempts):
+		}
+		if coolingDown(rec, now, pol) {
 			skips = append(skips, Skip{c.Path, c.Name, "cooling down"})
 			continue
 		}
@@ -572,6 +603,9 @@ func (e *Engine) Plan(cands []Candidate, pol Policy) (actions []Action, skips []
 		rec.attempts++
 		rec.last = now
 		rec.running = true
+		if billed {
+			e.billed[c.Path] = append(e.billed[c.Path], now)
+		}
 		inflight++
 		actions = append(actions, Action{
 			Path: c.Path, Name: c.Name, Plan: plan, Sig: sig,
@@ -580,6 +614,88 @@ func (e *Engine) Plan(cands []Candidate, pol Policy) (actions []Action, skips []
 		})
 	}
 	return actions, skips
+}
+
+// planFor is the chain one candidate would get, with the LLM steps allowed or
+// not.
+func planFor(c Candidate, pol Policy, allow bool) heal.Plan {
+	var plan heal.Plan
+	if !c.GraftOnly {
+		plan = heal.For(c.Graph, allow)
+		// Order is the point, because a chain stops at its first failure.
+		// The re-merge comes after the steps that rewrite graph.json — it
+		// exists to pick up what they wrote — and before `graft build`,
+		// which is unrelated to both and must not be what stops either.
+		if step, ok := globalStep(c, pol, plan); ok {
+			plan.Steps = append(plan.Steps, step)
+		}
+	}
+	if step, ok := graftStep(c, pol); ok {
+		// Appended LAST, for the same reason: a `graft build` that cannot
+		// run must not be what stops this checkout's graph being rebuilt.
+		plan.Steps = append(plan.Steps, step)
+	}
+	return plan
+}
+
+// coolingDown is the one clock every reservation answers to, whether or not
+// the signature just changed. A fresh attempt budget is not a fresh clock:
+// with attempts back at zero the wait is the plain cooldown, and it is only
+// the zero time of a record never attempted that skips it.
+//
+// The caller must hold e.mu.
+func coolingDown(rec *record, now time.Time, pol Policy) bool {
+	if rec.last.IsZero() {
+		return false
+	}
+	return now.Sub(rec.last) < backoff(pol.Cooldown, rec.attempts)
+}
+
+// forgetHealthy drops the record for a subject that now reads healthy — once
+// its cooldown has run out. Dropping it at once handed a repository that
+// flips healthy → broken → healthy a new record, with no last and so no
+// cooldown, on every flip: the loop's whole memory of having just worked on
+// it, erased by the work succeeding.
+//
+// The caller must hold e.mu.
+func (e *Engine) forgetHealthy(key string, now time.Time, pol Policy) {
+	rec := e.seen[key]
+	if rec == nil || rec.running || now.Sub(rec.last) < pol.Cooldown {
+		return
+	}
+	delete(e.seen, key)
+}
+
+// meteredSpent is how many billed chains have been started against this
+// repository inside MeteredWindow, trimming the ones that fell out of it.
+//
+// The caller must hold e.mu.
+func (e *Engine) meteredSpent(path string, now time.Time) int {
+	ts := e.billed[path]
+	i := 0
+	for i < len(ts) && now.Sub(ts[i]) >= MeteredWindow {
+		i++
+	}
+	if i == len(ts) {
+		delete(e.billed, path)
+		return 0
+	}
+	if i > 0 {
+		ts = append(ts[:0:0], ts[i:]...)
+		e.billed[path] = ts
+	}
+	return len(ts)
+}
+
+// meteredCapped is the skip line for a repository whose billed budget for the
+// window is spent and which has nothing free left to do.
+func meteredCapped(n int) string {
+	word := " billed runs"
+	if n == 1 {
+		word = " billed run"
+	}
+	return "metered cap reached — " + gfy.Itoa(n) + word +
+		" in the last 24h; the LLM steps wait for the window to roll"
 }
 
 // restamped reports whether the graph moved between the last attempt and now,
@@ -734,19 +850,47 @@ func (e *Engine) Declare(cands []Candidate, pol Policy) []Stuck {
 
 // Retry clears the memory for one repository — the "try this one again" the
 // user reaches for after fixing by hand whatever the loop could not.
+//
+// A chain still running is not forgotten, only forgiven: its record is the
+// in-flight slot Plan throttles on and the one Done is about to report to,
+// so dropping it would free a slot that is still taken. The billed-run
+// history is not touched either — see Engine.billed.
 func (e *Engine) Retry(path string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	delete(e.seen, path)
+	rec := e.seen[path]
+	if rec == nil {
+		return
+	}
+	if !rec.running {
+		delete(e.seen, path)
+		return
+	}
+	forgive(rec)
 }
 
 // Reset forgets everything, which is what a settings change has to do: a loop
 // that was refusing to retry under the old policy must not keep refusing
 // under the new one.
+//
+// It forgets what was concluded, not what is happening or when: a running
+// chain keeps its record — it still holds a slot, and Done for it has yet to
+// arrive; wiping it let the next tick queue up to Max more on top — and
+// every record keeps its last attempt time, so toggling a setting is not a
+// way round the cooldown. The billed-run history survives too.
 func (e *Engine) Reset() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.seen = map[string]*record{}
+	for _, rec := range e.seen {
+		forgive(rec)
+	}
+}
+
+// forgive clears a record's verdict — its signature, its spent attempts, the
+// give-up — and keeps running and last.
+func forgive(rec *record) {
+	rec.sig, rec.built, rec.err = "", "", ""
+	rec.attempts, rec.declared = 0, false
 }
 
 // Prune forgets every record whose key keep rejects, and reports how many it
@@ -774,6 +918,13 @@ func (e *Engine) Prune(keep func(key string) bool) int {
 			delete(e.seen, k)
 			n++
 		}
+	}
+	// The billed history is bounded by its own window, not by keep: a
+	// checkout that disappears and comes back within the day must not
+	// return with its budget refilled.
+	now := e.now()
+	for k := range e.billed {
+		e.meteredSpent(k, now)
 	}
 	return n
 }

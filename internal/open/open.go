@@ -11,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -83,37 +84,158 @@ func URL(u string) error {
 
 // InEditor opens a path in the user's editor, in a new terminal window when the
 // editor is a terminal one. A GUI editor named in $VISUAL is launched directly.
+//
+// $EDITOR and $VISUAL are command lines, not program names — "code --wait",
+// "emacsclient -t", "nvim -u NONE" are all ordinary — so they are split into
+// words the way a shell would split them, and executed without one: quoting
+// is honoured, but nothing in the variable is ever interpreted as shell syntax.
 func (c Config) InEditor(path string) error {
 	ed := c.Edit()
 	if ed == "" {
 		return Path(path) // no editor at all: let the desktop decide
 	}
-	// A terminal editor needs a terminal. The heuristic is the binary's name,
-	// because asking is not possible and guessing wrong in the other direction
-	// — hosting a GUI editor inside foot — is harmless.
-	if !isTUI(ed) {
-		return spawn(ed, path)
+	edWords, err := SplitWords(ed)
+	if err != nil {
+		return errors.New("open: cannot parse editor " + strconv.Quote(ed) + ": " + err.Error())
 	}
-	term := c.Term()
-	if term == "" {
-		return errors.New("open: no terminal emulator found to run " + ed + " in")
+	if len(edWords) == 0 {
+		return Path(path)
+	}
+	var termWords []string
+	// A terminal editor needs a terminal. The heuristic is the binary's name
+	// and its arguments, because asking is not possible and guessing wrong in
+	// the other direction — hosting a GUI editor inside foot — is harmless.
+	if isTUI(edWords) {
+		term := c.Term()
+		if termWords, err = SplitWords(term); err != nil {
+			return errors.New("open: cannot parse terminal " + strconv.Quote(term) + ": " + err.Error())
+		}
+	}
+	argv, err := editorArgv(edWords, termWords, path)
+	if err != nil {
+		return err
+	}
+	return spawn(argv[0], argv[1:]...)
+}
+
+// editorArgv is the command line InEditor runs: the editor's own words and the
+// path, wrapped in the terminal's words when the editor is a terminal one.
+func editorArgv(edWords, termWords []string, path string) ([]string, error) {
+	if len(edWords) == 0 {
+		return nil, errors.New("open: empty editor command")
+	}
+	if !isTUI(edWords) {
+		return append(append([]string(nil), edWords...), path), nil
+	}
+	if len(termWords) == 0 {
+		return nil, errors.New("open: no terminal emulator found to run " + edWords[0] + " in")
 	}
 	// -e is the flag every terminal in Terminals understands for "run this",
 	// except foot, which takes the command positionally but also accepts -e.
-	return spawn(term, "-e", ed, path)
+	// The editor goes in as separate words, so its own arguments reach it
+	// rather than being taken as part of the program name.
+	argv := append([]string(nil), termWords...)
+	argv = append(argv, "-e")
+	argv = append(argv, edWords...)
+	return append(argv, path), nil
 }
 
-func isTUI(ed string) bool {
-	base := ed
+// isTUI reports whether an editor command line runs in a terminal: by the
+// program's name, or — for the editors that can be either — by the flag that
+// asks for the terminal (emacsclient -t, emacs -nw).
+func isTUI(words []string) bool {
+	if len(words) == 0 {
+		return false
+	}
+	base := words[0]
 	if i := strings.LastIndexByte(base, '/'); i >= 0 {
 		base = base[i+1:]
 	}
-	base, _, _ = strings.Cut(base, " ")
 	switch base {
 	case "nvim", "vim", "vi", "nano", "hx", "helix", "emacs", "kak", "micro":
 		return true
+	case "emacsclient":
+		for _, a := range words[1:] {
+			switch a {
+			case "-t", "-nw", "--tty":
+				return true
+			}
+		}
 	}
 	return false
+}
+
+// SplitWords splits a command line into words the way a POSIX shell does for
+// a simple command — whitespace separates, single quotes are literal, double
+// quotes allow \" \\ \$ and \` escapes, a backslash outside quotes escapes
+// the next character — and nothing else: no expansion, no globbing, no
+// operators. An unterminated quote or trailing backslash is an error.
+func SplitWords(s string) ([]string, error) {
+	var (
+		words []string
+		cur   strings.Builder
+		inTok bool
+	)
+	rs := []rune(s)
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
+		switch {
+		case r == ' ' || r == '\t' || r == '\n':
+			if inTok {
+				words = append(words, cur.String())
+				cur.Reset()
+				inTok = false
+			}
+		case r == '\\':
+			if i+1 >= len(rs) {
+				return nil, errors.New("trailing backslash")
+			}
+			i++
+			if rs[i] != '\n' { // backslash-newline is a line continuation
+				cur.WriteRune(rs[i])
+				inTok = true
+			}
+		case r == '\'':
+			inTok = true
+			j := i + 1
+			for j < len(rs) && rs[j] != '\'' {
+				j++
+			}
+			if j >= len(rs) {
+				return nil, errors.New("unterminated single quote")
+			}
+			cur.WriteString(string(rs[i+1 : j]))
+			i = j
+		case r == '"':
+			inTok = true
+			j := i + 1
+			for ; j < len(rs) && rs[j] != '"'; j++ {
+				if rs[j] == '\\' && j+1 < len(rs) {
+					switch rs[j+1] {
+					case '"', '\\', '$', '`':
+						j++
+						cur.WriteRune(rs[j])
+						continue
+					case '\n':
+						j++
+						continue
+					}
+				}
+				cur.WriteRune(rs[j])
+			}
+			if j >= len(rs) {
+				return nil, errors.New("unterminated double quote")
+			}
+			i = j
+		default:
+			cur.WriteRune(r)
+			inTok = true
+		}
+	}
+	if inTok {
+		words = append(words, cur.String())
+	}
+	return words, nil
 }
 
 // Manager opens a directory in the file manager.

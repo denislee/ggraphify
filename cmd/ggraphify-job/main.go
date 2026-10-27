@@ -8,7 +8,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -18,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -215,6 +215,13 @@ func run() int {
 			jobs.RequireGraph,
 			jobs.RequireLocalServer(func() bool { return *autoOll }),
 		),
+		// The log reaches stdout through the runner's tee, byte for byte as the
+		// job writes it. Printing the ring buffer's String() past an offset —
+		// what this used to do — assumed an append-only buffer, and the buffer
+		// evicts off the front, folds carriage returns and is compacted when
+		// the job retires: a log past its cap went silent or printed from the
+		// wrong place, and the unprinted tail was lost at retirement.
+		Tee: os.Stdout,
 		LocalLease: func(j *jobs.Job) jobs.Lease {
 			if j == nil || !j.Local || gfy.ArgvBackend(j.Argv) != gfy.OllamaBackend {
 				return nil
@@ -237,24 +244,35 @@ func run() int {
 
 	// Ctrl-C cancels the job rather than killing this process out from under
 	// it, so graphify gets its SIGTERM and its chance to flush graph.json.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	//
+	// The watcher selects on its own done channel rather than on a signal
+	// context: stop() closes a context's Done too, so a watcher on it woke on
+	// every normal exit, printed an interrupt nobody sent and cancelled a job
+	// that had already finished. caught is which signal it was, for the exit
+	// status — 128 plus the signal number, as a shell reports it.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	var caught atomic.Int32
+	done := make(chan struct{})
+	defer close(done) // runs before signal.Stop: defers are LIFO
 	go func() {
-		<-ctx.Done()
-		fmt.Fprintln(os.Stderr, "\n# interrupt — cancelling the job")
-		r.Cancel(job.ID)
+		select {
+		case <-done:
+			return
+		case sig := <-sigs:
+			// One signal is a request to cancel; a second is the user
+			// insisting. Handing it back to the default action is what lets
+			// a second Ctrl-C end this process when the job will not.
+			signal.Stop(sigs)
+			if s, ok := sig.(syscall.Signal); ok {
+				caught.Store(int32(s))
+			}
+			fmt.Fprintf(os.Stderr, "\n# %s — cancelling the job\n", sig)
+			r.Cancel(job.ID)
+		}
 	}()
 
-	// Stream the log as it grows. The runner's events say "there is more";
-	// what to print is the delta against what has already been written.
-	printed := 0
-	flush := func() {
-		s := job.Log.String()
-		if len(s) > printed {
-			fmt.Print(s[printed:])
-			printed = len(s)
-		}
-	}
 	// code survives the loop so the deferred Close/Shutdown/stop all run before
 	// main turns it into an exit status. Breaking out rather than returning
 	// from inside the switch keeps that single path obvious.
@@ -265,7 +283,6 @@ func run() int {
 		if ev.ID != job.ID {
 			continue
 		}
-		flush()
 		if !ev.Job.Status.Done() {
 			continue
 		}
@@ -282,7 +299,10 @@ func run() int {
 			publishIndex(spec, abs)
 			code = 0
 		case jobs.Canceled:
-			code = 130
+			code = 128 + int(syscall.SIGINT)
+			if n := caught.Load(); n > 0 {
+				code = 128 + int(n)
+			}
 		default:
 			if line := gfy.FirstErrorLine(job.Log.String()); line != "" {
 				fmt.Fprintln(os.Stderr, "#", strings.TrimSpace(line))

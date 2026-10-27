@@ -1435,7 +1435,7 @@ func StartOllama() (string, error) {
 			return how, err
 		}
 		noteOllamaStart(startedDetached, cmd.Process.Pid)
-		go func() { _ = cmd.Wait() }() // reap, so it never becomes a zombie
+		go reapOllama(cmd) // reap, so it never becomes a zombie
 	}
 
 	deadline := time.Now().Add(10 * time.Second)

@@ -130,6 +130,12 @@ func EffectiveBackend(backend string) string {
 	if HasOpenCodeKey() {
 		return OpenCodeBackend
 	}
+	// Ollama Cloud the same way, and after OpenCode only because OpenCode was
+	// here first: its key has a name of its own, so exporting it is as
+	// deliberate a choice as exporting OPENCODE_API_KEY.
+	if HasPlanKey(OllamaCloudBackend) {
+		return OllamaCloudBackend
+	}
 	if HasClaudeCLI() {
 		return ClaudeCLIBackend
 	}
@@ -174,7 +180,7 @@ func BackendReady(backend string) (bool, string) {
 		// its own reasons — no server, no model pulled — and those are worth
 		// catching in the confirm rather than in the job log. See LocalReady.
 		return LocalReady(OllamaBackend, "")
-	case OpenCodeBackend, OpenCodeZenBackend:
+	case OpenCodeBackend, OpenCodeZenBackend, OllamaCloudBackend:
 		// Not just "is there a key": this backend is a provider entry and a
 		// model as much as it is a credential, and the entry is the half a
 		// user cannot see. Blank asks about the model a job with nothing
@@ -188,7 +194,7 @@ func BackendReady(backend string) (bool, string) {
 			return true, "An API key is visible in this environment; graphify will auto-detect the backend."
 		}
 		return false, "No API key is visible in this environment, no Claude Code CLI was found, " +
-			"no OpenCode key was exported, and no local model server answered, so there is " +
+			"no OpenCode or Ollama Cloud key was exported, and no local model server answered, so there is " +
 			"nothing for graphify to auto-detect."
 	default:
 		// openai with OPENAI_BASE_URL repointed at a loopback server is not the

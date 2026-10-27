@@ -2,7 +2,9 @@ package graftstate
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // Prune drops every repository the board no longer tracks — both the derived
@@ -103,5 +105,63 @@ func TestReadFingerprintTyped(t *testing.T) {
 	}
 	if len(fp) != 0 {
 		t.Errorf(`readFingerprint of {"version":1} = %v, want empty`, fp)
+	}
+}
+
+// W31: a read stamped before a Prune must not store its result after it —
+// neither re-adding the pruned key nor, once a later Invalidate brings the
+// reset counter back to the read's value, caching a superseded answer.
+func TestPruneDropsInFlightResults(t *testing.T) {
+	f := newFixture(t, false, map[string]string{"a.go": "package a"})
+	var c Cache
+	c.Invalidate(f.root)
+	derived = func(string) {
+		derived = nil
+		c.Prune(map[string]bool{})
+		c.Invalidate(f.root)
+	}
+	t.Cleanup(func() { derived = nil })
+	if _, err := c.Read(Options{Repo: f.root}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.m[f.root]; ok {
+		t.Fatal("a read that raced Prune and Invalidate stored its superseded result")
+	}
+	derived = func(string) {
+		derived = nil
+		c.Prune(map[string]bool{})
+	}
+	if _, err := c.Read(Options{Repo: f.root}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.m[f.root]; ok {
+		t.Fatal("a read finishing after Prune re-added the pruned key")
+	}
+}
+
+// W32: files added under .cache/ (or a card subdirectory) move no stamped
+// file, so the size has its own TTL instead of living as long as the stamp.
+func TestCacheSizeFollowsGrowthInsideSubdirs(t *testing.T) {
+	f := newFixture(t, false, map[string]string{"a.go": "package a"})
+	sub := filepath.Join(f.dir, cacheDir, "cards")
+	mkdir(t, sub)
+	c := Cache{TTL: time.Nanosecond, SizeTTL: time.Nanosecond}
+	opts := Options{Repo: f.root, SkipDrift: true}
+	i, err := c.Read(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := i.SizeBytes
+	key := dirKey(f.dir)
+	write(t, filepath.Join(sub, "x.md"), strings.Repeat("x", 4096))
+	if dirKey(f.dir) != key {
+		t.Fatal("setup: the write moved the stamp")
+	}
+	i, err = c.Read(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i.SizeBytes != before+4096 {
+		t.Fatalf("SizeBytes = %d, want %d — the static layer kept a stale size", i.SizeBytes, before+4096)
 	}
 }

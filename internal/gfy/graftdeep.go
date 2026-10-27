@@ -125,8 +125,9 @@ func GraftTargetFor(backend string) (GraftTarget, string) {
 			KeyVar: OllamaKeyVar, Local: true}, ""
 
 	case IsOpenCodeBackend(b):
-		if !HasOpenCodeKey() {
-			return GraftTarget{}, OpenCodeKeyVar + " is not set in this environment, so " +
+		plan := OpenCodePlanFor(b)
+		if !HasPlanKey(b) {
+			return GraftTarget{}, plan.KeyVar + " is not set in this environment, so " +
 				b + " has no credential to run graft's deep pass on."
 		}
 		base, err := StartOpenCodeProxy(b)
@@ -134,7 +135,7 @@ func GraftTargetFor(backend string) (GraftTarget, string) {
 			return GraftTarget{}, err.Error()
 		}
 		return GraftTarget{Backend: b, Provider: GraftOpenAIProvider, BaseURL: base,
-			KeyVar: OpenCodeKeyVar}, ""
+			KeyVar: plan.KeyVar}, ""
 
 	case b == ClaudeAPIBackend:
 		if strings.TrimSpace(os.Getenv(AnthropicKeyVar)) == "" {
@@ -163,7 +164,7 @@ func GraftTargetFor(backend string) (GraftTarget, string) {
 	return GraftTarget{}, b + " is not a backend graft can be pointed at. Its deep pass " +
 		"speaks the OpenAI and Anthropic wire formats, so Heavy work has to name " +
 		OllamaBackend + ", a local OpenAI-compatible server, " + ClaudeAPIBackend + ", " +
-		OpenAIBackend + ", or one of the two OpenCode plans."
+		OpenAIBackend + ", one of the two OpenCode plans, or " + OllamaCloudBackend + "."
 }
 
 // GraftProvider is graft's wire-format name for a backend, or "" for one graft

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -52,6 +53,12 @@ Exit status is 0 when every invariant holds and 1 when one is broken.
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
+		// -h is a request that was answered, not a usage error: the flag
+		// package has already printed the usage, and a script asking for it
+		// should not see a failure.
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 
@@ -105,6 +112,7 @@ Exit status is 0 when every invariant holds and 1 when one is broken.
 		Model:            set.Model,
 		OpenCodeModel:    set.OpenCodeModel,
 		OpenCodeZenModel: set.OpenCodeZenModel,
+		OllamaCloudModel: set.OllamaCloudModel,
 		ClaudeAccount:    set.ClaudeAccount,
 		Version:          gfy.Probe(ctx),
 	})

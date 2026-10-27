@@ -262,6 +262,21 @@ func walkRoot(root, dir string, depth int, opts Options, spec OutSpec, seen map[
 	if depth > opts.Depth {
 		return
 	}
+	// seen is keyed on the resolved directory, not the path the walk reached
+	// it by. Symlinked directories are followed (isDirEntry), so `api` and an
+	// `api-link` beside it — or a `loop -> ..` that leads back to an ancestor —
+	// are one tree reached twice; keyed on the link path each was its own row,
+	// with its own Busy flag and autofix record, and so its own concurrent
+	// graphify jobs writing the same output directory. The first path to reach
+	// a tree keeps it; ReadDir's sorted order makes that deterministic.
+	real := dir
+	if r, err := filepath.EvalSymlinks(dir); err == nil {
+		real = r
+	}
+	if seen[real] {
+		return
+	}
+	seen[real] = true
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -281,9 +296,8 @@ func walkRoot(root, dir string, depth int, opts Options, spec OutSpec, seen map[
 			continue
 		}
 		gitSeen = true
-		if r, ok := repoAt(root, dir, e); ok && !seen[r.Path] &&
+		if r, ok := repoAt(root, dir, e); ok &&
 			(!r.IsWorktree || opts.ShowWorktrees || depth == 0) {
-			seen[r.Path] = true
 			*out = append(*out, r)
 		}
 		if depth > 0 {
@@ -302,8 +316,7 @@ func walkRoot(root, dir string, depth int, opts Options, spec OutSpec, seen map[
 	// invents a row for an arbitrary directory. Like a checkout it is a leaf —
 	// one graph, one row — and like a checkout the root itself is exempt.
 	if !gitSeen && depth > 0 {
-		if r, ok := graphOnlyAt(root, dir, spec); ok && !seen[r.Path] {
-			seen[r.Path] = true
+		if r, ok := graphOnlyAt(root, dir, spec); ok {
 			*out = append(*out, r)
 			return
 		}

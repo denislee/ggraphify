@@ -2,9 +2,11 @@ package store
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -68,6 +70,142 @@ func TestCorruptFileFallsBackToDefaults(t *testing.T) {
 	}
 	if s.Settings().Overlay == nil {
 		t.Fatal("a corrupt file must still produce a usable overlay map")
+	}
+}
+
+// A corrupt file is moved aside before the store starts fresh, so the first
+// debounced save cannot overwrite the user's only copy of their state, and
+// Corrupt says where it went.
+func TestCorruptFileIsMovedAsideNotOverwritten(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "state.json")
+	bad := []byte(`{"settings": {"backend": "gemini"}, "repos": {"/r": {}}`) // one brace short
+	if err := os.WriteFile(p, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := Open(p)
+	aside, err := s.Corrupt()
+	if err == nil {
+		t.Fatal("Corrupt() reported no error for an unparseable file")
+	}
+	if !strings.HasPrefix(aside, p+".corrupt-") {
+		t.Fatalf("Corrupt() aside = %q, want %s.corrupt-<ts>", aside, p)
+	}
+	s.SetColumnWidth("repo", 300)
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(aside)
+	if err != nil {
+		t.Fatalf("the corrupt file was not kept: %v", err)
+	}
+	if string(got) != string(bad) {
+		t.Fatalf("aside file = %q, want the original bytes %q", got, bad)
+	}
+
+	// A file that loads reports nothing.
+	if aside, err := Open(p).Corrupt(); aside != "" || err != nil {
+		t.Fatalf("Corrupt() on a good file = %q, %v; want nothing", aside, err)
+	}
+}
+
+// Save marshals while still holding the lock. Before, it marshalled a shallow
+// copy after releasing it, walking the live maps while setters wrote them: a
+// fatal "concurrent map read and map write" (and a -race report).
+func TestSaveIsSafeAgainstConcurrentSetters(t *testing.T) {
+	s, _ := tempStore(t)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	setter := func(f func(i int)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				f(i)
+			}
+		}()
+	}
+	setter(func(i int) { s.SetColumnWidth(fmt.Sprintf("c%d", i%50), 100+i%7) })
+	setter(func(i int) { s.SetDriftBaseline(fmt.Sprintf("/r%d", i%50), graphstate.Baseline{}) })
+	setter(func(i int) { s.SetOverride(fmt.Sprintf("/r%d", i%50), RepoOverride{Backend: "openai"}) })
+	setter(func(i int) {
+		s.PruneDriftBaselines(func(repo string) bool { return i%2 == 0 })
+	})
+	for i := 0; i < 200; i++ {
+		if err := s.Save(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// A debounce save already past its snapshot when Flush runs must not rename
+// its older snapshot over the one Flush wrote.
+func TestFlushIsNotOverwrittenByAnInFlightSave(t *testing.T) {
+	s, p := tempStore(t)
+	s.SetColumnWidth("repo", 100)
+
+	held, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	s.beforeRename = func() {
+		once.Do(func() {
+			close(held)
+			<-release
+		})
+	}
+	stale := make(chan error, 1)
+	go func() { stale <- s.Save() }() // the "timer" save: snapshots width 100
+	<-held
+
+	s.SetColumnWidth("repo", 200)
+	flushed := make(chan error, 1)
+	go func() { flushed <- s.Flush() }()
+	// Give an unserialized Flush every chance to finish first.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	if err := <-stale; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-flushed; err != nil {
+		t.Fatal(err)
+	}
+
+	if got := Open(p).Columns()["repo"]; got != 200 {
+		t.Fatalf("width on disk = %d after Flush, want 200 (a stale save landed last)", got)
+	}
+}
+
+// SaveError reports the last save, not the last failure: once a later save
+// succeeds, the error the board was showing is gone.
+func TestSaveErrorClearsAfterASuccessfulSave(t *testing.T) {
+	s, p := tempStore(t)
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.path = filepath.Join(blocker, "state.json") // parent is a file: MkdirAll fails
+	s.mu.Unlock()
+	if err := s.Save(); err == nil {
+		t.Fatal("Save under a regular file succeeded")
+	}
+	if s.SaveError() == nil {
+		t.Fatal("SaveError() = nil after a failed save")
+	}
+	s.mu.Lock()
+	s.path = p
+	s.mu.Unlock()
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveError(); err != nil {
+		t.Fatalf("SaveError() = %v after a successful save, want nil", err)
 	}
 }
 

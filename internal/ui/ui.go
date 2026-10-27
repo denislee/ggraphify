@@ -323,6 +323,8 @@ type App struct {
 	filterBar  *gtk.Box
 
 	runner *jobs.Runner
+	// precheck is the runner's Precheck, kept so Retry can ask it too.
+	precheck func(*jobs.Job) error
 	// autofix is the unattended repair loop's memory: which repositories it
 	// has already tried, how that went, and which ones it has given up on.
 	// The decisions live in internal/autofix; autofix.go in this package is
@@ -444,6 +446,7 @@ func (a *App) activate() {
 	a.applyColorScheme()
 	a.applyAnimations()
 	a.loadCSS()
+	a.applyScale()
 
 	set := a.opts.Store.Settings()
 	// Both policy funcs read the store at the moment they are asked rather
@@ -454,6 +457,18 @@ func (a *App) activate() {
 		Idle:    func() time.Duration { return a.opts.Store.Settings().OllamaIdle() },
 		Logf:    applog.Infof,
 	}
+	// Two refusals, both before anything is queued: a command that needs
+	// a graph there is not, and a local job whose model server is down
+	// and unstartable from here. The second is the lifecycle's verdict
+	// brought forward — see jobs.RequireLocalServer — and it reads the
+	// same setting the lifecycle does, live, for activate's own reason.
+	// Kept on the App as well as handed to the runner: Retry resubmits a
+	// finished job's argv through Submit, which does not consult it, and a
+	// retry must be refused for the same reasons the first click would be.
+	a.precheck = jobs.Checks(
+		jobs.RequireGraph,
+		jobs.RequireLocalServer(func() bool { return a.opts.Store.Settings().AutoOllama() }),
+	)
 	a.runner = jobs.New(jobs.Options{
 		FreeLanes:    set.FreeLanes,
 		MeteredLanes: set.MeteredLanes,
@@ -464,10 +479,7 @@ func (a *App) activate() {
 		// and unstartable from here. The second is the lifecycle's verdict
 		// brought forward — see jobs.RequireLocalServer — and it reads the
 		// same setting the lifecycle does, live, for activate's own reason.
-		Precheck: jobs.Checks(
-			jobs.RequireGraph,
-			jobs.RequireLocalServer(func() bool { return a.opts.Store.Settings().AutoOllama() }),
-		),
+		Precheck:   a.precheck,
 		LocalLease: a.leaseOllama,
 	})
 	// Before the pump, because Restore deliberately emits nothing: the views
@@ -587,6 +599,7 @@ func (a *App) activate() {
 
 	a.win.SetVisible(true)
 	a.announceRestored(restored, held, resumed)
+	a.announceCorruptState()
 	a.applyDockSettings()
 	a.restoreFilter()
 	a.refresh(true)
@@ -1446,6 +1459,24 @@ func (a *App) toastf(format string, args ...any) {
 	a.toast(sprintf(format, args...))
 }
 
+// announceCorruptState says so when state.json could not be parsed at start-up
+// and the board is running on defaults: otherwise every override, baseline and
+// queued job vanishes without a word.
+func (a *App) announceCorruptState() {
+	if a.opts.Store == nil {
+		return
+	}
+	aside, err := a.opts.Store.Corrupt()
+	if err == nil {
+		return
+	}
+	if aside != "" {
+		a.toastf("state file was unreadable — moved to %s; started from defaults", aside)
+		return
+	}
+	a.toastf("state file is unreadable and could not be moved aside — started from defaults, and this session will not save over it")
+}
+
 // applyColorScheme pushes the current preference into libadwaita.
 func (a *App) applyColorScheme() {
 	sm := adw.StyleManagerGetDefault()
@@ -1466,6 +1497,84 @@ func (a *App) applyColorScheme() {
 		}
 	}
 	a.refreshSchemeButton()
+}
+
+// baseDPI is gtk-xft-dpi as the desktop set it, so repeated applies multiply
+// the system value rather than compounding on their own result. It is
+// refreshed whenever the desktop changes it ("Large text", a new monitor)
+// while the board is following the session value.
+//
+// dpiOverridden says the board has installed an application value — which
+// GTK then keeps over every later XSETTINGS/portal update until it is reset —
+// and dpiWriting marks the board's own writes so the notify handler does not
+// mistake them for the desktop's.
+var (
+	baseDPI       int
+	dpiOverridden bool
+	dpiWriting    bool
+	dpiWatched    bool
+)
+
+// dpiAction is what applyScale does to gtk-xft-dpi for a scale.
+type dpiAction int
+
+const (
+	dpiLeave dpiAction = iota // follow the session value: touch nothing
+	dpiReset                  // drop our earlier override and follow the session again
+	dpiWrite                  // install base × scale
+)
+
+// scaleDPI decides the gtk-xft-dpi write for a scale. At 1.0 the board has
+// nothing to say: writing base × 1 would still mark the property as set by
+// the application and freeze desktop text scaling for the rest of the run.
+func scaleDPI(base int, scale float64, overridden bool) (dpiAction, int) {
+	if scale == 1 || scale <= 0 {
+		if overridden {
+			return dpiReset, 0
+		}
+		return dpiLeave, 0
+	}
+	return dpiWrite, int(float64(base) * scale)
+}
+
+// applyScale pushes the interface scale preference into GtkSettings.
+// gtk-xft-dpi is in 1024ths of a dot per inch; GTK re-lays out every
+// window when it changes, so this applies live.
+func (a *App) applyScale() {
+	s := gtk.SettingsGetDefault()
+	if s == nil {
+		return
+	}
+	readDPI := func() int {
+		if v, ok := s.ObjectProperty("gtk-xft-dpi").(int); ok && v > 0 {
+			return v
+		}
+		return 96 * 1024
+	}
+	if baseDPI == 0 {
+		baseDPI = readDPI()
+	}
+	if !dpiWatched {
+		dpiWatched = true
+		s.NotifyProperty("gtk-xft-dpi", func() {
+			if dpiWriting || dpiOverridden {
+				return
+			}
+			baseDPI = readDPI()
+		})
+	}
+	act, v := scaleDPI(baseDPI, a.opts.Store.Scale(), dpiOverridden)
+	dpiWriting = true
+	defer func() { dpiWriting = false }()
+	switch act {
+	case dpiReset:
+		s.ResetProperty("gtk-xft-dpi")
+		dpiOverridden = false
+		baseDPI = readDPI()
+	case dpiWrite:
+		s.SetObjectProperty("gtk-xft-dpi", v)
+		dpiOverridden = true
+	}
 }
 
 // schemePinned reports whether -dark/-light decided the scheme for this run.

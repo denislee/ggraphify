@@ -280,7 +280,21 @@ func DriftOf(repo, out string, ignore map[string]bool, base Baseline) Drift {
 		}
 	}
 
-	outBase := filepath.Base(out)
+	// WalkDir Lstats its root, so a symlinked checkout (discover boards those
+	// and keeps the link as Repo.Path) would be visited as one non-directory
+	// entry and report no drift, ever. Walk the real tree instead; every rel
+	// path is the same either way.
+	if r, err := filepath.EvalSymlinks(repo); err == nil {
+		repo = r
+	}
+	// Only the configured out directory itself is skipped, not every directory
+	// sharing its basename: an in-tree `.kb/graph` must not hide a Go
+	// `internal/graph/`. Both sides are resolved so a link anywhere in either
+	// path still compares equal.
+	outDir := filepath.Clean(out)
+	if r, err := filepath.EvalSymlinks(out); err == nil {
+		outDir = r
+	}
 	gi := newIgnoreTree(repo)
 	_ = filepath.WalkDir(repo, func(path string, de fs.DirEntry, err error) error {
 		if err != nil {
@@ -300,7 +314,7 @@ func DriftOf(repo, out string, ignore map[string]bool, base Baseline) Drift {
 			// central --out-base does not delete the in-tree graphify-out a
 			// previous run left behind, and its 800-odd cached files are not
 			// drift in the checkout.
-			if driftSkip[name] || name == outBase || name == DefaultOutName ||
+			if driftSkip[name] || path == outDir || name == DefaultOutName ||
 				(ignore != nil && ignore[name]) {
 				return fs.SkipDir
 			}

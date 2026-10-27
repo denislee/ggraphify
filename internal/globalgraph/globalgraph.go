@@ -16,10 +16,14 @@
 package globalgraph
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -153,11 +157,26 @@ func Load(path string) *Manifest {
 		m.Entries = append(m.Entries, e)
 		m.byTag[tag] = e
 		if e.Source != "" {
-			m.byPath[e.Source] = e
+			// Two tags can share one source_path — the same graph re-added
+			// with --as. Which one a row shows must not depend on map
+			// iteration order, or its Tag, AddedAt and Stale flicker from one
+			// tick to the next: the newest add is the one that describes what
+			// the global graph holds now, and the tag breaks a tie.
+			if prev, ok := m.byPath[e.Source]; !ok || newerEntry(e, prev) {
+				m.byPath[e.Source] = e
+			}
 		}
 	}
 	sort.Slice(m.Entries, func(i, j int) bool { return m.Entries[i].Tag < m.Entries[j].Tag })
 	return m
+}
+
+// newerEntry reports whether a should represent a shared source_path over b.
+func newerEntry(a, b Entry) bool {
+	if !a.AddedAt.Equal(b.AddedAt) {
+		return a.AddedAt.After(b.AddedAt)
+	}
+	return a.Tag < b.Tag
 }
 
 // Len is how many repositories are in the global graph.
@@ -264,18 +283,89 @@ func (m *Manifest) MemberOf(graphPath string, builtAt time.Time) Member {
 	if !ok {
 		return Member{}
 	}
+	// Truncated to the second: the manifest records an RFC3339 timestamp and
+	// a file mtime has nanoseconds, so an add and a build within the same
+	// second must not read as drift.
+	stale := !builtAt.IsZero() && !e.AddedAt.IsZero() &&
+		builtAt.Truncate(time.Second).After(e.AddedAt.Truncate(time.Second))
+	if stale && e.Hash != "" {
+		// The mtime only says graph.json was written since the add. graphify
+		// rewrites it on every run — a cluster-only pass, a relabel that
+		// changed nothing — and `global add` skips a graph whose hash still
+		// matches without moving added_at, so by mtime alone such a member is
+		// stale forever and re-adding it can never clear it. The hash is
+		// graphify's own authority on whether an add would change anything.
+		if h, ok := sourceHash(graphPath); ok && h == e.Hash {
+			stale = false
+		}
+	}
 	return Member{
 		In:      true,
 		Tag:     e.Tag,
 		Nodes:   e.Nodes,
 		Edges:   e.Edges,
 		AddedAt: e.AddedAt,
-		// Truncated to the second: the manifest records an RFC3339 timestamp
-		// and a file mtime has nanoseconds, so an add and a build within the
-		// same second must not read as drift.
-		Stale: !builtAt.IsZero() && !e.AddedAt.IsZero() &&
-			builtAt.Truncate(time.Second).After(e.AddedAt.Truncate(time.Second)),
+		Stale:   stale,
 	}
+}
+
+// MaxHashBytes is the largest graph.json MemberOf will hash to settle an
+// mtime-stale verdict; above it the mtime answer stands. It matches
+// graphstate.MaxGraphBytes, the ceiling the board already applies to reading
+// a graph at all.
+const MaxHashBytes = 128 << 20
+
+// hashMemo is one graph.json's hash, valid while its size and mtime hold.
+type hashMemo struct {
+	size  int64
+	mtime time.Time
+	hash  string
+}
+
+var (
+	hashMu    sync.Mutex
+	hashMemos = map[string]hashMemo{}
+)
+
+// hashFile is the hash function, a variable so a test can count calls.
+var hashFile = fileHash
+
+// sourceHash is graph.json's fingerprint in graphify's own spelling — the
+// first 16 hex digits of the SHA-256 of its bytes (graphify/global_graph.py
+// _file_hash) — memoised on the file's size and mtime, so a member is hashed
+// once per rebuild and not once per tick.
+func sourceHash(path string) (string, bool) {
+	fi, err := os.Stat(path)
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() > MaxHashBytes {
+		return "", false
+	}
+	hashMu.Lock()
+	memo, ok := hashMemos[path]
+	hashMu.Unlock()
+	if ok && memo.size == fi.Size() && memo.mtime.Equal(fi.ModTime()) {
+		return memo.hash, true
+	}
+	h, err := hashFile(path)
+	if err != nil {
+		return "", false
+	}
+	hashMu.Lock()
+	hashMemos[path] = hashMemo{size: fi.Size(), mtime: fi.ModTime(), hash: h}
+	hashMu.Unlock()
+	return h, true
+}
+
+func fileHash(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16], nil
 }
 
 // GraphFor is the graph.json an output directory holds — the path the manifest

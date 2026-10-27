@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -32,6 +33,43 @@ type FileState struct {
 	// denominator is not a slightly-off number; it halves every share derived
 	// from it.
 	Tools int `json:"tools,omitempty"`
+	// Tail fingerprints the bytes just before Offset (see tailPrint). A file
+	// that has grown past Offset but no longer carries them there was
+	// rewritten, not appended to: resuming at Offset would start mid-line in
+	// different content.
+	Tail uint64 `json:"tail,omitempty"`
+	// Through is the newest event this file has contributed. A file re-read
+	// from the start — shrunk, rotated, rewritten — re-emits only what is
+	// newer, so the events it still carries are not counted twice.
+	Through time.Time `json:"through,omitzero"`
+}
+
+// tailWindow is how many bytes before Offset a FileState fingerprints.
+const tailWindow = 4 << 10
+
+// tailPrint is the FNV-1a hash of up to tailWindow bytes ending at off, or 0
+// when there is nothing to fingerprint or the read fails — and 0 is never
+// checked, so a state saved before Tail existed keeps resuming as before.
+func tailPrint(path string, off int64) uint64 {
+	if off <= 0 {
+		return 0
+	}
+	n := int64(tailWindow)
+	if off < n {
+		n = off
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = f.Close() }()
+	var buf [tailWindow]byte
+	if _, err := f.ReadAt(buf[:n], off-n); err != nil {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write(buf[:n])
+	return h.Sum64()
 }
 
 // hookAttachment is the attachment type Claude Code uses for whatever a hook

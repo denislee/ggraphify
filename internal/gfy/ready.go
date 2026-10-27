@@ -78,6 +78,10 @@ func BackendChoices(owner, model string) []BackendChoice {
 		add(OpenCodeZenBackend, OpenCodeZenBackend+" — OpenCode Zen, pay-as-you-go on the same "+
 			OpenCodeKeyVar+", including the models it serves free")
 	}
+	if HasPlanKey(OllamaCloudBackend) {
+		add(OllamaCloudBackend, OllamaCloudBackend+" — Ollama Cloud's hosted models ("+
+			OllamaCloudKeyVar+")")
+	}
 	if p := ProbeLocal(OllamaBackend); p.Reach {
 		add(OllamaBackend, OllamaBackend+" — a model on this machine: free, slower, no key")
 	}

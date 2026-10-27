@@ -69,6 +69,26 @@ func noteOllamaStart(route ollamaStartRoute, pid int) {
 	}
 }
 
+// reapOllama waits for a detached `ollama serve` this process started, so it
+// never becomes a zombie, and forgets its pid once it has gone. A server that
+// exits on its own — a crash, `ollama` killed by hand — would otherwise leave
+// the pid recorded, and a later idle stop would SIGTERM whatever process
+// group the kernel has since handed that number to.
+func reapOllama(cmd *exec.Cmd) {
+	_ = cmd.Wait()
+	forgetOllamaPID(cmd.Process.Pid)
+}
+
+// forgetOllamaPID clears the recorded start if it is still this pid's. A
+// newer start — a different pid — is left alone.
+func forgetOllamaPID(pid int) {
+	ollamaStart.Lock()
+	defer ollamaStart.Unlock()
+	if ollamaStart.route == startedDetached && ollamaStart.pid == pid {
+		ollamaStart.route, ollamaStart.pid, ollamaStart.pinned = startedNot, 0, false
+	}
+}
+
 // PinOllama marks the running server as one a person asked for, which exempts
 // it from the idle stop and from the stop at exit. The settings page's Start
 // button calls it; nothing else should.

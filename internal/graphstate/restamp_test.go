@@ -181,3 +181,43 @@ func TestNeedsUpdateFlag(t *testing.T) {
 		t.Error("an empty path is not a directory with a flag in it")
 	}
 }
+
+// W33: the report is replaced through a temp file and a rename, as graph.json
+// is, never rewritten in place — an in-place write that dies half way leaves a
+// truncated report. A rename gives the path a new file; an in-place write
+// keeps the old one. No temp file may be left behind, and the mode survives.
+func TestRestampReplacesTheReportAtomically(t *testing.T) {
+	f := newFixture(t)
+	f.graphJSON(2, 1, builtSHA)
+	f.writeOut("GRAPH_REPORT.md", "# Graph\n"+reportCommitPrefix+"`"+builtSHA[:8]+"`\n")
+	rp := filepath.Join(f.out, "GRAPH_REPORT.md")
+	if err := os.Chmod(rp, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(rp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := Restamp(f.out, headSHA); err != nil || !ok {
+		t.Fatalf("Restamp = %v, %v", ok, err)
+	}
+	after, err := os.Stat(rp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Fatal("GRAPH_REPORT.md was rewritten in place, not replaced by a rename")
+	}
+	if after.Mode().Perm() != 0o640 {
+		t.Errorf("mode = %v, want 0640", after.Mode().Perm())
+	}
+	ents, err := os.ReadDir(f.out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if strings.Contains(e.Name(), ".stamp-") {
+			t.Errorf("temp file left behind: %s", e.Name())
+		}
+	}
+}
